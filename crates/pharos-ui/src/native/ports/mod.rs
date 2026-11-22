@@ -11,22 +11,48 @@ use tokio::sync::watch;
 
 pub mod fake;
 
-/// A set-once cell holding a port implementation.
+/// A set-once cell holding a port implementation. A port set after a
+/// reader looked is announced: [`Slot::published`] resolves then.
 pub struct Slot<T: ?Sized> {
     cell: OnceLock<Arc<T>>,
+    /// True once the cell is set; made on first use.
+    published: OnceLock<watch::Sender<bool>>,
 }
 
 impl<T: ?Sized> Slot<T> {
     pub const fn new() -> Self {
         Self {
             cell: OnceLock::new(),
+            published: OnceLock::new(),
         }
+    }
+
+    fn notifier(&self) -> &watch::Sender<bool> {
+        self.published.get_or_init(|| watch::channel(false).0)
     }
 
     /// Refuses a second port, so a late registration cannot silently replace
     /// the one the UI already reads.
     pub fn set(&self, port: Arc<T>) -> Result<(), AlreadyRegistered> {
-        self.cell.set(port).map_err(|_| AlreadyRegistered)
+        self.cell.set(port).map_err(|_| AlreadyRegistered)?;
+        self.notifier().send_replace(true);
+        Ok(())
+    }
+
+    /// The port, once one is set: now if it is, else when it is. Never
+    /// blocks a thread; a reader that must not wait reads [`Slot::get`].
+    pub async fn published(&self) -> Arc<T> {
+        // Subscribed before the cell is read, so a set in between is seen.
+        let mut rx = self.notifier().subscribe();
+        loop {
+            if let Some(port) = self.get() {
+                return port;
+            }
+            if rx.changed().await.is_err() {
+                // The sender lives in the slot: it is never dropped.
+                std::future::pending::<()>().await;
+            }
+        }
     }
 
     pub fn get(&self) -> Option<Arc<T>> {
@@ -74,12 +100,301 @@ pub fn offline_store() -> Option<Arc<dyn OfflineStore>> {
 pub fn register_video_store(
     port: Arc<dyn super::kept_video::VideoStore>,
 ) -> Result<(), AlreadyRegistered> {
-    VIDEO_STORE.set(port)
+    video_slot().set(port)?;
+    // A sign-in that landed before the store resumes its downloads now.
+    super::offline_video::store_published();
+    Ok(())
 }
 
-/// The registered store of downloaded videos, if any.
+/// The registered store of downloaded videos, if any. A component reads it
+/// through `kept_video_view::shown_video_store`, which re-renders it when a
+/// store registered after it mounted is published.
 pub fn video_store() -> Option<Arc<dyn super::kept_video::VideoStore>> {
-    VIDEO_STORE.get()
+    video_slot().get()
+}
+
+/// The slot behind [`video_store`], for a reader that waits for it.
+pub fn video_slot() -> &'static Slot<dyn super::kept_video::VideoStore> {
+    #[cfg(test)]
+    if let Some(slot) = TEST_VIDEO_SLOT.with(std::cell::Cell::get) {
+        return slot;
+    }
+    &VIDEO_STORE
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own video slot, on this thread, in place of the process's:
+    /// a test can publish a store without reaching every other test.
+    static TEST_VIDEO_SLOT: std::cell::Cell<Option<&'static Slot<dyn super::kept_video::VideoStore>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Puts `slot` in place of the process's video slot on this thread, or
+/// takes it out with `None`.
+#[cfg(test)]
+pub fn use_test_video_slot(slot: Option<&'static Slot<dyn super::kept_video::VideoStore>>) {
+    TEST_VIDEO_SLOT.with(|s| s.set(slot));
+}
+
+/// A claim that succeeds once. Opening the video store twice on one root
+/// is not harmless: the second open's recovery deletes the first's staging
+/// files. The phone has two callers (the media service's init hook and the
+/// first render), so each claims before it touches the folder; a first
+/// attempt that reached the store is not retried by the second, which would
+/// open the store over whatever the first left. One that failed before it
+/// (the folder could not be made) gives the claim back, so a later caller
+/// tries again (see [`register_video_root`]).
+#[cfg(any(feature = "mobile", test))]
+pub struct OpenOnce {
+    claimed: std::sync::atomic::AtomicBool,
+    /// The music hook is in; it goes in once, whoever claims.
+    hooked: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(any(feature = "mobile", test))]
+impl OpenOnce {
+    pub const fn new() -> Self {
+        Self {
+            claimed: std::sync::atomic::AtomicBool::new(false),
+            hooked: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// True for the first caller only, until the claim is given back.
+    pub fn claim(&self) -> bool {
+        !self.claimed.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Gives the claim back: only for an attempt that never reached the
+    /// store, so no store can be opening or open on the root.
+    fn release(&self) {
+        self.claimed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// True the first time only: whether to install the music hook.
+    fn first_hook(&self) -> bool {
+        !self.hooked.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(any(feature = "mobile", test))]
+impl Default for OpenOnce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What the video budget reads of the music side. The phone's `Budget`
+/// takes every figure from the library through these functions, so the
+/// decision is the same code in a test as on the device: the library
+/// implements this by delegating to its own methods.
+#[cfg(any(feature = "mobile", test))]
+pub trait MusicSide {
+    /// The cap in force, when the music cache is enabled.
+    fn cache_cap(&self) -> Option<u64>;
+    /// Bytes the music holds, when the cache is enabled.
+    fn used_bytes(&self) -> Option<u64>;
+    /// Whether the music cache is enabled.
+    fn cache_enabled(&self) -> bool;
+    /// Music writes approved and not yet landed, and the bytes its
+    /// in-flight downloads have already written (in the cap, not in the
+    /// free-space figure; None when they could not all be read), from one
+    /// read of each part.
+    fn pending(&self) -> (u64, Option<u64>);
+    /// Sets the cache's cap, the one music and video share. Its free-space
+    /// floor is its own and stays.
+    fn set_cache_cap(&self, bytes: u64) -> Result<(), String>;
+}
+
+#[cfg(any(feature = "mobile", test))]
+impl MusicSide for pharos_content::Library {
+    fn cache_cap(&self) -> Option<u64> {
+        pharos_content::Library::cache_cap(self)
+    }
+    fn used_bytes(&self) -> Option<u64> {
+        self.offline_summary().map(|s| s.used_bytes)
+    }
+    fn cache_enabled(&self) -> bool {
+        pharos_content::Library::cache_enabled(self)
+    }
+    fn set_cache_cap(&self, bytes: u64) -> Result<(), String> {
+        pharos_content::Library::set_cache_cap(self, bytes).map_err(|e| e.redacted())
+    }
+    fn pending(&self) -> (u64, Option<u64>) {
+        let p = self.music_pending();
+        (p.owed, p.written)
+    }
+}
+
+/// The shared cap: the cache's, or the default while there is no cache.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_cap(music: Option<&dyn MusicSide>) -> u64 {
+    music
+        .and_then(MusicSide::cache_cap)
+        .unwrap_or(pharos_content::DEFAULT_CAP_BYTES)
+}
+
+/// Sets the cap music and video share, through the music cache; refused
+/// while there is none, as nothing would keep it.
+#[cfg(any(feature = "mobile", test))]
+pub fn set_music_cap(music: Option<&dyn MusicSide>, bytes: u64) -> Result<(), String> {
+    match music {
+        Some(m) if m.cache_enabled() => m.set_cache_cap(bytes),
+        _ => Err("the music cache is not up yet, so the allowance cannot change".to_owned()),
+    }
+}
+
+/// What the music holds of the cap; nothing while there is no cache.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_used(music: Option<&dyn MusicSide>) -> u64 {
+    music.and_then(MusicSide::used_bytes).unwrap_or(0)
+}
+
+/// Whether the cap and the music's figures can be had: only once the cache
+/// is enabled, the cap is the default and the music counts as nothing.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_ready(music: Option<&dyn MusicSide>) -> bool {
+    music.is_some_and(MusicSide::cache_enabled)
+}
+
+/// Music writes approved and not yet landed (room the free space does not
+/// lack yet but will), and the bytes its in-flight downloads have written
+/// already (part of the cap with `music_used`, never of free space), from
+/// one observation. Nothing while there is no cache.
+#[cfg(any(feature = "mobile", test))]
+pub fn music_pending(music: Option<&dyn MusicSide>) -> (u64, Option<u64>) {
+    music.map_or((0, Some(0)), MusicSide::pending)
+}
+
+/// How `register_video_root` ended.
+#[cfg(any(feature = "mobile", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Registration {
+    /// Another caller had claimed the root; nothing was touched.
+    AlreadyOpened,
+    /// The folder could not be created: no store, and the music cache has
+    /// been told the video size is unknown. The claim was given back, so a
+    /// later caller tries again.
+    NoFolder(String),
+    /// The store was opened and registered.
+    Registered,
+    /// The store was opened but not registered (one already is).
+    NotRegistered(String),
+    /// The store's runtime or thread could not start, so no store was
+    /// opened on the root. The claim was given back, so a later caller
+    /// tries again.
+    NotOpened(String),
+}
+
+/// Whether a registration attempt is done with, for a caller that retries
+/// until it is (the service's init hook): only once a store is published.
+/// `AlreadyOpened` with nothing published is another caller still opening
+/// the store, which may yet fail before it opens and give the claim back:
+/// not done, so the retry goes on.
+#[cfg(any(feature = "mobile", test))]
+pub fn registration_done(_outcome: &Registration, published: bool) -> bool {
+    published
+}
+
+/// Why `register_video_root`'s `register` failed: before the store was
+/// opened on the root (nothing to protect, so the claim is given back) or
+/// after it may have been (the claim is kept: a second store would run
+/// recovery over the first's staging files).
+#[cfg(any(feature = "mobile", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisterFailed {
+    /// Nothing was opened on the root.
+    BeforeOpen(String),
+    /// The store may be open on the root.
+    AfterOpen(String),
+}
+
+/// The phone's registration of its video store, as the Android crate runs
+/// it (the init hook and the first render both come here). `once` is
+/// claimed first, before the folder is touched: a second store on the same
+/// root would run recovery over the first's staging files, so an attempt
+/// that reached `register` (the store may be opening or open) is never
+/// retried. One whose folder could not be created opened nothing and gives
+/// the claim back: a later caller tries the folder again. `install_hook`
+/// goes in once, before the folder is created, and reports the size unknown
+/// while no store is registered, so a folder that cannot be created leaves
+/// the music refused (fail closed), not counted as free of video.
+/// `register` opens and registers the store. A `register` that failed
+/// before it opened anything ([`RegisterFailed::BeforeOpen`]) gives the
+/// claim back too.
+#[cfg(any(feature = "mobile", test))]
+pub fn register_video_root(
+    root: &std::path::Path,
+    once: &OpenOnce,
+    install_hook: impl FnOnce(),
+    register: impl FnOnce() -> Result<(), RegisterFailed>,
+) -> Registration {
+    if !once.claim() {
+        return Registration::AlreadyOpened;
+    }
+    if once.first_hook() {
+        install_hook();
+    }
+    if let Err(e) = std::fs::create_dir_all(root) {
+        // Nothing was opened on the root: the next caller may try again.
+        once.release();
+        return Registration::NoFolder(e.to_string());
+    }
+    match register() {
+        Ok(()) => Registration::Registered,
+        Err(RegisterFailed::AfterOpen(e)) => Registration::NotRegistered(e),
+        Err(RegisterFailed::BeforeOpen(e)) => {
+            // No store was opened on the root: the next caller may try again.
+            once.release();
+            Registration::NotOpened(e)
+        }
+    }
+}
+
+/// What the music cache is told about the video store: what it holds, still
+/// owes, and whether it knows its own size. With no store registered (its
+/// folder could not be created, or it has yet to be) nothing is known about
+/// what the video holds on disk, so the size is unknown and the music cache
+/// admits nothing, rather than reading the absence as zero usage.
+#[cfg(any(feature = "mobile", test))]
+pub fn outside_bytes(
+    store: Option<&dyn super::kept_video::VideoStore>,
+) -> pharos_content::OutsideBytes {
+    match store {
+        Some(s) => {
+            // One snapshot: the verdict and the bytes from the same moment.
+            let (held, outstanding, unknown) = s.accounting();
+            pharos_content::OutsideBytes {
+                held,
+                outstanding,
+                unknown,
+            }
+        }
+        None => pharos_content::OutsideBytes {
+            held: 0,
+            outstanding: 0,
+            unknown: true,
+        },
+    }
+}
+
+/// The hook the phone registers with the music cache (see `outside_bytes`),
+/// over the process's video store slot. The phone registers exactly this
+/// (`pharos-phone` cannot host a test, being Android-only).
+#[cfg(any(feature = "mobile", test))]
+pub fn outside_bytes_hook() -> pharos_content::OutsideUsed {
+    outside_bytes_hook_for(&VIDEO_STORE)
+}
+
+/// `outside_bytes_hook` over a slot of the caller's: a test gives each case
+/// a slot of its own, so none depends on what another put in the global.
+#[cfg(any(feature = "mobile", test))]
+pub fn outside_bytes_hook_for(
+    slot: &'static Slot<dyn super::kept_video::VideoStore>,
+) -> pharos_content::OutsideUsed {
+    Arc::new(move || outside_bytes(slot.get().as_deref()))
 }
 
 /// What the host app runs when the user signs in or out, so a second client
@@ -93,16 +408,30 @@ pub fn register_on_credentials_changed(hook: fn()) -> Result<(), AlreadyRegister
         .map_err(|_| AlreadyRegistered)
 }
 
+/// What the host app runs instead of a reload when a sign-out could neither
+/// remove nor mark its token: the second client (the car's media service,
+/// in this same process) stays signed out. The sign-out fenced the token in
+/// the token file's own fence already, which the service reads through.
+static ON_CREDENTIALS_KEPT: OnceLock<fn()> = OnceLock::new();
+
+/// Called once by the host app before the UI launches.
+pub fn register_on_credentials_kept(hook: fn()) -> Result<(), AlreadyRegistered> {
+    ON_CREDENTIALS_KEPT.set(hook).map_err(|_| AlreadyRegistered)
+}
+
+/// A queued host call: run on the notifier thread, in order.
+type HostCall = Box<dyn FnOnce() + Send>;
+
 /// The thread that runs the hook, so the caller (the UI) never waits for the
 /// host's reload, which queues behind the content worker. One thread keeps the
 /// changes in the order they happened.
-static CREDENTIALS_NOTIFIER: OnceLock<std::sync::mpsc::Sender<fn()>> = OnceLock::new();
+static CREDENTIALS_NOTIFIER: OnceLock<std::sync::mpsc::Sender<HostCall>> = OnceLock::new();
 
-fn notifier() -> Option<&'static std::sync::mpsc::Sender<fn()>> {
+fn notifier() -> Option<&'static std::sync::mpsc::Sender<HostCall>> {
     if let Some(tx) = CREDENTIALS_NOTIFIER.get() {
         return Some(tx);
     }
-    let (tx, rx) = std::sync::mpsc::channel::<fn()>();
+    let (tx, rx) = std::sync::mpsc::channel::<HostCall>();
     std::thread::Builder::new()
         .name("pharos-credentials".into())
         .spawn(move || {
@@ -120,14 +449,29 @@ pub fn credentials_changed() -> bool {
     let Some(hook) = ON_CREDENTIALS_CHANGED.get() else {
         return false;
     };
-    queue_hook(notifier(), *hook);
+    queue_hook(notifier(), Box::new(*hook));
+    true
+}
+
+/// Queues the host's stay-signed-out hook, in order with every other
+/// credentials change; returns whether one was registered. The token is
+/// fenced already: the sign-out operation set the fence under the token
+/// file's lock, so nothing here has to land first.
+pub fn credentials_kept() -> bool {
+    let Some(hook) = ON_CREDENTIALS_KEPT.get() else {
+        eprintln!("warn: credentials kept verdict=fenced reason=no_host_hook");
+        return false;
+    };
+    if !queue_hook(notifier(), Box::new(*hook)) {
+        eprintln!("warn: credentials kept verdict=fenced reason=hook_not_queued");
+    }
     true
 }
 
 /// Hands the hook to the notifier thread. It is never run on the caller's
 /// thread: the hook can block on the content worker, and the caller is the UI.
 /// A missing thread or a closed channel drops this call with a warning.
-fn queue_hook(tx: Option<&std::sync::mpsc::Sender<fn()>>, hook: fn()) -> bool {
+fn queue_hook(tx: Option<&std::sync::mpsc::Sender<HostCall>>, hook: HostCall) -> bool {
     match tx {
         Some(tx) => match tx.send(hook) {
             Ok(()) => true,
@@ -331,28 +675,265 @@ pub trait OfflineStore: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_dir::TmpDir;
     use super::*;
+
+    /// The phone's allowance goes to the music cache's cap, the one music
+    /// and video share, and is refused while there is no cache to keep it.
+    #[test]
+    fn the_shared_cap_is_set_through_the_music_cache() {
+        struct Music(std::cell::Cell<u64>, bool);
+        impl MusicSide for Music {
+            fn cache_cap(&self) -> Option<u64> {
+                Some(self.0.get())
+            }
+            fn used_bytes(&self) -> Option<u64> {
+                Some(0)
+            }
+            fn cache_enabled(&self) -> bool {
+                self.1
+            }
+            fn pending(&self) -> (u64, Option<u64>) {
+                (0, Some(0))
+            }
+            fn set_cache_cap(&self, bytes: u64) -> Result<(), String> {
+                self.0.set(bytes);
+                Ok(())
+            }
+        }
+        let on = Music(std::cell::Cell::new(4), true);
+        assert_eq!(set_music_cap(Some(&on), 8), Ok(()));
+        assert_eq!(music_cap(Some(&on)), 8, "the shared cap did not change");
+        let off = Music(std::cell::Cell::new(4), false);
+        assert!(set_music_cap(Some(&off), 8).is_err());
+        assert_eq!(off.0.get(), 4);
+        assert!(set_music_cap(None, 8).is_err());
+    }
 
     static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     fn count() {
         RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// A store that failed to register (its folder could not be created)
+    /// leaves the video's bytes unknown, not zero: the music cache refuses.
+    #[test]
+    fn no_registered_video_store_reads_as_unknown_not_empty() {
+        let o = outside_bytes(None);
+        assert!(o.unknown);
+        assert_eq!((o.held, o.outstanding), (0, 0));
+    }
+
+    /// The init hook and the first render both register the video store;
+    /// only the first may open it.
+    #[test]
+    fn the_second_registration_does_not_open_the_store_again() {
+        let once = OpenOnce::new();
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let register = || {
+            if once.claim() {
+                opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        register();
+        register();
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A registration whose folder could not be created opened nothing, so
+    /// a later caller tries again (the hook goes in once); once one reaches
+    /// the store, every later call does nothing at all.
+    #[test]
+    fn a_registration_with_no_folder_is_retried_and_one_that_opened_is_not() {
+        use std::cell::Cell;
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-twice");
+        let root = scope.path().join("root");
+        assert!(std::fs::write(&root, b"a file where the folder should be").is_ok());
+        let once = OpenOnce::new();
+        let (hooks, registers) = (Cell::new(0), Cell::new(0));
+        let run = || {
+            register_video_root(
+                &root,
+                &once,
+                || hooks.set(hooks.get() + 1),
+                || {
+                    registers.set(registers.get() + 1);
+                    Ok(())
+                },
+            )
+        };
+        assert!(matches!(run(), Registration::NoFolder(_)));
+        assert_eq!(
+            (hooks.get(), registers.get()),
+            (1, 0),
+            "hook once, no store"
+        );
+        assert!(
+            matches!(run(), Registration::NoFolder(_)),
+            "a failed folder was not tried again"
+        );
+        assert_eq!((hooks.get(), registers.get()), (1, 0), "a second hook");
+        let _ = std::fs::remove_file(&root);
+        assert_eq!(run(), Registration::Registered, "the retry did not open");
+        assert_eq!((hooks.get(), registers.get()), (1, 1));
+        assert_eq!(run(), Registration::AlreadyOpened);
+        assert_eq!(
+            (hooks.get(), registers.get()),
+            (1, 1),
+            "a call after the store opened touched the hook or the store"
+        );
+    }
+
+    /// A store that opened but was not registered keeps the claim: it may
+    /// still be open on the root.
+    #[test]
+    fn a_registration_that_reached_the_store_keeps_its_claim_on_failure() {
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-kept");
+        let root = scope.path().join("root");
+        let once = OpenOnce::new();
+        let outcome = register_video_root(
+            &root,
+            &once,
+            || {},
+            || Err(RegisterFailed::AfterOpen("taken".to_owned())),
+        );
+        assert_eq!(outcome, Registration::NotRegistered("taken".to_owned()));
+        assert_eq!(
+            register_video_root(&root, &once, || {}, || Ok(())),
+            Registration::AlreadyOpened
+        );
+    }
+
+    /// A store whose runtime or thread could not start opened nothing on
+    /// the root: the claim is given back and the next caller opens it. The
+    /// hook still goes in only once.
+    #[test]
+    fn a_registration_that_failed_before_the_store_opened_is_retried() {
+        use std::cell::Cell;
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-unopened");
+        let root = scope.path().join("root");
+        let once = OpenOnce::new();
+        let hooks = Cell::new(0);
+        let outcome = register_video_root(
+            &root,
+            &once,
+            || hooks.set(hooks.get() + 1),
+            || Err(RegisterFailed::BeforeOpen("video thread: no".to_owned())),
+        );
+        assert_eq!(
+            outcome,
+            Registration::NotOpened("video thread: no".to_owned())
+        );
+        assert_eq!(
+            register_video_root(&root, &once, || hooks.set(hooks.get() + 1), || Ok(())),
+            Registration::Registered,
+            "a store that never opened kept the claim"
+        );
+        assert_eq!(hooks.get(), 1, "a second hook");
+    }
+
+    /// Two attempts overlap: the second finds the root claimed while the
+    /// first is opening, and is not done, since nothing is published. The
+    /// first then fails before it opens and gives the claim back; a later
+    /// retry opens and registers the store, and only then is it done.
+    #[test]
+    fn an_attempt_that_found_the_store_opening_is_not_done_until_one_is_published() {
+        use std::cell::{Cell, RefCell};
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-overlap");
+        let root = scope.path().join("root");
+        let once = OpenOnce::new();
+        let published = Cell::new(false);
+        let second = RefCell::new(None);
+        let first = register_video_root(
+            &root,
+            &once,
+            || {},
+            || {
+                // The service's retry, while this caller is opening.
+                let outcome = register_video_root(&root, &once, || {}, || Ok(()));
+                let done = registration_done(&outcome, published.get());
+                *second.borrow_mut() = Some((outcome, done));
+                Err(RegisterFailed::BeforeOpen("video thread: no".to_owned()))
+            },
+        );
+        assert!(matches!(first, Registration::NotOpened(_)), "{first:?}");
+        assert!(!registration_done(&first, published.get()));
+        assert_eq!(
+            second.take(),
+            Some((Registration::AlreadyOpened, false)),
+            "an attempt that found the store opening said it was done"
+        );
+        let retry = register_video_root(
+            &root,
+            &once,
+            || {},
+            || {
+                published.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(retry, Registration::Registered);
+        assert!(registration_done(&retry, published.get()));
+    }
+
+    /// On success the hook goes in before the folder is created, and the
+    /// store is registered after it: the hook sees no folder, the store
+    /// sees one.
+    #[test]
+    fn the_hook_goes_in_before_the_folder_exists_and_the_store_after() {
+        use std::cell::Cell;
+        // A folder of its own, gone when the test ends (a failure
+        // included); the root inside it starts missing.
+        let scope = TmpDir::new("register-order");
+        let root = scope.path().join("root");
+        let once = OpenOnce::new();
+        let (hook_saw_folder, register_saw_folder) = (Cell::new(None), Cell::new(None));
+        let outcome = register_video_root(
+            &root,
+            &once,
+            || hook_saw_folder.set(Some(root.exists())),
+            || {
+                register_saw_folder.set(Some(root.is_dir()));
+                Ok(())
+            },
+        );
+        assert_eq!(outcome, Registration::Registered);
+        assert_eq!(
+            hook_saw_folder.get(),
+            Some(false),
+            "the hook came after the folder"
+        );
+        assert_eq!(
+            register_saw_folder.get(),
+            Some(true),
+            "the store came before the folder"
+        );
+        assert!(root.is_dir());
+    }
+
     #[test]
     fn a_hook_with_no_notifier_is_dropped_not_run_on_the_caller() {
         let before = RAN.load(std::sync::atomic::Ordering::SeqCst);
-        let (tx, rx) = std::sync::mpsc::channel::<fn()>();
-        assert!(!queue_hook(None, count));
+        let (tx, rx) = std::sync::mpsc::channel::<HostCall>();
+        assert!(!queue_hook(None, Box::new(count)));
         drop(rx);
-        assert!(!queue_hook(Some(&tx), count));
+        assert!(!queue_hook(Some(&tx), Box::new(count)));
         assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), before);
     }
 
     #[test]
     fn a_hook_is_queued_not_run_inline() {
         let before = RAN.load(std::sync::atomic::Ordering::SeqCst);
-        let (tx, rx) = std::sync::mpsc::channel::<fn()>();
-        assert!(queue_hook(Some(&tx), count));
+        let (tx, rx) = std::sync::mpsc::channel::<HostCall>();
+        assert!(queue_hook(Some(&tx), Box::new(count)));
         assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), before);
         assert!(rx.try_recv().is_ok());
     }
@@ -437,6 +1018,36 @@ mod tests {
             ],
         };
         assert_eq!(d.cached_bytes(), 15);
+    }
+
+    /// A sign-out that kept its token runs the host's hook on the
+    /// notifier thread, in place of a reload.
+    #[test]
+    fn a_kept_token_reaches_the_host_hook() {
+        static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        fn hook() {
+            SEEN.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("kept".to_owned());
+        }
+        assert!(!credentials_kept(), "a hook ran with none registered");
+        assert_eq!(register_on_credentials_kept(hook), Ok(()));
+        assert!(credentials_kept());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            *SEEN
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            ["kept"]
+        );
     }
 
     #[test]

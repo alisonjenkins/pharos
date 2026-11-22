@@ -1,0 +1,14651 @@
+//! Downloaded video on a device's disk (spec 048, ADR 0145): the phone's
+//! [`VideoStore`], and any other host that has a directory to keep files in.
+//!
+//! Guarded by V1463 (whole files, path+query keys), V1464 (shared cap and
+//! free-space guard) and V1465 (every outcome logged) in
+//! `specs/001-pharos-baseline/invariants.md`.
+//!
+//! The same plan as the web store (`kept_video_web.rs`): the player's own
+//! HLS stream, every playlist, init and segment stored under the request
+//! key the player will ask for (`request_key`: path and query). Here a key
+//! is a file named by its hash under `<root>/<user>/<item>/files/`, beside
+//! the item's `manifest.json` (the [`KeptVideo`] record). A file is written
+//! to `<name>.part` and renamed once whole, so a file that exists is a file
+//! that is complete, and a restart refetches only what is missing.
+//!
+//! Bytes go from the network to the file chunk by chunk; nothing holds a
+//! whole video in memory. What the host brings is behind two small traits,
+//! so tests drive the loop with a fake server: [`Fetcher`] (the HTTP the
+//! app already uses, with its token and server address) and [`Budget`]
+//! (how much may be kept and how much room is left).
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
+
+use futures_util::stream::{self, StreamExt as _};
+use pharos_hls::offline::{estimate_bytes, plan_master, plan_media};
+use tokio::io::AsyncWriteExt as _;
+
+use super::kept_video::{
+    check_not_kept, content_type_for, find, fits, insert_front, interrupted, is_retryable,
+    localize_playlist, missing_files, new_record, progress_due, request_key, retry_delay_secs,
+    take, url_path, KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, Localized,
+    StoredFile, VideoStore,
+};
+use super::platform;
+
+/// Two files in flight: the link is the limit, and more would only make
+/// each segment slower to arrive whole.
+const CONCURRENCY: usize = 2;
+
+/// How far past what a media chunk needs a reservation grows, when that
+/// fits: one admission-lock hold covers many chunks.
+const RESERVATION_STEP: u64 = 1 << 20;
+
+/// Playlists are planned against this origin, then cut back to keys: the
+/// shared planner resolves relative URIs against an absolute URL.
+const PLAN_ORIGIN: &str = "http://pharos.invalid";
+
+pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Why a fetch failed: `status` is the server's answer, `None` when there
+/// was none (no network, a dropped connection).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{}", self.shown())]
+pub struct FetchError {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl FetchError {
+    fn shown(&self) -> String {
+        match self.status {
+            Some(s) => format!("status {s}"),
+            None => format!("network ({})", self.message),
+        }
+    }
+}
+
+/// A response body, read a chunk at a time.
+pub trait Body: Send {
+    /// The next chunk, or `None` at the end.
+    fn next_chunk(&mut self) -> BoxFut<'_, Result<Option<Vec<u8>>, FetchError>>;
+    /// The key the body was answered from after the server's redirects
+    /// (path and query, as [`request_key`] cuts it), when that is not the
+    /// key asked for: a playlist's relative references resolve against it.
+    fn final_key(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Why a request was not answered with a body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenFailed {
+    /// Sent, and failed or answered a non-success status.
+    Fetch(FetchError),
+    /// Not sent: the credentials the request would carry are not the run's
+    /// owner's ([`token_for_owner`](super::kept_video::token_for_owner)),
+    /// and why.
+    NotOwner(String),
+    /// Failed in a way no retry changes (no client could be built, too many
+    /// redirects, an answer from outside the server's base path), and why.
+    Refused(String),
+}
+
+impl From<FetchError> for OpenFailed {
+    fn from(e: FetchError) -> Self {
+        Self::Fetch(e)
+    }
+}
+
+/// The app's HTTP to its server: GET a request key (path and query) and
+/// stream the body. A non-success status is an `Err` carrying it.
+pub trait Fetcher: Send + Sync {
+    /// GET `key` for a run of `owner`'s. The credentials are read with the
+    /// request and sent only while they belong to `owner`: otherwise
+    /// nothing is sent and the answer is [`OpenFailed::NotOwner`].
+    fn open<'a>(
+        &'a self,
+        owner: &'a str,
+        key: &'a str,
+    ) -> BoxFut<'a, Result<Box<dyn Body>, OpenFailed>>;
+    /// Ok while the credentials requests would carry now belong to `owner`;
+    /// Err names why not. Asked under the store's lock before a fetched
+    /// file is promoted: it takes none of the store's locks (the token
+    /// file's own lock is the innermost).
+    fn check_owner(&self, owner: &str) -> Result<(), String>;
+    /// The server's address with its base path, which keys are under: a
+    /// playlist's references on it are stored as keys. The default is the
+    /// planning origin with no base path.
+    fn server_base(&self) -> String {
+        PLAN_ORIGIN.to_owned()
+    }
+}
+
+/// How much video may be kept and how much room there is.
+pub trait Budget: Send + Sync {
+    /// The most that downloaded media of every kind may take together.
+    fn cap_bytes(&self) -> u64;
+    /// What the other kinds (the phone's music) hold of that now.
+    fn other_used_bytes(&self) -> u64;
+    /// Free space on the device, measured now.
+    fn free_bytes(&self) -> u64;
+    /// Sets the one cap every kind shares. A host that cannot keeps it and
+    /// says why.
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        Err(format!(
+            "this device cannot change the cap to {bytes} bytes"
+        ))
+    }
+    /// Whether the other kinds' figures can be had yet. A host whose music
+    /// cache is not up reports the default cap and no music, so a new
+    /// download is refused until it is. Ready by default.
+    fn accounting_ready(&self) -> bool {
+        true
+    }
+    /// The other kinds' in-flight bytes, from one observation: what they
+    /// have been approved to write and not yet landed (the free space does
+    /// not lack it yet, but will), and what their running downloads have
+    /// already written (in the cap with `other_used_bytes`, never in the
+    /// free-space figure, since the disk already lacks it). One read, so a
+    /// write landing mid-read is counted in one figure, never both or
+    /// neither. Read under the admission lock, before the free space is
+    /// measured. The written figure is None when it could not all be read:
+    /// a new download is refused (`reason=music_size_unknown`) until it
+    /// can. (0, Some(0)) by default.
+    fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+        (0, Some(0))
+    }
+    /// Holds the lock a host shares between its kinds of download while an
+    /// admission reads the other kinds' bytes and reserves its own, so
+    /// neither kind admits against a figure the other is changing. Taken
+    /// before the store's own lock, always. No lock by default.
+    fn admission_guard(&self) -> Box<dyn std::any::Any> {
+        Box::new(())
+    }
+}
+
+/// What a host supplies besides the directory.
+pub struct Env {
+    pub fetcher: Arc<dyn Fetcher>,
+    pub budget: Arc<dyn Budget>,
+    /// Waits this many seconds (the retry backoff).
+    pub sleep: Arc<dyn Fn(u64) -> BoxFut<'static, ()> + Send + Sync>,
+    /// The time as ISO 8601 UTC.
+    pub now: fn() -> String,
+    /// The runtime the downloads run on.
+    pub runtime: tokio::runtime::Handle,
+    /// Deletes a folder and what is in it (`std::fs::remove_dir_all`; a
+    /// test makes it fail).
+    pub remove_dir: fn(&Path) -> std::io::Result<()>,
+}
+
+/// Why a download stopped before it was ready.
+#[derive(Debug)]
+enum Stop {
+    /// Removed while running: nothing more to record.
+    Gone,
+    /// Over the cap or short of space; stored playlists are deleted.
+    Refused(String),
+    /// A file could not be fetched or stored; stored files stay for a retry.
+    Failed(String),
+    /// The credentials are not the owner's (another user signed in): the
+    /// record and its files stay as they are, to resume for its owner.
+    Parked(String),
+}
+
+/// A user's request key to the whole files on disk that answer it, one per
+/// item folder: two of a user's downloads may store the same key, and
+/// removing one keeps the other's copy answering. A lookup answers with the
+/// copy indexed last.
+#[derive(Default)]
+struct Index(HashMap<(String, String), Vec<(PathBuf, u64)>>);
+
+impl Index {
+    /// Indexes `path` for `at`, replacing an earlier entry for that path.
+    fn insert(&mut self, at: (String, String), (path, len): (PathBuf, u64)) {
+        let copies = self.0.entry(at).or_default();
+        copies.retain(|(p, _)| *p != path);
+        copies.push((path, len));
+    }
+
+    /// Every copy indexed for `at`, oldest first.
+    fn copies(&self, at: &(String, String)) -> &[(PathBuf, u64)] {
+        self.0.get(at).map_or(&[], Vec::as_slice)
+    }
+
+    /// Keeps only the copies whose path `keep` accepts.
+    fn retain(&mut self, mut keep: impl FnMut(&Path) -> bool) {
+        self.0.retain(|_, copies| {
+            copies.retain(|(p, _)| keep(p));
+            !copies.is_empty()
+        });
+    }
+
+    /// Forgets the copy at `path` for `at`; any other copy stays.
+    fn remove(&mut self, at: &(String, String), path: &Path) {
+        if let Some(copies) = self.0.get_mut(at) {
+            copies.retain(|(p, _)| p != path);
+            if copies.is_empty() {
+                self.0.remove(at);
+            }
+        }
+    }
+
+    fn extend(&mut self, entries: impl IntoIterator<Item = ((String, String), (PathBuf, u64))>) {
+        for (at, copy) in entries {
+            self.insert(at, copy);
+        }
+    }
+}
+
+#[derive(Default)]
+struct State {
+    list: Vec<KeptVideo>,
+    /// Request key to the whole files on disk that answer it.
+    index: Index,
+    /// The run that owns each (user, item) download; a removed or restarted
+    /// download is told apart from the one still running by this number.
+    runs: HashMap<(String, String), u64>,
+    next_run: u64,
+    /// Bytes each run of a download has written to staging files not yet
+    /// whole: on disk already, so the free space lacks them, but not yet in
+    /// the record's stored bytes. Keyed by run: an old run still draining
+    /// after a restart stages bytes the new run's estimate never covered.
+    staged: HashMap<(String, String, u64), u64>,
+    /// Bytes of media chunks each run has checked against its reservation
+    /// and is writing now: owed still (not on disk yet), but spoken for, so
+    /// two fetches of one run cannot both spend the same headroom.
+    claimed: HashMap<(String, String, u64), u64>,
+    /// Per run of a resume, before its plan is admitted (the admission
+    /// drops it): what its folder held when its first playlist was
+    /// reserved, and the playlist allowances it has taken since.
+    playlists_taken: HashMap<(String, String, u64), (u64, u64)>,
+    /// Per run, before its plan is admitted: the bytes of the playlists it
+    /// has fetched and promoted. On disk, so no longer owed, but in no
+    /// stored figure until the plan's inventory counts them.
+    playlists_landed: HashMap<(String, String, u64), u64>,
+    /// Per run, after its plan is admitted: the bytes of media files it
+    /// has renamed to their final names and progress has not recorded
+    /// yet. On disk, so not owed, and in no stored figure until the
+    /// `publish` that counts them takes them out, in the same hold.
+    promoted: HashMap<(String, String, u64), u64>,
+    /// Per run, before its plan is admitted: the record's reservation
+    /// before the run's first playlist allowance. A run that ends with no
+    /// plan gives its allowances back down to this, keeping the playlists
+    /// that landed counted, and only on the record it was taken from (the
+    /// record's generation, `record_gen`, beside it).
+    playlists_base: HashMap<(String, String, u64), (u64, u64)>,
+    /// Parked runs whose playlist allowance a claim kept because their
+    /// writer was still going, by the run the record was handed to: that
+    /// run's exit gives the unused allowance back on the replacement's
+    /// record, while the replacement has reserved no playlist of its own.
+    handed_over: HashMap<(String, String, u64), u64>,
+    /// Which run last took an item's record, by the run id every claim sets
+    /// ([`State::claim_run`]): a new start, a resume or a handoff moves it,
+    /// and a stale run's exit must not change the new run's reservation.
+    /// Records read at open have none (0).
+    record_gen: HashMap<(String, String), u64>,
+    /// Starts whose first record is not saved yet, by the run they claimed:
+    /// a failed save rolls back its own record even when a session end has
+    /// parked (revoked) that run, and never a newer start's. A removal or a
+    /// newer start drops or replaces the entry.
+    pending_starts: HashMap<(String, String), u64>,
+    /// Sign-ins that found their download's start not saved yet: resumed
+    /// by the start once its save settles (a saved start whose run a
+    /// sign-out parked starts a new one), dropped by its rollback.
+    resume_after_save: HashSet<(String, String)>,
+    /// Staging files a settlement measured but could not delete, in a
+    /// folder a run owns (its plan not yet admitted): bytes on disk that
+    /// no plan inventory counts. The plan admitted next reserves them on
+    /// top of its own; cleared when the run leaves (its exit drops or
+    /// counts them again).
+    retained_parts: HashMap<PathBuf, u64>,
+    /// Folders of removed downloads that could not be deleted, with the
+    /// bytes left in them: counted against the cap until a later sweep
+    /// deletes them.
+    tombstones: Vec<(PathBuf, u64)>,
+    /// Folders found at open whose record could not be read: kept, never
+    /// swept, and counted against the cap at the bytes measured.
+    held: Vec<(PathBuf, u64)>,
+    /// Folders found at open whose size or record is not known (unlistable,
+    /// unreadable, damaged): no download is admitted while one exists. The
+    /// reason travels with it. Folders of removed downloads are not here:
+    /// whether those are known is derived (`State::unknown_reason`) from
+    /// the facts below, never stored as a mark that has to be cleared.
+    unmeasured: Vec<(PathBuf, String)>,
+    /// Folders (the root, a user's) that could not be listed at open: a sweep
+    /// lists them again, and their block lifts only once the listing succeeds
+    /// and everything found is counted.
+    relist: Vec<PathBuf>,
+    /// Folders of `relist` a sweep has claimed and is listing now. Held
+    /// from before the listing until what it found is adopted and its runs
+    /// installed: a second sweep that scanned the same folder meanwhile
+    /// would adopt a record again and delete the new run's staging files.
+    relisting: Vec<PathBuf>,
+    /// Folders of adopted records whose walk was not whole: a sweep measures
+    /// them again, and the record's floor is taken from the whole walk.
+    remeasure: Vec<PathBuf>,
+    /// Folders of `remeasure` a sweep is walking now, with the epoch it
+    /// claimed them at: a second sweep leaves them alone, and the walk is
+    /// applied only if the folder is still at that epoch and idle.
+    remeasuring: Vec<(PathBuf, u64)>,
+    /// Folders a `remove` is working on right now. A sweep leaves them
+    /// alone, and while one is listed its folder is of unknown size.
+    removing: Vec<PathBuf>,
+    /// Staging files being written, by run (a run writes several at once).
+    /// A removal revokes its run, but a write already under way goes on to
+    /// the next chunk's check: while a revoked run has a writer its folder
+    /// is of unknown size.
+    writers: HashMap<(String, String, u64), usize>,
+    /// Folders a sweep has picked and is deleting. Picked under the same
+    /// hold that checked nothing owns them, and refused to `start` until
+    /// the delete is over: a download restarted in that gap would have its
+    /// new files deleted.
+    deleting: Vec<PathBuf>,
+    /// Folders where a staging file could not be deleted: nothing bounds
+    /// them until a later sweep deletes the file or measures the folder
+    /// whole, so they are unknown meanwhile. A fact, so accounting does not
+    /// depend on a cleanup having worked.
+    leftover: Vec<PathBuf>,
+    /// Folders whose staging files the host's size check found and left
+    /// (counted, measured whole): the next ordinary sweep deletes them.
+    deferred_parts: Vec<PathBuf>,
+    /// Folders whose leftover a sweep is settling right now. One settlement
+    /// per folder at a time, and `start` refuses a folder in it: a second
+    /// sweep (or a retry) would otherwise act on what the first one saw
+    /// before the folder changed.
+    settling: Vec<PathBuf>,
+    /// Folders whose run is publishing its terminal record, one entry per
+    /// run. From before the run measures the folder until its terminal
+    /// figure and any leftover are published, in one hold, a settlement
+    /// leaves the folder alone: one in between would measure the staging
+    /// files, clear the leftover, and then have the terminal figure (which
+    /// counts no staging file) replace its measure.
+    terminating: Vec<PathBuf>,
+    /// Runs that were refused the credentials and are parking: from the
+    /// refusal until the run gives up its id. A sign-in in that window
+    /// cannot start a run (the id is still taken), so it is kept here.
+    parking: HashMap<(String, String), u64>,
+    /// Sign-ins that arrived while the item's run was parking, by the run
+    /// that was parking: that run starts a new one as it gives up its id.
+    resume_pending: HashMap<(String, String), u64>,
+    /// The last measurement of each tombstoned folder: the epoch it was
+    /// taken at, and whether the walk read everything.
+    measured: HashMap<PathBuf, (u64, bool)>,
+    /// Per folder, moved by every event that can change its size under a
+    /// measurement: a writer starting or stopping, a removal beginning. A
+    /// measurement is valid only at the epoch it was taken at.
+    epochs: HashMap<PathBuf, u64>,
+    /// The store's root, to tell a record's folder from a tombstone's.
+    root: PathBuf,
+    last_saved: Option<Instant>,
+}
+
+struct Inner {
+    root: PathBuf,
+    env: Env,
+    state: Mutex<State>,
+    /// Held while a record is written or an item's folder is removed.
+    ///
+    /// Lock order: the host's admission guard (`Budget::admission_guard`)
+    /// first, then `saves`, then `state`. A save made under admission (a
+    /// plan's, an extended reservation's) takes them in that order, so
+    /// nothing may take admission while holding `saves`.
+    saves: Mutex<()>,
+    /// When the unknown-size sweep last ran from the host's size check.
+    last_sweep: Mutex<Option<std::time::Instant>>,
+    /// A readiness poll's sweep of the held folders is running on the
+    /// blocking pool: a poll meanwhile starts no second one.
+    ready_sweeping: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Called by `sweep_relist` at its steps, for a test to interleave two.
+    #[cfg(test)]
+    relist_hook: Mutex<Option<RelistHook>>,
+    /// Sweeps the host's size check has run, on any thread.
+    #[cfg(test)]
+    host_sweeps: std::sync::atomic::AtomicUsize,
+    /// The items whose plan `admit` has admitted, in order.
+    #[cfg(test)]
+    plans_admitted: Mutex<Vec<String>>,
+}
+
+/// A test's hook into `sweep_relist`, given the step reached.
+#[cfg(test)]
+type RelistHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+/// The store of downloaded video on disk.
+pub struct DiskVideoStore {
+    inner: Arc<Inner>,
+}
+
+fn emit(warn: bool, line: String) {
+    #[cfg(test)]
+    tests::CAPTURED.with(|c| c.borrow_mut().push(line.clone()));
+    if warn {
+        platform::warn(&line);
+    } else {
+        platform::info(&line);
+    }
+}
+
+/// A path component made of `name`: letters, digits, `-` and `_` as they
+/// are, anything else as `%` and its hex, so no id can climb out of `root`.
+fn safe_name(name: &str) -> String {
+    if name.is_empty() {
+        return "_".to_owned();
+    }
+    name.bytes()
+        .map(|b| match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => char::from(b).to_string(),
+            _ => format!("%{b:02x}"),
+        })
+        .collect()
+}
+
+/// The file name for `key`: 128 bits from two seeded FNV-1a runs. Two
+/// keys of one download meeting is not a case worth a lookup table, and a
+/// collision would serve the wrong segment, so the width is generous.
+fn file_name(key: &str) -> String {
+    fn fnv(seed: u64, bytes: &[u8]) -> u64 {
+        bytes.iter().fold(seed, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+    let a = fnv(0xcbf2_9ce4_8422_2325, key.as_bytes());
+    let b = fnv(0x84222325_cbf29ce4, key.as_bytes());
+    format!("{a:016x}{b:016x}")
+}
+
+/// The time as ISO 8601 UTC, from the system clock.
+pub fn iso_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    iso_from_secs(secs)
+}
+
+fn iso_from_secs(secs: u64) -> String {
+    let days = i64::try_from(secs / 86_400).unwrap_or(0);
+    let rem = secs % 86_400;
+    // Civil date from days since 1970-01-01 (Hinnant's algorithm).
+    let z = days.saturating_add(719_468);
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
+/// The planned download, as [`Inner::admit`] records it.
+#[derive(Clone)]
+struct Plan {
+    files: Vec<String>,
+    estimate: u64,
+    total: u32,
+    /// Bytes of the plan already on disk: a resumed download's, or files a
+    /// failed attempt left that a new download's plan names again.
+    stored: u64,
+    /// Bytes on disk that are no stored file of the plan: an earlier plan's
+    /// files that could not be deleted, and an entry under a planned name
+    /// that is not a regular file. Against the cap, though in no other
+    /// figure.
+    stale: u64,
+}
+
+impl Plan {
+    /// What the plan holds against the cap: the larger of its estimate and
+    /// the planned bytes already on disk (a file can be larger than
+    /// planned), plus the stale files it could not prune, which are on disk
+    /// too and in neither figure.
+    fn wants(&self) -> u64 {
+        self.estimate.max(self.stored).saturating_add(self.stale)
+    }
+}
+
+/// The room a download is admitted against, read by the caller.
+#[derive(Clone, Copy)]
+enum Check {
+    /// A new download: the other kinds' bytes and the cap, read after
+    /// `ready` (whether the accounting was up before they were read: it
+    /// never goes down once up, so a figure read after a true `ready` is a
+    /// real one).
+    /// `unknown`: the other kinds' unfinished downloads could not be
+    /// measured, so the figure in `other` is a lower bound.
+    Fresh {
+        other: u64,
+        cap: u64,
+        ready: bool,
+        unknown: bool,
+    },
+    /// A resumed one, with the shared figures read as for `Fresh`: a plan
+    /// that admission widens past the reservation (staging files a
+    /// settlement kept) is checked against the shared cap with them.
+    Resume {
+        other: u64,
+        cap: u64,
+        ready: bool,
+        unknown: bool,
+    },
+}
+
+enum Admission {
+    /// Removed or restarted meanwhile.
+    Gone,
+    /// The plan was admitted in memory but its record could not be saved.
+    Unsaved(std::io::Error),
+    Refused {
+        refusal: KeepVideoRefusal,
+        /// What the other downloads and kinds hold or have reserved.
+        used: u64,
+        /// The free space as measured.
+        free: u64,
+        /// What the other running downloads still have to write.
+        outstanding: u64,
+    },
+}
+
+/// What a record holds against the shared cap: the larger of what it has
+/// stored and what it expects to take, so a download still under way
+/// reserves its whole estimate.
+fn reserved(v: &KeptVideo) -> u64 {
+    v.bytes().max(v.estimated_bytes)
+}
+
+impl State {
+    fn dir_of(&self, user: &str, item: &str) -> PathBuf {
+        self.root.join(safe_name(user)).join(safe_name(item))
+    }
+
+    /// Whether a staging file is still being written in `dir`.
+    fn writing(&self, dir: &Path) -> bool {
+        self.writers
+            .keys()
+            .any(|(u, i, _)| self.dir_of(u, i) == *dir)
+    }
+
+    fn epoch(&self, dir: &Path) -> u64 {
+        self.epochs.get(dir).copied().unwrap_or(0)
+    }
+
+    /// Something that can change `dir`'s size happened: measurements taken
+    /// before it no longer count.
+    fn bump(&mut self, dir: &Path) {
+        *self.epochs.entry(dir.to_path_buf()).or_default() += 1;
+    }
+
+    /// Forgets a tombstone and everything derived about it.
+    fn drop_tombstone(&mut self, dir: &Path) {
+        self.tombstones.retain(|(d, _)| d != dir);
+        self.measured.remove(dir);
+        self.removing.retain(|d| d != dir);
+    }
+
+    /// The first folder whose size is not known, and why. Derived from the
+    /// facts each time: a stored mark is only the open's findings. A folder
+    /// is unknown while a revoked run's writer is running in it with no
+    /// run owning the item (whether or not its record is back), while its removal is in flight, and, once
+    /// tombstoned, until a measurement that read everything was taken after
+    /// the last event that could change it.
+    fn unknown_reason(&self) -> Option<(PathBuf, String)> {
+        if let Some((dir, why)) = self.unmeasured.first() {
+            return Some((dir.clone(), why.clone()));
+        }
+        if let Some(dir) = self.leftover.first() {
+            return Some((
+                dir.clone(),
+                "a staging file could not be deleted".to_owned(),
+            ));
+        }
+        for (user, item, _) in self.writers.keys() {
+            // With another run owning the item, the stale run's bytes are
+            // counted under it (`staged`, the owner's estimate); with none
+            // (a removal, or a record put back) nothing bounds them.
+            // A folder that was deleted has nothing left to bound: the
+            // writer's file is an unlinked one.
+            let dir = self.dir_of(user, item);
+            let kept = find(&self.list, user, item).is_some()
+                || self.tombstones.iter().any(|(d, _)| *d == dir);
+            if kept && !self.runs.contains_key(&(user.clone(), item.clone())) {
+                return Some((
+                    self.dir_of(user, item),
+                    "a revoked run's writer is still running".to_owned(),
+                ));
+            }
+        }
+        for (dir, _) in &self.tombstones {
+            if self.removing.contains(dir) {
+                return Some((dir.clone(), "being removed, not yet measured".to_owned()));
+            }
+            if self.measured.get(dir) != Some(&(self.epoch(dir), true)) {
+                return Some((
+                    dir.clone(),
+                    "folder not deleted, not measured whole since it last changed".to_owned(),
+                ));
+            }
+        }
+        None
+    }
+
+    /// Bytes in the folders of removed downloads that would not delete,
+    /// leaving out one a live record has since taken over.
+    fn tombstoned(&self) -> u64 {
+        self.tombstones
+            .iter()
+            .chain(self.held.iter())
+            .filter(|(dir, _)| {
+                !self
+                    .list
+                    .iter()
+                    .any(|v| self.root.join(safe_name(&v.user)).join(safe_name(&v.item)) == *dir)
+            })
+            .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
+    }
+
+    /// Why nothing can be admitted now, when a folder's size is unknown.
+    fn unknown_folder(&self) -> Option<KeepVideoRefusal> {
+        self.unknown_reason().map(|(dir, why)| {
+            KeepVideoRefusal::Host(format!(
+                "the size of {} is unknown ({why}), so the cap cannot be checked",
+                dir.display()
+            ))
+        })
+    }
+
+    /// Every video's reservation but `item`'s own, and the tombstones'.
+    fn reserved_by_others(&self, user: &str, item: &str) -> u64 {
+        reserved_by_others(&self.list, user, item)
+            .saturating_add(self.tombstoned())
+            .saturating_add(self.draining())
+    }
+
+    /// Bytes revoked runs still have staged where another run now owns the
+    /// item (a park and an immediate resume): on disk, and in no
+    /// reservation, until the revoked writer stops and deletes its file.
+    /// A revoked run whose item no run owns is bounded instead by the
+    /// folder being of unknown size (`unknown_reason`).
+    fn draining(&self) -> u64 {
+        self.staged
+            .iter()
+            .filter(|((user, item, run), _)| {
+                self.runs
+                    .get(&(user.clone(), item.clone()))
+                    .is_some_and(|owner| owner != run)
+            })
+            .fold(0u64, |sum, (_, n)| sum.saturating_add(*n))
+    }
+
+    /// Whether a run of `user`'s `item` other than `run` still has a
+    /// staging file open.
+    fn revoked_writer(&self, user: &str, item: &str, run: u64) -> bool {
+        self.writers
+            .keys()
+            .any(|(u, i, r)| u == user && i == item && *r != run)
+    }
+
+    /// Names a new run the owner of `user`'s `item` and returns its id.
+    /// Names a new run for `user`'s `item`. The record's generation moves to
+    /// it too, whether a start, a resume or a handoff claimed it: a run
+    /// that took allowances before then is stale on that record, and its
+    /// late exit gives nothing back from the new run's reservation.
+    /// Gives back what earlier runs of `user`'s `item` took as
+    /// playlist allowances before a plan, down to the record's reservation
+    /// before them plus the playlists that landed (on disk), and forgets
+    /// them, so their exit has nothing left to release. Only on the record
+    /// they were taken from (its generation); a replaced record's are
+    /// dropped with no change. Called under the state lock before a claim
+    /// with no run in `runs`: a parked run's allowances are settled while
+    /// the record is still its own, and its late exit cannot touch the
+    /// replacement's reservation.
+    /// Returns the runs whose allowance it kept for a running writer.
+    fn release_preplan_allowances(&mut self, user: &str, item: &str) -> Vec<u64> {
+        let mut kept = Vec::new();
+        let stale: Vec<u64> = self
+            .playlists_taken
+            .keys()
+            .filter(|(u, i, _)| u == user && i == item)
+            .map(|(_, _, run)| *run)
+            .collect();
+        let gen = self
+            .record_gen
+            .get(&(user.to_owned(), item.to_owned()))
+            .copied()
+            .unwrap_or(0);
+        for run in stale {
+            let who = (user.to_owned(), item.to_owned(), run);
+            // A revoked run whose writer is still going may yet land a
+            // playlist write in its allowance: it stays reserved on the
+            // record until the new run's plan replaces the estimate.
+            if self.writers.get(&who).is_some_and(|n| *n > 0) {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video playlist allowance kept item={item} run={run} reason=writer_running"
+                    ),
+                );
+                kept.push(run);
+                continue;
+            }
+            self.playlists_taken.remove(&who);
+            let landed = self.playlists_landed.remove(&who).unwrap_or(0);
+            let base = self.playlists_base.remove(&who);
+            let Some((base, _)) = base.filter(|(_, g)| *g == gen) else {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video playlist allowance kept item={item} run={run} reason=record_replaced"
+                    ),
+                );
+                continue;
+            };
+            if let Some(v) = self
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            {
+                let to = base.saturating_add(landed).min(v.estimated_bytes);
+                if to < v.estimated_bytes {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video playlist allowance released item={item} run={run} from={} to={to} landed={landed} reason=reclaimed_before_claim",
+                            v.estimated_bytes
+                        ),
+                    );
+                    v.estimated_bytes = to;
+                }
+            }
+        }
+        kept
+    }
+
+    /// Settles a parked download's earlier runs' playlist allowances
+    /// ([`State::release_preplan_allowances`]) and claims a new run for
+    /// it, in one hold. An allowance kept for a running writer is handed
+    /// over to the new run's record: the parked run's exit gives back what
+    /// it did not use there, until the new run reserves a playlist.
+    fn claim_parked(&mut self, user: &str, item: &str) -> u64 {
+        let kept = self.release_preplan_allowances(user, item);
+        let id = self.claim_run(user, item);
+        for run in kept {
+            self.handed_over
+                .insert((user.to_owned(), item.to_owned(), run), id);
+            emit(
+                false,
+                format!(
+                    "pharos: video playlist allowance handed_over item={item} run={run} to_run={id}"
+                ),
+            );
+        }
+        id
+    }
+
+    fn claim_run(&mut self, user: &str, item: &str) -> u64 {
+        self.next_run = self.next_run.wrapping_add(1);
+        let id = self.next_run;
+        let key = (user.to_owned(), item.to_owned());
+        self.runs.insert(key.clone(), id);
+        self.record_gen.insert(key, id);
+        id
+    }
+
+    /// What `run` of `v`'s download has on disk of its reservation: its
+    /// whole files, its staged (flushed) bytes and the stale files its plan
+    /// could not prune. Chunks it has claimed
+    /// and not yet written are not here: the free space still holds them.
+    fn run_on_disk(&self, v: &KeptVideo, run: u64) -> u64 {
+        let who = (v.user.clone(), v.item.clone(), run);
+        let stored = match v.state {
+            KeptState::Downloading { bytes, .. } => bytes,
+            _ => v.bytes(),
+        };
+        let stale = v.stale_on_disk;
+        stored
+            .saturating_add(self.staged.get(&who).copied().unwrap_or(0))
+            .saturating_add(self.promoted.get(&who).copied().unwrap_or(0))
+            .saturating_add(stale)
+    }
+
+    /// What `run` holds of its reservation: what it has on disk and the
+    /// chunks it has claimed to write.
+    fn run_holds(&self, v: &KeptVideo, run: u64) -> u64 {
+        let who = (v.user.clone(), v.item.clone(), run);
+        self.run_on_disk(v, run)
+            .saturating_add(self.claimed.get(&who).copied().unwrap_or(0))
+    }
+
+    fn unclaim(&mut self, who: &(String, String, u64), n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(c) = self.claimed.get_mut(who) {
+            *c = c.saturating_sub(n);
+            if *c == 0 {
+                self.claimed.remove(who);
+            }
+        }
+    }
+
+    /// What a running download has yet to write of its reservation: the
+    /// reservation less everything of it already on disk
+    /// ([`State::run_on_disk`]: its whole files, its staged bytes and the
+    /// stale files its plan could not prune). The free space already lacks
+    /// what is on disk, so only the rest is still to come out of it. This is
+    /// the one place a figure owed to the disk is taken: every admission's
+    /// owed figure is built from it. `run` is the run that owns the record;
+    /// with none, nothing is staged under it.
+    fn owed(&self, v: &KeptVideo, run: Option<u64>) -> u64 {
+        let on_disk = match run {
+            // A playlist promoted before the plan is on disk too: what it
+            // took of its allowance is written, not owed.
+            Some(run) => self.run_on_disk(v, run).saturating_add(
+                self.playlists_landed
+                    .get(&(v.user.clone(), v.item.clone(), run))
+                    .copied()
+                    .unwrap_or(0),
+            ),
+            None => {
+                let stored = match v.state {
+                    KeptState::Downloading { bytes, .. } => bytes,
+                    _ => v.bytes(),
+                };
+                stored.saturating_add(v.stale_on_disk)
+            }
+        };
+        v.estimated_bytes.saturating_sub(on_disk)
+    }
+
+    /// What the other running downloads have yet to write ([`State::owed`]).
+    /// What every record holds or has reserved, with the tombstones and
+    /// the revoked runs still draining.
+    fn kept(&self) -> u64 {
+        self.list
+            .iter()
+            .map(reserved)
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(self.tombstoned())
+            .saturating_add(self.draining())
+    }
+
+    /// A download parked with no run (a session end) writes nothing until
+    /// it resumes, which admits its plan against the free space again: its
+    /// reservation stays in [`State::kept`], but none of it is owed here.
+    /// One whose revoked writer is still going is owed still, since that
+    /// write may yet land.
+    fn outstanding(&self, user: &str, item: &str) -> u64 {
+        self.list
+            .iter()
+            .filter(|v| !(v.user == user && v.item == item))
+            .filter(|v| matches!(v.state, KeptState::Downloading { .. }))
+            .filter_map(|v| {
+                let run = self.runs.get(&(v.user.clone(), v.item.clone())).copied();
+                let writing = self
+                    .writers
+                    .keys()
+                    .any(|(u, i, _)| *u == v.user && *i == v.item);
+                (run.is_some() || writing).then(|| self.owed(v, run))
+            })
+            .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// A download's bytes in a staging file, counted in [`State::staged`] until
+/// the file is whole, promoted or dropped.
+struct Staged<'a> {
+    inner: &'a Inner,
+    who: (String, String, u64),
+    len: u64,
+    part: PathBuf,
+    /// Bytes claimed against the reservation for the chunk being written.
+    claim: u64,
+    /// Set once the file is under its final name: dropping it then only
+    /// moves its bytes from staged to stored.
+    promoted: bool,
+    /// Why the file is given up, for the log; "dropped" when no failure
+    /// path named one: the fetch was cancelled.
+    why: &'static str,
+}
+
+impl Staged<'_> {
+    fn add(&mut self, n: u64) {
+        self.len = self.len.saturating_add(n);
+        let mut st = lock(&self.inner.state);
+        let held = st.staged.entry(self.who.clone()).or_default();
+        *held = held.saturating_add(n);
+        // A claimed chunk moves from claimed to staged in one hold.
+        let moved = std::mem::take(&mut self.claim);
+        st.unclaim(&self.who, moved);
+    }
+
+    /// Claims `n` bytes of the run's reservation for the next media chunk,
+    /// extending the reservation first when it would be passed. Err with
+    /// the reason when the extension does not fit.
+    fn claim(&mut self, n: u64) -> Result<(), ClaimRefused> {
+        let (user, item, run) = (&self.who.0, &self.who.1, self.who.2);
+        for _ in 0..2 {
+            let need = {
+                let mut st = lock(&self.inner.state);
+                if st.runs.get(&(user.clone(), item.clone())) != Some(&run) {
+                    return Err(ClaimRefused::Gone);
+                }
+                let Some(v) = find(&st.list, user, item) else {
+                    return Err(ClaimRefused::Gone);
+                };
+                let need = st.run_holds(v, run).saturating_add(n);
+                if need <= v.estimated_bytes {
+                    *st.claimed.entry(self.who.clone()).or_default() += n;
+                    self.claim = self.claim.saturating_add(n);
+                    return Ok(());
+                }
+                need
+            };
+            self.inner.extend_reservation(user, item, run, need)?;
+        }
+        Err(ClaimRefused::Reason(
+            "the reservation could not be extended for the chunk".to_owned(),
+        ))
+    }
+}
+
+impl Staged<'_> {
+    /// Gives up the staging file, naming why. The work is in `Drop`, so a
+    /// path that returns without calling this cleans up the same way.
+    fn abandon(mut self, why: &'static str) {
+        self.why = why;
+    }
+}
+
+/// What became of a fetched file at its promotion.
+enum Promote {
+    /// Renamed to its final name, or the rename's error.
+    Renamed(std::io::Result<()>),
+    /// The run no longer owns the download.
+    NotOwned,
+    /// The credentials are not the owner's, and why.
+    NotOwner(String),
+}
+
+/// Why a media chunk was not written.
+enum ClaimRefused {
+    /// The run no longer owns the download.
+    Gone,
+    /// The reservation could not grow to hold it, and why.
+    Reason(String),
+}
+
+impl Drop for Staged<'_> {
+    /// Deletes a file that was not promoted and rolls its accounting back
+    /// (staged and claimed bytes become owed again) in one hold of the
+    /// shared admission lock, then the store's lock, on every path: a
+    /// failure, a revoked run, a cancelled fetch. A music check reads the
+    /// video's owed bytes and then the free space under the admission lock:
+    /// the deletion alone in between would show the bytes freed while still
+    /// counted written. Never dropped while either lock is held.
+    fn drop(&mut self) {
+        let _admission = self.inner.env.budget.admission_guard();
+        let mut st = lock(&self.inner.state);
+        let dir = st.dir_of(&self.who.0, &self.who.1);
+        // The file goes before its writer is unregistered, so a folder is
+        // not bounded while it could be there.
+        let part = if self.promoted {
+            None
+        } else {
+            Some(match remove_part(&self.part) {
+                Ok(()) => "removed".to_owned(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => "absent".to_owned(),
+                Err(e) => {
+                    if !st.leftover.contains(&dir) {
+                        st.leftover.push(dir.clone());
+                    }
+                    format!("left error={e}")
+                }
+            })
+        };
+        st.bump(&dir);
+        if let Some(n) = st.writers.get_mut(&self.who) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                st.writers.remove(&self.who);
+            }
+        }
+        if let Some(held) = st.staged.get_mut(&self.who) {
+            *held = held.saturating_sub(self.len);
+            if *held == 0 {
+                st.staged.remove(&self.who);
+            }
+        }
+        // A playlist promoted before the plan was moved to landed in the
+        // hold that renamed it (its `len` is 0 since): nothing to move.
+        let claim = std::mem::take(&mut self.claim);
+        st.unclaim(&self.who, claim);
+        drop(st);
+        if let Some(part) = part {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep staging dropped item={} reason={} staged={} claimed={claim} part={part} under=admission_lock",
+                    self.who.1, self.why, self.len
+                ),
+            );
+        }
+    }
+}
+
+/// Every video's reservation but `item`'s own.
+fn reserved_by_others(list: &[KeptVideo], user: &str, item: &str) -> u64 {
+    list.iter()
+        .filter(|v| !(v.user == user && v.item == item))
+        .map(reserved)
+        .fold(0u64, u64::saturating_add)
+}
+
+fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Inner {
+    /// Tries again to delete the folders of removed downloads that would
+    /// not go; the ones that do stop counting. A folder a live record has
+    /// taken over is left to that record.
+    fn sweep_tombstones(&self) {
+        // Staging files the host's check left are settled (deleted, the
+        // folder measured) here, with the leftovers.
+        {
+            let mut st = lock(&self.state);
+            let deferred = std::mem::take(&mut st.deferred_parts);
+            for dir in deferred {
+                if !st.leftover.contains(&dir) {
+                    st.leftover.push(dir);
+                }
+            }
+        }
+        self.settle_leftovers(Sweep::Ordinary);
+        let pending: Vec<PathBuf> = {
+            let mut st = lock(&self.state);
+            let picked: Vec<PathBuf> = st
+                .tombstones
+                .iter()
+                .map(|(dir, _)| dir.clone())
+                .filter(|dir| {
+                    !st.removing.contains(dir)
+                        && !st.deleting.contains(dir)
+                        && !st.writing(dir)
+                        && !st
+                            .list
+                            .iter()
+                            .any(|v| self.item_dir(&v.user, &v.item) == *dir)
+                })
+                .collect();
+            st.deleting.extend(picked.iter().cloned());
+            picked
+        };
+        for dir in pending {
+            let outcome = (self.env.remove_dir)(&dir);
+            {
+                let mut st = lock(&self.state);
+                st.deleting.retain(|d| *d != dir);
+                if st.removing.contains(&dir)
+                    || st.writing(&dir)
+                    || st
+                        .list
+                        .iter()
+                        .any(|v| self.item_dir(&v.user, &v.item) == dir)
+                {
+                    // A removal began while the delete ran: it owns the folder.
+                    continue;
+                }
+                if outcome.is_ok() {
+                    st.drop_tombstone(&dir);
+                    drop(st);
+                    emit(
+                        false,
+                        format!("pharos: video keep tombstone cleared dir={}", dir.display()),
+                    );
+                    continue;
+                }
+            }
+            if let Err(e) = outcome {
+                let bytes = self.measure_tombstone(&dir);
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep tombstone kept dir={} bytes={bytes} error={e}",
+                        dir.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Resolves folders where a staging file could not be deleted: with no
+    /// writer in one, the files are deleted if no run owns the item, and
+    /// the folder is then measured whole (staging files included); read in
+    /// full, its bytes are taken into the figure that counts for it (the
+    /// record's reservation, saved, or the tombstone's) and the fact clears.
+    /// A folder that cannot be read whole, or whose save failed, stays
+    /// unknown. One settlement per folder at a time.
+    fn settle_leftovers(&self, sweep: Sweep) {
+        let dirs: Vec<PathBuf> = {
+            let st = lock(&self.state);
+            st.leftover
+                .iter()
+                .filter(|d| {
+                    !st.writing(d)
+                        && !st.removing.contains(d)
+                        && !st.settling.contains(d)
+                        && !st.terminating.contains(d)
+                })
+                .cloned()
+                .collect()
+        };
+        for dir in dirs {
+            let claimed = {
+                let mut st = lock(&self.state);
+                if st.settling.contains(&dir)
+                    || st.writing(&dir)
+                    || st.removing.contains(&dir)
+                    || st.terminating.contains(&dir)
+                {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep leftover settle verdict=skipped dir={} reason=busy",
+                            dir.display()
+                        ),
+                    );
+                    None
+                } else {
+                    st.settling.push(dir.clone());
+                    let owned = st.runs.keys().any(|(u, i)| st.dir_of(u, i) == dir);
+                    Some((st.epoch(&dir), owned))
+                }
+            };
+            let Some((epoch, owned)) = claimed else {
+                continue;
+            };
+            // The host's check deletes no staging file: it settles on the
+            // whole folder's measure (the files included) and leaves the
+            // files to the next ordinary sweep.
+            let host = sweep == Sweep::HostCheck;
+            self.settle_claimed(&dir, epoch, owned || host);
+            let mut st = lock(&self.state);
+            st.settling.retain(|d| *d != dir);
+            if host && !owned && !st.deferred_parts.contains(&dir) {
+                st.deferred_parts.push(dir.clone());
+            }
+        }
+    }
+
+    /// Whether `dir` is still as a settlement that began at `epoch` found
+    /// it: no writer, no removal, no run publishing its terminal record, no
+    /// move of its epoch.
+    fn unchanged_since(st: &State, dir: &Path, epoch: u64) -> bool {
+        st.epoch(dir) == epoch
+            && !st.writing(dir)
+            && !st.removing.iter().any(|d| d == dir)
+            && !st.terminating.iter().any(|d| d == dir)
+    }
+
+    fn settle_claimed(&self, dir: &Path, epoch: u64, owned: bool) {
+        #[cfg(test)]
+        tests::before_settle_drop();
+        if !owned {
+            self.drop_parts_settling(dir, epoch);
+        }
+        let measured = dir_size(dir);
+        #[cfg(test)]
+        tests::during_measure();
+        let (record, saved_floor) = {
+            let mut st = lock(&self.state);
+            // Only a whole measure settles the folder.
+            let Some(measured) = measured.whole() else {
+                return;
+            };
+            if !Self::unchanged_since(&st, dir, epoch) {
+                return;
+            }
+            let record = st
+                .list
+                .iter()
+                .position(|v| st.dir_of(&v.user, &v.item) == dir);
+            let tomb = st.tombstones.iter().position(|(d, _)| d == dir);
+            let mut ident = None;
+            if let Some(i) = record {
+                let (user, item) = (st.list[i].user.clone(), st.list[i].item.clone());
+                let running = st.runs.contains_key(&(user.clone(), item.clone()));
+                let v = &mut st.list[i];
+                // A terminal record with no run is charged what the whole
+                // measure found: staging files the sweep deleted go back to
+                // the budget. An interrupted plan (Downloading, no run) keeps
+                // its reservation for what it will fetch.
+                let terminal = !running && !matches!(v.state, KeptState::Downloading { .. });
+                let charge = if terminal {
+                    measured
+                } else {
+                    v.estimated_bytes.max(measured)
+                };
+                if charge != v.estimated_bytes {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep charge verdict={} item={item} from={} to={charge} measured={measured}",
+                            if terminal { "measured" } else { "raised" },
+                            v.estimated_bytes
+                        ),
+                    );
+                }
+                v.estimated_bytes = charge;
+                ident = Some((user, item));
+            }
+            if let Some(i) = tomb {
+                st.tombstones[i].1 = st.tombstones[i].1.max(measured);
+            }
+            (ident, measured)
+        };
+        // The larger reservation must be on disk before the fact clears: a
+        // restart would otherwise read the old, smaller one.
+        if let Some((user, item)) = &record {
+            if self.save_record(user, item).is_err() {
+                return;
+            }
+        }
+        // What the staging files hold now, after any deletion above: a
+        // run's stay, and one that would not delete stays too. The plan
+        // admitted next must reserve them (its inventory leaves `.part` out).
+        let retained = parts_bytes(dir);
+        // Staging files that could not all be measured: what the plan
+        // would reserve for them is not known, so the folder stays unknown.
+        let Some(retained) = retained.whole() else {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep leftover verdict=kept reason=staging_files_unmeasured dir={}",
+                    dir.display()
+                ),
+            );
+            return;
+        };
+        let mut st = lock(&self.state);
+        if !Self::unchanged_since(&st, dir, epoch) {
+            return;
+        }
+        st.leftover.retain(|d| d != dir);
+        if retained > 0 {
+            st.retained_parts.insert(dir.to_path_buf(), retained);
+        } else {
+            st.retained_parts.remove(dir);
+        }
+        drop(st);
+        emit(
+            false,
+            format!(
+                "pharos: video keep leftover settled dir={} bytes={saved_floor}",
+                dir.display()
+            ),
+        );
+    }
+
+    /// Deletes the staging files in `dir`, each under the state lock after
+    /// checking again that no run owns the folder and nothing moved its
+    /// epoch since the settlement began: a retry's new file is never taken.
+    fn drop_parts_settling(&self, dir: &Path, epoch: u64) -> bool {
+        let (paths, mut clean) = part_paths(dir, ".part");
+        for path in paths {
+            let st = lock(&self.state);
+            let owned = st.runs.keys().any(|(u, i)| st.dir_of(u, i) == dir);
+            if owned || !Self::unchanged_since(&st, dir, epoch) {
+                return false;
+            }
+            match remove_part(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => clean = false,
+            }
+        }
+        clean
+    }
+
+    /// Measures a tombstoned folder and records the figure, unless something
+    /// that could change it happened meanwhile: the walk is made outside the
+    /// lock, and its result is taken only if the folder's epoch has not
+    /// moved and no removal or writer owns the folder; otherwise it is made
+    /// again. With a writer or a removal in flight nothing is measured (the
+    /// folder stays unknown): the party that ends last measures. Returns the
+    /// figure counted for the folder. An unreadable folder keeps the figure
+    /// it had.
+    fn measure_tombstone(&self, dir: &Path) -> u64 {
+        let mut figure = 0;
+        for _ in 0..4 {
+            let epoch = {
+                let st = lock(&self.state);
+                let Some((_, bytes)) = st.tombstones.iter().find(|(d, _)| d == dir) else {
+                    return 0;
+                };
+                figure = *bytes;
+                if st.removing.iter().any(|d| d == dir) || st.writing(dir) {
+                    return figure;
+                }
+                st.epoch(dir)
+            };
+            let measured = dir_size(dir);
+            #[cfg(test)]
+            tests::during_measure();
+            let mut st = lock(&self.state);
+            if st.removing.iter().any(|d| d == dir) || st.writing(dir) || st.epoch(dir) != epoch {
+                continue;
+            }
+            let Some(t) = st.tombstones.iter_mut().find(|(d, _)| d == dir) else {
+                return 0;
+            };
+            t.1 = measured.counted(t.1);
+            figure = t.1;
+            st.measured
+                .insert(dir.to_path_buf(), (epoch, measured.is_whole()));
+            return figure;
+        }
+        figure
+    }
+
+    /// Puts back the record of a removal that could not take its manifest
+    /// off the disk, with the files it still holds indexed.
+    fn keep_after_failed_unlink(&self, mut record: KeptVideo, dir: &Path, e: &std::io::Error) {
+        // A regular file found is whole, whether or not the walk read
+        // everything: one it missed is left unindexed, and the folder's own
+        // measure below keeps its bytes counted. A short walk leaves a Ready
+        // record with files its index lacks, so it does not come back Ready.
+        let (names, whole) = match stored_entries(dir) {
+            Measure::Whole(e) => (regular_files(&e), true),
+            Measure::Short(e) => (regular_files(&e), false),
+        };
+        #[cfg(test)]
+        tests::at_unlink_failure();
+        let mut st = lock(&self.state);
+        // The record comes back and the removal's tombstone, mark and
+        // in-removal entry go in this one hold: no admission sees neither.
+        st.drop_tombstone(dir);
+        let mut indexed = 0usize;
+        for key in &record.files {
+            if let Some(len) = names.get(&file_name(key)) {
+                indexed += 1;
+                st.index.insert(
+                    (record.user.clone(), key.clone()),
+                    (self.file_path(&record.user, &record.item, key), *len),
+                );
+            }
+        }
+        // Nothing runs it any more; and a Ready one whose files could not
+        // all be indexed, by a short walk or a file gone from a whole one,
+        // is no longer whole to the proxy.
+        let missing = indexed < record.files.len();
+        let short_ready = record.ready() && (!whole || missing);
+        if matches!(record.state, KeptState::Downloading { .. }) || short_ready {
+            // A Failed record reports its estimate as its bytes: what the
+            // download had written, or the folder holds, must not drop out
+            // of what it reserves in the change.
+            // The whole folder, staging files included.
+            // A short walk is a lower bound, and only raises the figure.
+            // It is no figure for what the folder holds, so the folder is
+            // unknown, in this same hold, until a sweep measures it whole:
+            // no admission sees it known meanwhile.
+            let m = dir_size(dir);
+            let on_disk = m.counted(0);
+            record.estimated_bytes = reserved(&record).max(on_disk);
+            if !m.is_whole() {
+                let at = dir.to_path_buf();
+                if !st.unmeasured.iter().any(|(d, _)| *d == at) {
+                    st.unmeasured.push((
+                        at.clone(),
+                        "folder not measured whole when a failed removal put its record back"
+                            .to_owned(),
+                    ));
+                }
+                if !st.remeasure.contains(&at) {
+                    st.remeasure.push(at);
+                }
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep remove item={} measure=short found={on_disk} verdict=folder_unknown",
+                        record.item
+                    ),
+                );
+            }
+            record.state = KeptState::Failed {
+                reason: if short_ready {
+                    format!(
+                        "could not be removed ({e}), and its files could not all be read: keep it again or remove it"
+                    )
+                } else {
+                    format!("could not be removed: {e}")
+                },
+            };
+        }
+        emit(
+            true,
+            format!(
+                "pharos: video keep remove item={} verdict=not_removed index={} manifest={} error={e}",
+                record.item,
+                if !whole {
+                    "short"
+                } else if missing {
+                    "missing"
+                } else {
+                    "whole"
+                },
+                dir.join("manifest.json").display()
+            ),
+        );
+        insert_front(&mut st.list, record);
+    }
+
+    fn item_dir(&self, user: &str, item: &str) -> PathBuf {
+        self.root.join(safe_name(user)).join(safe_name(item))
+    }
+
+    fn file_path(&self, user: &str, item: &str, key: &str) -> PathBuf {
+        self.item_dir(user, item).join("files").join(file_name(key))
+    }
+
+    /// Writes the current record of `item` beside its files, whole or not
+    /// at all. Saves are serialised and write what the record holds when
+    /// their turn comes, never an older copy, and a record that has since
+    /// been removed is not written back: [`DiskVideoStore::remove`] holds
+    /// the same lock while it deletes the folder. A record that is gone has
+    /// nothing to write; a write that fails is logged and returned.
+    fn save_record(&self, user: &str, item: &str) -> std::io::Result<()> {
+        let _saving = self.saves.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(video) = find(&lock(&self.state).list, user, item).cloned() else {
+            return Ok(());
+        };
+        self.write_manifest(&video)
+    }
+
+    /// Writes `video`'s manifest, whole or not at all, logging a failure.
+    /// The caller holds the `saves` lock.
+    fn write_manifest(&self, video: &KeptVideo) -> std::io::Result<()> {
+        #[cfg(test)]
+        tests::during_save(video);
+        let dir = self.item_dir(&video.user, &video.item);
+        let result = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            let text = serde_json::to_vec(&video).map_err(std::io::Error::other)?;
+            let tmp = dir.join("manifest.json.part");
+            // A Ready record is made durable in order: its contents, the
+            // rename, then the folder, all before Ready is published. Other
+            // records are progress a reopen can redo, and pay no sync.
+            let durable = video.ready();
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(&text)?;
+                if durable {
+                    #[cfg(test)]
+                    tests::sync_step("manifest file".to_owned());
+                    file.sync_all().map_err(|e| {
+                        emit(
+                            true,
+                            format!(
+                                "pharos: video keep sync failed item={} what=manifest error={e}",
+                                video.item
+                            ),
+                        );
+                        e
+                    })?;
+                }
+            }
+            std::fs::rename(&tmp, dir.join("manifest.json"))?;
+            if durable {
+                #[cfg(test)]
+                tests::sync_step("rename manifest".to_owned());
+                durable_dir(&dir, &video.item, "item_dir")
+                    .map_err(|e| std::io::Error::new(e.kind(), format!("item folder sync: {e}")))?;
+                // The folders above it may be new too (a first download makes
+                // the user's folder, and on a new store the store's): each is
+                // an entry in its parent, which a power loss can lose with the
+                // whole download under it. Each parent up to the store's own
+                // is synced, as the item's folder is, before Ready.
+                let user_dir = dir.parent().unwrap_or(&self.root);
+                for (at, what) in [
+                    (Some(user_dir), "user_dir"),
+                    (Some(self.root.as_path()), "store_dir"),
+                    (self.root.parent(), "store_parent"),
+                ] {
+                    if let Some(at) = at {
+                        durable_dir(at, &video.item, what).map_err(|e| {
+                            std::io::Error::new(e.kind(), format!("{what} sync: {e}"))
+                        })?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = &result {
+            emit(
+                true,
+                format!(
+                    "pharos: video record not saved item={} dir={} error={e}",
+                    video.item,
+                    dir.display()
+                ),
+            );
+        }
+        result
+    }
+
+    /// Changes the record of `item` and saves it: `Ok(false)` when it is
+    /// gone. When the save fails the change is kept in memory, not rolled
+    /// back, and the error is returned: memory is what the UI shows, the
+    /// next successful save writes it, and undoing a play position or a
+    /// progress figure over a transient disk fault would only lose it.
+    fn update(
+        &self,
+        user: &str,
+        item: &str,
+        f: impl FnOnce(&mut KeptVideo),
+    ) -> std::io::Result<bool> {
+        {
+            let mut st = lock(&self.state);
+            let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            else {
+                return Ok(false);
+            };
+            f(v);
+        }
+        self.save_record(user, item).map(|()| true)
+    }
+
+    /// [`Inner::update`] for the run that owns the download: the run id is
+    /// checked under the same lock as the change, so a run that was removed
+    /// or restarted since cannot touch the record of the one that replaced
+    /// it. `Ok(false)` when `run` no longer owns `item`; an error when the
+    /// change could not be saved (it stays in memory, as in `update`).
+    fn update_run(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        f: impl FnOnce(&mut KeptVideo),
+    ) -> std::io::Result<bool> {
+        {
+            let mut st = lock(&self.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                return Ok(false);
+            }
+            let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            else {
+                return Ok(false);
+            };
+            f(v);
+        }
+        self.save_record(user, item).map(|()| true)
+    }
+
+    /// [`Inner::update_run`] for a change that must not be seen before it
+    /// is on disk (a download becoming Ready): the changed record is saved
+    /// first, and only then published in memory, under the ownership check
+    /// and with the `saves` lock held throughout so no other save or
+    /// removal comes between. A failed save leaves memory untouched.
+    fn update_run_saved(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        f: impl Fn(&mut KeptVideo),
+    ) -> std::io::Result<bool> {
+        let _saving = self.saves.lock().unwrap_or_else(PoisonError::into_inner);
+        let owns = |st: &State| st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run);
+        let candidate = {
+            let st = lock(&self.state);
+            if !owns(&st) {
+                return Ok(false);
+            }
+            let Some(mut v) = find(&st.list, user, item).cloned() else {
+                return Ok(false);
+            };
+            f(&mut v);
+            v
+        };
+        self.write_manifest(&candidate)?;
+        let mut st = lock(&self.state);
+        if !owns(&st) {
+            return Ok(false);
+        }
+        let Some(v) = st
+            .list
+            .iter_mut()
+            .find(|v| v.user == user && v.item == item)
+        else {
+            return Ok(false);
+        };
+        f(v);
+        Ok(true)
+    }
+
+    fn owns(&self, user: &str, item: &str, run: u64) -> bool {
+        lock(&self.state)
+            .runs
+            .get(&(user.to_owned(), item.to_owned()))
+            == Some(&run)
+    }
+
+    fn wanted(&self, user: &str, item: &str, run: u64) -> bool {
+        let st = lock(&self.state);
+        st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run)
+            && find(&st.list, user, item)
+                .is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }))
+    }
+
+    /// Reserves [`PLAYLIST_MAX_BYTES`] for a playlist `run` is about to
+    /// fetch before its plan is admitted, by raising the record's estimate,
+    /// so every other admission counts it. Held to the shared cap and the
+    /// free floor as a fresh download is, with its refusals (accounting not
+    /// ready, music's size unknown, a folder of unknown size). The admission
+    /// that follows sets the estimate, which releases it.
+    fn reserve_playlist(&self, user: &str, item: &str, run: u64, key: &str) -> Result<(), Stop> {
+        let budget = &self.env.budget;
+        let _admission = budget.admission_guard();
+        let ready = budget.accounting_ready();
+        let (other_outstanding, progress) = budget.other_pending_bytes();
+        let other = budget
+            .other_used_bytes()
+            .saturating_add(other_outstanding)
+            .saturating_add(progress.unwrap_or(0));
+        let cap = budget.cap_bytes();
+        // What the folder holds before this run fetches anything into it
+        // (the run owns the folder, and planning writes nothing else there).
+        // Measured outside the lock, only for a resume (a new download draws
+        // nothing from its reservation) and only on a run's first playlist.
+        let who = (user.to_owned(), item.to_owned(), run);
+        let (held, dir, resume) = {
+            let st = lock(&self.state);
+            (
+                st.playlists_taken.get(&who).map(|t| t.0),
+                st.dir_of(user, item),
+                find(&st.list, user, item).is_some_and(|v| !v.files.is_empty()),
+            )
+        };
+        let held = match held {
+            Some(held) => Measure::Whole(held),
+            None if resume => dir_size(&dir),
+            None => Measure::Whole(0),
+        };
+        let mut st = lock(&self.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return Err(Stop::Gone);
+        }
+        // A short walk is no figure for what the folder holds: the
+        // reservation could look unused while the folder fills it. The
+        // folder is unknown until a sweep measures it whole, and the
+        // refusal below follows from that.
+        let held = match held {
+            Measure::Whole(held) => held,
+            Measure::Short(found) => {
+                if !st.unmeasured.iter().any(|(d, _)| *d == dir) {
+                    st.unmeasured.push((
+                        dir.clone(),
+                        "folder not measured whole when a playlist was reserved".to_owned(),
+                    ));
+                }
+                if !st.remeasure.contains(&dir) {
+                    st.remeasure.push(dir.clone());
+                }
+                emit(
+                    true,
+                    format!(
+                        "pharos: video playlist measure short item={item} found={found} verdict=folder_unknown"
+                    ),
+                );
+                found
+            }
+        };
+        let outstanding = st.outstanding(user, item).saturating_add(other_outstanding);
+        let used = st.reserved_by_others(user, item).saturating_add(other);
+        let own = find(&st.list, user, item).map_or(0, reserved);
+        // A resume takes the allowance from what its own reservation has
+        // not used yet: the reservation less what the folder held at the
+        // run's first playlist (or what the run holds, if more) and the
+        // allowances already taken. It asks the cap only for the shortfall.
+        // A new download has no reservation of its own to draw on (a figure
+        // it inherits counts files on disk), so it asks for the whole
+        // allowance.
+        let taken = st.playlists_taken.get(&who).map_or(0, |t| t.1);
+        let shortfall = match find(&st.list, user, item) {
+            Some(v) if !v.files.is_empty() => st
+                .run_holds(v, run)
+                .max(held)
+                .saturating_add(taken)
+                .saturating_add(PLAYLIST_MAX_BYTES)
+                .saturating_sub(own),
+            _ => PLAYLIST_MAX_BYTES,
+        };
+        let verdict = if let Some(refusal) = st.unknown_folder() {
+            Err(refusal)
+        } else if !ready {
+            Err(KeepVideoRefusal::Host(
+                "the music cache is not up yet, so the shared cap cannot be checked".to_owned(),
+            ))
+        } else if progress.is_none() {
+            Err(KeepVideoRefusal::Host(
+                "the size of the music cache's unfinished downloads is unknown (reason=music_size_unknown), so the shared cap cannot be checked"
+                    .to_owned(),
+            ))
+        } else {
+            // The cap is asked for the shortfall only; the disk must hold
+            // every byte the playlist can write, whatever the reservation
+            // covers, above the guard and the other downloads' owed bytes.
+            fits(shortfall, used.saturating_add(own), cap, u64::MAX).and_then(|()| {
+                fits(
+                    PLAYLIST_MAX_BYTES,
+                    0,
+                    u64::MAX,
+                    budget.free_bytes().saturating_sub(outstanding),
+                )
+            })
+        };
+        match verdict {
+            Ok(()) => {
+                if let Some(v) = st
+                    .list
+                    .iter_mut()
+                    .find(|v| v.user == user && v.item == item)
+                {
+                    v.estimated_bytes = own.saturating_add(shortfall);
+                }
+                let gen = st
+                    .record_gen
+                    .get(&(user.to_owned(), item.to_owned()))
+                    .copied()
+                    .unwrap_or(0);
+                st.playlists_base.entry(who.clone()).or_insert((own, gen));
+                st.playlists_taken.entry(who).or_insert((held, 0)).1 += PLAYLIST_MAX_BYTES;
+                drop(st);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video playlist reserved item={item} url_path={} bytes={PLAYLIST_MAX_BYTES} extended={shortfall} from_own={} held={held} taken={taken} used={} cap={cap}",
+                        url_path(key),
+                        PLAYLIST_MAX_BYTES.saturating_sub(shortfall),
+                        used.saturating_add(own)
+                    ),
+                );
+                Ok(())
+            }
+            Err(refusal) => {
+                drop(st);
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep refused item={item} reason={refusal} step=playlist url_path={} reserve={PLAYLIST_MAX_BYTES} extended={shortfall} held={held} taken={taken} used={} cap={cap}",
+                        url_path(key),
+                        used.saturating_add(own)
+                    ),
+                );
+                Err(Stop::Refused(refusal.to_string()))
+            }
+        }
+    }
+
+    /// Admits `run`'s download: the plan is recorded and its estimate
+    /// reserved in one step under the state lock, after the room it needs
+    /// is checked beside every other download's reservation. Checking and
+    /// reserving together is what stops two downloads from each fitting
+    /// alone, against the cap (`Check::Fresh`) and against the free space,
+    /// where each other running download still has its unwritten bytes to
+    /// take from it.
+    fn admit(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        plan: &Plan,
+        check: Check,
+        other_outstanding: u64,
+    ) -> Result<(), Admission> {
+        #[cfg(test)]
+        tests::before_plan_admit();
+        {
+            let mut st = lock(&self.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                return Err(Admission::Gone);
+            }
+            // Staging files a settlement kept in this folder are on disk and
+            // in no inventory: the plan reserves them as stale.
+            let retained = st
+                .retained_parts
+                .get(&self.item_dir(user, item))
+                .copied()
+                .unwrap_or(0);
+            let widened;
+            let plan = if retained > 0 {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep plan item={item} run={run} retained_parts={retained} verdict=reserved"
+                    ),
+                );
+                widened = Plan {
+                    stale: plan.stale.saturating_add(retained),
+                    ..plan.clone()
+                };
+                &widened
+            } else {
+                plan
+            };
+            // A resume keeps the cap it was admitted under only while its
+            // reservation holds the plan: one the kept staging files widened
+            // past it passes the shared cap as a fresh download.
+            let held = st
+                .list
+                .iter()
+                .find(|v| v.user == user && v.item == item)
+                .map_or(0, |v| v.estimated_bytes);
+            let check = match check {
+                Check::Resume {
+                    other,
+                    cap,
+                    ready,
+                    unknown,
+                } if plan.wants() > held => {
+                    // Over the live reservation, whatever raised it: kept
+                    // staging files, or a handed-over allowance given back
+                    // while this run waited.
+                    let reason = if retained > 0 {
+                        "retained_parts_raised_estimate"
+                    } else {
+                        "plan_exceeds_reservation"
+                    };
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video resume replanned item={item} run={run} reason={reason} estimated={held} wants={} retained_parts={retained}",
+                            plan.wants()
+                        ),
+                    );
+                    Check::Fresh {
+                        other,
+                        cap,
+                        ready,
+                        unknown,
+                    }
+                }
+                check => check,
+            };
+            // What the running downloads still owe is read before the free
+            // space is measured: a write landing in between lowers free, and
+            // the stale (higher) owed figure only makes the check stricter.
+            // The other order counts that write as room. The other kinds'
+            // share was read by the caller, before their written bytes.
+            let outstanding = st.outstanding(user, item).saturating_add(other_outstanding);
+            if let Some(refusal) = st.unknown_folder() {
+                return Err(Admission::Refused {
+                    refusal,
+                    used: 0,
+                    free: 0,
+                    outstanding,
+                });
+            }
+            let free = self.env.budget.free_bytes();
+            let verdict = match check {
+                // A new plan is checked against the shared cap, so it needs
+                // the other kinds' figures: a download restarted with no
+                // plan (and none of its files) is fresh too, and must pass
+                // the gate `start` applies.
+                Check::Fresh { ready: false, .. } => Err((
+                    KeepVideoRefusal::Host(
+                        "the music cache is not up yet, so the shared cap cannot be checked"
+                            .to_owned(),
+                    ),
+                    0,
+                    free,
+                )),
+                // Accounting first, whatever the cap policy: a resume held
+                // by its reservation is not admitted on free space alone
+                // while music's unfinished downloads cannot be measured.
+                Check::Fresh { unknown: true, .. } | Check::Resume { unknown: true, .. } => {
+                    emit(
+                        true,
+                        format!(
+                            "pharos: video keep refused item={item} reason=music_size_unknown resume={}",
+                            matches!(check, Check::Resume { .. })
+                        ),
+                    );
+                    Err((
+                        KeepVideoRefusal::Host(
+                            "the size of the music cache's unfinished downloads is unknown (reason=music_size_unknown), so the shared cap cannot be checked"
+                                .to_owned(),
+                        ),
+                        0,
+                        free,
+                    ))
+                }
+                Check::Fresh { other, cap, .. } => {
+                    let used = st.reserved_by_others(user, item).saturating_add(other);
+                    // The cap is held to the whole estimate; the free space
+                    // only to what is not on disk yet (a re-planned resume
+                    // has stored bytes the disk already lacks).
+                    fits(
+                        plan.estimate.max(plan.stored),
+                        used.saturating_add(plan.stale),
+                        cap,
+                        u64::MAX,
+                    )
+                    .and_then(|()| {
+                        fits(
+                            plan.estimate.saturating_sub(plan.stored),
+                            plan.stale,
+                            u64::MAX,
+                            free.saturating_sub(outstanding),
+                        )
+                    })
+                    .map_err(|r| (r, used, free))
+                }
+                // The cap was met when the download began and its stored
+                // bytes are counted; what is left needs room, and 0 free
+                // (an unreadable measure) is no room.
+                Check::Resume { .. } => fits(
+                    plan.estimate.saturating_sub(plan.stored),
+                    0,
+                    u64::MAX,
+                    free.saturating_sub(outstanding),
+                )
+                .map_err(|r| (r, 0, free)),
+            };
+            if let Err((refusal, used, free)) = verdict {
+                return Err(Admission::Refused {
+                    refusal,
+                    used,
+                    free,
+                    outstanding,
+                });
+            }
+            let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            else {
+                return Err(Admission::Gone);
+            };
+            v.files.clone_from(&plan.files);
+            // The reservation holds what the plan will take and what an
+            // earlier plan still leaves on disk.
+            v.estimated_bytes = plan.wants();
+            // The plan's estimate replaces the playlists' allowances.
+            let who = (user.to_owned(), item.to_owned(), run);
+            // A plan is admitted: the estimate is a reserved one now.
+            v.estimate_from_adoption = false;
+            v.state = KeptState::Downloading {
+                done: 0,
+                total: plan.total,
+                bytes: plan.stored,
+            };
+            // The stale share is on disk already: media may not grow into it.
+            // Kept on the record, so it goes with it.
+            v.stale_on_disk = plan.stale;
+            st.playlists_taken.remove(&who);
+            st.playlists_landed.remove(&who);
+            st.playlists_base.remove(&who);
+            // The plan's estimate is this run's reservation now: an earlier
+            // run's allowance handed over to it is no longer there to give
+            // back, so that run's exit leaves the record as it is.
+            let before = st.handed_over.len();
+            st.handed_over
+                .retain(|(u, i, _), to| !(u == user && i == item && *to == run));
+            let invalidated = before - st.handed_over.len();
+            if invalidated > 0 {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video playlist allowance handover verdict=invalidated item={item} run={run} reason=replacement_admitted runs={invalidated}"
+                    ),
+                );
+            }
+        }
+        #[cfg(test)]
+        self.plans_admitted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(item.to_owned());
+        self.save_record(user, item).map_err(Admission::Unsaved)
+    }
+
+    /// Grows `run`'s reservation to hold `need` bytes (a step more when it
+    /// fits, so the admission lock is not taken for every chunk), under the
+    /// shared admission lock and the checks admission makes: the music
+    /// cache up and its size known, no folder of unknown size, the shared
+    /// cap, and the free space less what every download still owes and the
+    /// guard. Logged either way, with the figures.
+    fn extend_reservation(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        need: u64,
+    ) -> Result<(), ClaimRefused> {
+        let budget = &self.env.budget;
+        let _admission = budget.admission_guard();
+        // In admission's order: readiness, then the owed and written bytes.
+        let ready = budget.accounting_ready();
+        let (other_outstanding, progress) = budget.other_pending_bytes();
+        let other = budget
+            .other_used_bytes()
+            .saturating_add(other_outstanding)
+            .saturating_add(progress.unwrap_or(0));
+        let cap = budget.cap_bytes();
+        let refuse = |why: String| {
+            emit(
+                true,
+                format!(
+                    "pharos: video keep reservation verdict=refused item={item} run={run} need={need} why={why}"
+                ),
+            );
+            Err(ClaimRefused::Reason(why))
+        };
+        let grown = {
+            let mut st = lock(&self.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                return Err(ClaimRefused::Gone);
+            }
+            if !ready {
+                return refuse("reason=music_not_ready".to_owned());
+            }
+            if progress.is_none() {
+                return refuse("reason=music_size_unknown".to_owned());
+            }
+            if let Some(r) = st.unknown_folder() {
+                return refuse(format!("reason=size_unknown {r}"));
+            }
+            let used = st.reserved_by_others(user, item).saturating_add(other);
+            let Some(v) = find(&st.list, user, item) else {
+                return Err(ClaimRefused::Gone);
+            };
+            let current = v.estimated_bytes;
+            if need <= current {
+                return Ok(());
+            }
+            // Owed by the others before free is read (as in `admit`), and
+            // by this run: what its reservation still lacks on disk. A
+            // claimed chunk not yet written is owed still (the free space
+            // has not lost it), so it is not taken off.
+            let on_disk = st.run_on_disk(v, run);
+            let owed = st
+                .outstanding(user, item)
+                .saturating_add(other_outstanding)
+                .saturating_add(st.owed(v, Some(run)));
+            let free = budget.free_bytes();
+            let room = free.saturating_sub(owed);
+            let fits_at = |to: u64| {
+                fits(to, used, cap, u64::MAX)
+                    .and_then(|()| fits(to.saturating_sub(current), 0, u64::MAX, room))
+            };
+            let stepped = need.saturating_add(RESERVATION_STEP);
+            let to = if fits_at(stepped).is_ok() {
+                stepped
+            } else if let Err(r) = fits_at(need) {
+                let why = match r {
+                    KeepVideoRefusal::OverCap { .. } => "reason=over_cap",
+                    KeepVideoRefusal::LowSpace { .. } => "reason=low_space",
+                    _ => "reason=refused",
+                };
+                return refuse(format!(
+                    "{why} current={current} on_disk={on_disk} used={used} cap={cap} free={free} owed={owed} ({r})"
+                ));
+            } else {
+                need
+            };
+            let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            else {
+                return Err(ClaimRefused::Gone);
+            };
+            v.estimated_bytes = to;
+            (current, to, on_disk, owed, free)
+        };
+        emit(
+            false,
+            format!(
+                "pharos: video keep reservation verdict=extended item={item} run={run} from={} to={} need={need} on_disk={} owed={} free={}",
+                grown.0, grown.1, grown.2, grown.3, grown.4
+            ),
+        );
+        // On disk before more is written: a restart must not read the
+        // smaller figure. A failed save keeps the larger one in memory.
+        if let Err(e) = self.save_record(user, item) {
+            emit(
+                true,
+                format!("pharos: video keep reservation not saved item={item} error={e}"),
+            );
+        }
+        Ok(())
+    }
+
+    /// Indexes a whole file for `run`; false when `run` no longer owns the
+    /// download, which indexes nothing.
+    fn record_file(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        key: &str,
+        path: PathBuf,
+        len: u64,
+    ) -> bool {
+        let mut st = lock(&self.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return false;
+        }
+        st.index
+            .insert((user.to_owned(), key.to_owned()), (path, len));
+        true
+    }
+
+    /// Records progress; the record is written at most once a second
+    /// unless `force`. `landed` is what this call adds to `bytes` of a
+    /// media file promoted since the last: it leaves the run's promoted
+    /// figure in the hold that puts it in the record's, so no reader
+    /// counts it twice, or not at all.
+    fn publish(
+        &self,
+        user: &str,
+        item: &str,
+        run: u64,
+        (done, total, bytes): (usize, u32, u64),
+        landed: u64,
+        force: bool,
+    ) {
+        let done = u32::try_from(done).unwrap_or(u32::MAX);
+        let due = {
+            let mut st = lock(&self.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run) {
+                #[cfg(test)]
+                let before = find(&st.list, user, item).map(|v| st.owed(v, Some(run)));
+                if let Some(v) = st
+                    .list
+                    .iter_mut()
+                    .find(|v| v.user == user && v.item == item)
+                {
+                    v.state = KeptState::Downloading { done, total, bytes };
+                }
+                let who = (user.to_owned(), item.to_owned(), run);
+                if let Some(held) = st.promoted.get_mut(&who) {
+                    *held = held.saturating_sub(landed);
+                    if *held == 0 {
+                        st.promoted.remove(&who);
+                    }
+                }
+                #[cfg(test)]
+                tests::published(
+                    before,
+                    find(&st.list, user, item).map(|v| st.owed(v, Some(run))),
+                );
+            }
+            let now = Instant::now();
+            let due = force
+                || st.last_saved.map_or(true, |t| {
+                    progress_due(0.0, now.duration_since(t).as_secs_f64() * 1_000.0)
+                });
+            if due {
+                st.last_saved = Some(now);
+            }
+            due
+        };
+        if due {
+            // Progress only: a failed save is logged by `save_record`, and
+            // the next one (or the terminal state's) writes it again.
+            let _ = self.update_run(user, item, run, |v| {
+                v.state = KeptState::Downloading { done, total, bytes };
+            });
+        }
+    }
+}
+
+/// Whether the offline proxy has a handler for `key`: its first path
+/// segment is one the page's requests are answered for
+/// ([`crate::native::tv_page::proxied_segments`]).
+fn servable(key: &str) -> bool {
+    let first = url_path(key)
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    crate::native::tv_page::proxied(first)
+}
+
+/// Fetches `key` to its file, retrying with backoff while a retry can
+/// mend the failure, and stops once the download has been removed.
+async fn fetch_file(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+    key: &str,
+    limit: Option<u64>,
+) -> Result<u64, Stop> {
+    // Every key a download stores is one the offline proxy answers: one it
+    // has no handler for (a playlist the server moved under `/delivery/`)
+    // would be Ready and play nothing. Refused, not served by widening the
+    // proxy, which sends what it answers to the server with the token.
+    if !servable(key) {
+        let reason = format!(
+            "{} is under a path the phone's player cannot load offline (reason=key_not_servable)",
+            url_path(key)
+        );
+        emit(
+            true,
+            format!(
+                "pharos: video keep refused item={item} reason=key_not_servable url_path={}",
+                url_path(key)
+            ),
+        );
+        return Err(Stop::Refused(reason));
+    }
+    let path = inner.file_path(user, item, key);
+    let mut attempt = 0u32;
+    loop {
+        if !inner.wanted(user, item, run) {
+            return Err(Stop::Gone);
+        }
+        let err = match fetch_once(inner, user, item, run, key, &path, limit).await {
+            Ok(len) => {
+                return if inner.record_file(user, item, run, key, path, len) {
+                    Ok(len)
+                } else {
+                    Err(Stop::Gone)
+                };
+            }
+            Err(e) => e,
+        };
+        let failure = match err {
+            FetchOnce::Store(reason) => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep store failed item={item} url_path={} reason={reason}",
+                        url_path(key)
+                    ),
+                );
+                return if inner.wanted(user, item, run) {
+                    Err(Stop::Failed(reason))
+                } else {
+                    Err(Stop::Gone)
+                };
+            }
+            FetchOnce::Gone => return Err(Stop::Gone),
+            FetchOnce::NotOwner(why) => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep fetch verdict=refused item={item} run={run} url_path={} reason={why}",
+                        url_path(key)
+                    ),
+                );
+                #[cfg(test)]
+                tests::before_park_mark();
+                // Marked parking only while this run still owns the item, in
+                // the hold that checks it: a run that lost it (removed, or
+                // replaced by another run) stops as gone and marks nothing.
+                let mut st = lock(&inner.state);
+                let ident = (user.to_owned(), item.to_owned());
+                if st.runs.get(&ident) != Some(&run) {
+                    drop(st);
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep park verdict=gone item={item} run={run} reason=run_lost_item"
+                        ),
+                    );
+                    return Err(Stop::Gone);
+                }
+                st.parking.insert(ident, run);
+                return Err(Stop::Parked(why));
+            }
+            FetchOnce::TooLarge(limit) => {
+                let reason = format!(
+                    "{} is larger than the {limit} bytes a playlist may take (reason=playlist_too_large)",
+                    url_path(key)
+                );
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep refused item={item} reason=playlist_too_large url_path={} limit={limit}",
+                        url_path(key)
+                    ),
+                );
+                return Err(Stop::Refused(reason));
+            }
+            FetchOnce::NotLocal(reference) => {
+                let reason = format!(
+                    "{} names {}, which the phone cannot serve offline (reason=reference_not_local)",
+                    url_path(key),
+                    url_path(&reference)
+                );
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep refused item={item} reason=reference_not_local url_path={} reference_path={}",
+                        url_path(key),
+                        url_path(&reference)
+                    ),
+                );
+                return Err(Stop::Refused(reason));
+            }
+            FetchOnce::OverReservation(why) => {
+                let reason = format!(
+                    "{} is larger than its download's reservation, which could not grow: {why}",
+                    url_path(key)
+                );
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep refused item={item} reason=reservation_exceeded url_path={} why={why}",
+                        url_path(key)
+                    ),
+                );
+                return Err(Stop::Refused(reason));
+            }
+            FetchOnce::Refused(why) => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep file failed item={item} url_path={} status=none attempt={} terminal=true why={why}",
+                        url_path(key),
+                        attempt + 1
+                    ),
+                );
+                return Err(Stop::Failed(format!(
+                    "{} could not be fetched: {why}",
+                    url_path(key)
+                )));
+            }
+            FetchOnce::Fetch(e) => e,
+        };
+        attempt += 1;
+        emit(
+            true,
+            format!(
+                "pharos: video keep file failed item={item} url_path={} status={} attempt={attempt}",
+                url_path(key),
+                failure.status.map_or_else(|| "none".to_owned(), |s| s.to_string()),
+            ),
+        );
+        match (is_retryable(failure.status), retry_delay_secs(attempt)) {
+            (true, Some(secs)) => (inner.env.sleep)(secs).await,
+            _ => {
+                return Err(Stop::Failed(format!(
+                    "{} answered {failure}",
+                    url_path(key)
+                )))
+            }
+        }
+    }
+}
+
+enum FetchOnce {
+    Fetch(FetchError),
+    Store(String),
+    /// The body passed the size limit set for it (a playlist's).
+    TooLarge(u64),
+    /// A media body passed the run's reservation, which could not grow to
+    /// hold it, and why.
+    OverReservation(String),
+    /// The download was removed or restarted while this run was fetching.
+    Gone,
+    /// The credentials are not the run's owner's, and why: nothing was
+    /// sent, or a fetched file was not promoted.
+    NotOwner(String),
+    /// A playlist names this file, which no stored key can serve offline.
+    NotLocal(String),
+    /// The request failed in a way no retry changes, and why.
+    Refused(String),
+}
+
+/// Waits for a chunk's write to complete. In a test the write can be held
+/// pending first, to show nothing is counted as staged meanwhile.
+async fn flush_chunk(file: &mut tokio::fs::File, item: &str, part: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::hold_write(item).await;
+    #[cfg(not(test))]
+    let _ = (item, part);
+    file.flush().await?;
+    #[cfg(test)]
+    tests::flush_fault(part)?;
+    Ok(())
+}
+
+/// Makes `dir`'s entries (a rename into it) durable. A rename is atomic,
+/// not durable: until its folder is synced a power loss can undo it.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    tests::sync_step(format!(
+        "dir {}",
+        dir.file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+    ));
+    #[cfg(test)]
+    tests::dir_sync_fault(dir)?;
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// Makes `dir` durable for a record about to be published Ready: a failed
+/// sync is tried once more, then sorted. A filesystem that cannot sync a
+/// folder (EINVAL, ENOTSUP: some FUSE and sdcard layers) counts as synced,
+/// logged once per sync point, or a download there could never finish. Any
+/// other error is returned, logged with the error, and Ready is not
+/// published.
+fn durable_dir(dir: &Path, item: &str, what: &'static str) -> std::io::Result<()> {
+    let Err(first) = sync_dir(dir) else {
+        return Ok(());
+    };
+    let Err(e) = sync_dir(dir) else {
+        emit(
+            false,
+            format!(
+                "pharos: video keep sync verdict=retried what={what} item={item} first_error={first}"
+            ),
+        );
+        return Ok(());
+    };
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+    ) {
+        static LOGGED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let first_time = {
+            let mut logged = LOGGED.lock().unwrap_or_else(PoisonError::into_inner);
+            let new = !logged.contains(&what);
+            if new {
+                logged.push(what);
+            }
+            new
+        };
+        if first_time {
+            emit(
+                true,
+                format!(
+                    "pharos: video keep sync verdict=unsupported what={what} item={item} error={e}"
+                ),
+            );
+        }
+        return Ok(());
+    }
+    emit(
+        true,
+        format!(
+            "pharos: video keep sync failed verdict=not_ready what={what} item={item} error={e}"
+        ),
+    );
+    Err(e)
+}
+
+/// The final name of a stored file, for the logs and the test's record.
+fn shown_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
+/// One attempt: the body into `<path>.part`, then renamed into place.
+///
+/// The body is staged in a file named for `run` (`<name>.<run>.part`), so
+/// two runs of one item never share a staging file, and it is promoted only
+/// while `run` still owns the download: the check and the rename happen
+/// under the state lock, so a removed or restarted run cannot put its bytes
+/// in place.
+async fn fetch_once(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+    key: &str,
+    path: &Path,
+    limit: Option<u64>,
+) -> Result<u64, FetchOnce> {
+    let store_err = |what: &str, e: std::io::Error| {
+        FetchOnce::Store(format!(
+            "could not {what} {}: {e}",
+            path.file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        ))
+    };
+    let mut body = inner
+        .env
+        .fetcher
+        .open(user, key)
+        .await
+        .map_err(|e| match e {
+            OpenFailed::Fetch(e) => FetchOnce::Fetch(e),
+            OpenFailed::Refused(why) => FetchOnce::Refused(why),
+            OpenFailed::NotOwner(why) => {
+                // Marked at the refusal: a sign-in from here on finds the
+                // run parking and leaves it a pending resume.
+                lock(&inner.state)
+                    .parking
+                    .insert((user.to_owned(), item.to_owned()), run);
+                FetchOnce::NotOwner(why)
+            }
+        })?;
+    let part = path.with_extension(format!("{run}.part"));
+    // The folder and the staging file are created in one step, with no
+    // await to be cancelled in, and only while this run still owns the
+    // item: a removal revokes the run under the same lock, so an old run
+    // cannot bring the folder or a file back after a sweep measured it.
+    // (A write to a handle opened before the revocation lands in an
+    // unlinked file.)
+    let who = (user.to_owned(), item.to_owned(), run);
+    let (mut file, mut staged) = {
+        let mut st = lock(&inner.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return Err(FetchOnce::Gone);
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| store_err("create the folder for", e))?;
+        }
+        let file = std::fs::File::create(&part)
+            .map(tokio::fs::File::from_std)
+            .map_err(|e| store_err("create", e))?;
+        // Registered as a writer with the file, under the same hold.
+        *st.writers.entry(who.clone()).or_default() += 1;
+        let dir = st.dir_of(user, item);
+        st.bump(&dir);
+        (
+            file,
+            Staged {
+                inner,
+                who,
+                len: 0,
+                part: part.clone(),
+                claim: 0,
+                promoted: false,
+                why: "cancelled",
+            },
+        )
+    };
+    // A playlist is held whole and stored with every reference it makes
+    // naming the key the offline proxy serves it under (`localize_playlist`):
+    // relative ones rebased onto the key a same-origin redirect answered it
+    // from (CR 4637279590), and absolute ones on the server cut to their
+    // keys under its base path. What is written, reserved and capped is the
+    // stored text. The raw body is held to the same cap, so memory stays
+    // bounded. A playlist naming a file no key can serve is refused: the
+    // copy would not play offline.
+    let mut localize: Option<Option<String>> = limit.map(|_| body.final_key().filter(|f| f != key));
+    let mut held: Vec<u8> = Vec::new();
+    let mut ended = false;
+    let mut len = 0u64;
+    'chunks: loop {
+        if ended {
+            break;
+        }
+        let next = 'body: {
+            match body.next_chunk().await {
+                Ok(Some(chunk)) if localize.is_some() => {
+                    let cap = limit.unwrap_or(PLAYLIST_MAX_BYTES);
+                    if (held.len() as u64).saturating_add(chunk.len() as u64) > cap {
+                        drop(file);
+                        staged.abandon("too_large");
+                        return Err(FetchOnce::TooLarge(cap));
+                    }
+                    held.extend_from_slice(&chunk);
+                    continue 'chunks;
+                }
+                Ok(Some(chunk)) => Ok(Some(chunk)),
+                Ok(None) => match localize.take() {
+                    Some(final_key) => {
+                        ended = true;
+                        let raw = std::mem::take(&mut held);
+                        let cap = limit.unwrap_or(PLAYLIST_MAX_BYTES);
+                        let moved = final_key.as_deref().map_or("-", url_path).to_owned();
+                        let server = inner.env.fetcher.server_base();
+                        // Not text: stored as sent, and planning refuses it.
+                        let Ok(text) = std::str::from_utf8(&raw) else {
+                            break 'body Ok(Some(raw));
+                        };
+                        // Resolved against the URL fetched: the final one
+                        // after a redirect, else the one requested.
+                        match localize_playlist(
+                            text,
+                            final_key.as_deref().unwrap_or(key),
+                            final_key.is_some(),
+                            &server,
+                            usize::try_from(cap).unwrap_or(usize::MAX),
+                        ) {
+                            Localized::Unchanged => Ok(Some(raw)),
+                            Localized::Rewritten(text) => {
+                                emit(
+                                false,
+                                format!(
+                                    "pharos: video keep playlist verdict=rebased item={item} url_path={} final_path={moved} from_len={} to_len={} cap={cap}",
+                                    url_path(key),
+                                    raw.len(),
+                                    text.len()
+                                ),
+                            );
+                                Ok(Some(text.into_bytes()))
+                            }
+                            Localized::TooLarge => {
+                                emit(
+                                true,
+                                format!(
+                                    "pharos: video keep playlist verdict=too_large item={item} url_path={} final_path={moved} from_len={} cap={cap}",
+                                    url_path(key),
+                                    raw.len()
+                                ),
+                            );
+                                drop(file);
+                                staged.abandon("too_large");
+                                return Err(FetchOnce::TooLarge(cap));
+                            }
+                            Localized::NotLocal(reference) => {
+                                emit(
+                                true,
+                                format!(
+                                    "pharos: video keep playlist verdict=not_local item={item} url_path={} final_path={moved} reference_path={}",
+                                    url_path(key),
+                                    url_path(&reference)
+                                ),
+                            );
+                                drop(file);
+                                staged.abandon("not_local");
+                                return Err(FetchOnce::NotLocal(reference));
+                            }
+                        }
+                    }
+                    None => Ok(None),
+                },
+                Err(e) => Err(e),
+            }
+        };
+        match next {
+            Ok(Some(chunk)) => {
+                // A run a removal or restart has revoked writes no more.
+                if !inner.owns(user, item, run) {
+                    drop(file);
+                    staged.abandon("revoked");
+                    return Err(FetchOnce::Gone);
+                }
+                // A body past its limit is not written on: its reservation
+                // was for the limit.
+                if let Some(limit) = limit {
+                    if len.saturating_add(chunk.len() as u64) > limit {
+                        drop(file);
+                        staged.abandon("too_large");
+                        return Err(FetchOnce::TooLarge(limit));
+                    }
+                } else if let Err(refused) = staged.claim(chunk.len() as u64) {
+                    // A media body has no limit of its own: past the run's
+                    // reservation it is written on only once the
+                    // reservation has grown to hold it, under the checks
+                    // admission makes.
+                    drop(file);
+                    staged.abandon("over_reservation");
+                    return Err(match refused {
+                        ClaimRefused::Gone => FetchOnce::Gone,
+                        ClaimRefused::Reason(why) => FetchOnce::OverReservation(why),
+                    });
+                }
+                if let Err(e) = file.write_all(&chunk).await {
+                    drop(file);
+                    staged.abandon("write_failed");
+                    return Err(store_err("write", e));
+                }
+                // `write_all` can return while tokio's write is still
+                // pending, and the free-space reading does not lack those
+                // bytes yet. They count as staged (and so stop being owed)
+                // only once the write has completed.
+                if let Err(e) = flush_chunk(&mut file, item, &part).await {
+                    drop(file);
+                    staged.abandon("write_failed");
+                    return Err(store_err("write", e));
+                }
+                len = len.saturating_add(chunk.len() as u64);
+                staged.add(chunk.len() as u64);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                drop(file);
+                staged.abandon("body_failed");
+                return Err(FetchOnce::Fetch(e));
+            }
+        }
+    }
+    if let Err(e) = file.flush().await {
+        drop(file);
+        staged.abandon("write_failed");
+        return Err(store_err("write", e));
+    }
+    // Its contents are durable before it is promoted: a file under its
+    // final name is taken as whole at a reopen, and `flush` alone leaves the
+    // bytes in the page cache.
+    #[cfg(test)]
+    tests::sync_step(format!("file {}", shown_name(path)));
+    if let Err(e) = file.sync_all().await {
+        drop(file);
+        staged.abandon("sync_failed");
+        emit(
+            true,
+            format!(
+                "pharos: video keep sync failed item={item} what=file name={} error={e}",
+                shown_name(path)
+            ),
+        );
+        return Err(store_err("sync", e));
+    }
+    drop(file);
+    let promoted = {
+        let mut st = lock(&inner.state);
+        let owns = st.runs.get(&(user.to_owned(), item.to_owned())) == Some(&run)
+            && find(&st.list, user, item)
+                .is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }));
+        if !owns {
+            Promote::NotOwned
+        } else if let Err(why) = inner.env.fetcher.check_owner(user) {
+            // Fetched while another user's credentials were on file: none
+            // of it goes into this user's download. Marked parking in the
+            // hold that refused it, so no sign-in falls in between.
+            st.parking.insert((user.to_owned(), item.to_owned()), run);
+            Promote::NotOwner(why)
+        } else {
+            #[cfg(test)]
+            tests::sync_step(format!("rename {}", shown_name(path)));
+            let renamed = std::fs::rename(&part, path);
+            // A playlist promoted before the plan moves from staged to
+            // landed in this hold, with the rename: no reader sees it under
+            // its final name and still staged. The guard's drop then has
+            // nothing of it left to move.
+            if renamed.is_ok() && st.playlists_taken.contains_key(&staged.who) {
+                let moved = std::mem::take(&mut staged.len);
+                if let Some(held) = st.staged.get_mut(&staged.who) {
+                    *held = held.saturating_sub(moved);
+                    if *held == 0 {
+                        st.staged.remove(&staged.who);
+                    }
+                }
+                *st.playlists_landed.entry(staged.who.clone()).or_default() += moved;
+            } else if renamed.is_ok() && limit.is_none() {
+                // A media file moves from staged to promoted in this hold,
+                // with the rename, and stays there until the `publish`
+                // that records it: on disk throughout, and counted once.
+                let moved = std::mem::take(&mut staged.len);
+                if let Some(held) = st.staged.get_mut(&staged.who) {
+                    *held = held.saturating_sub(moved);
+                    if *held == 0 {
+                        st.staged.remove(&staged.who);
+                    }
+                }
+                *st.promoted.entry(staged.who.clone()).or_default() += moved;
+            }
+            Promote::Renamed(renamed)
+        }
+    };
+    match promoted {
+        Promote::Renamed(Ok(())) => {
+            staged.promoted = true;
+            #[cfg(test)]
+            if let Some(hook) = tests::AFTER_PROMOTE.with(|h| h.borrow_mut().take()) {
+                hook(&lock(&inner.state), &staged.who, len);
+            }
+            Ok(len)
+        }
+        Promote::Renamed(Err(e)) => {
+            staged.abandon("rename_failed");
+            Err(store_err("finish", e))
+        }
+        Promote::NotOwned => {
+            staged.abandon("not_owned");
+            Err(FetchOnce::Gone)
+        }
+        Promote::NotOwner(why) => {
+            emit(
+                true,
+                format!(
+                    "pharos: video keep promote verdict=refused item={item} run={run} name={} reason={why}",
+                    shown_name(path)
+                ),
+            );
+            staged.abandon("token_owner_mismatch");
+            Err(FetchOnce::NotOwner(why))
+        }
+    }
+}
+
+/// The most a playlist may take. Playlists are fetched before the plan is
+/// admitted, so each is reserved at this size first and refused past it.
+#[cfg(not(test))]
+pub(crate) const PLAYLIST_MAX_BYTES: u64 = 4 << 20;
+/// The test playlists are a few hundred bytes, and the test budgets small.
+#[cfg(test)]
+pub(crate) const PLAYLIST_MAX_BYTES: u64 = 256;
+
+/// A playlist's text: the stored file, or reserved, fetched and stored
+/// first (`fetched` is then pushed its key).
+async fn playlist(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+    key: &str,
+    fetched: &mut Vec<String>,
+) -> Result<String, Stop> {
+    let path = inner.file_path(user, item, key);
+    // `symlink_metadata`: a link at the path is not a stored playlist.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(m) if m.is_file() => {}
+        Ok(m) => {
+            // A folder (or anything but a regular file) where the playlist
+            // goes: never read as text, and not deleted from under the
+            // folder's accounting. The download must be removed.
+            let kind = if m.is_dir() { "folder" } else { "other" };
+            emit(
+                true,
+                format!(
+                    "pharos: video keep playlist verdict=damaged item={item} run={run} url_path={} kind={kind}",
+                    url_path(key)
+                ),
+            );
+            return Err(Stop::Failed(format!(
+                "{} is stored as a {kind}, not a file: remove this download and keep it again",
+                url_path(key)
+            )));
+        }
+        Err(_) => {
+            inner.reserve_playlist(user, item, run, key)?;
+            fetch_file(inner, user, item, run, key, Some(PLAYLIST_MAX_BYTES)).await?;
+            fetched.push(key.to_owned());
+        }
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| Stop::Failed(format!("could not read {}: {e}", url_path(key))))?;
+    String::from_utf8(bytes).map_err(|_| Stop::Failed(format!("{} is not text", url_path(key))))
+}
+
+/// The entries under `dir/files` but staging files, by name: `Short` when
+/// the folder, an entry or an entry's length could not be read (anything
+/// but being gone), so the list may lack some. An entry that is a folder
+/// counts every byte under it ([`dir_size`]), not its own entry's size, and
+/// a walk of it that falls short makes this one short. Only an entry that
+/// is a regular file can be a whole stored file ([`regular_files`]). Every
+/// whole-file measure and inventory of a download goes through here.
+fn stored_entries(dir: &Path) -> Measure<HashMap<String, Entry>> {
+    let read = match std::fs::read_dir(dir.join("files")) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Measure::Whole(HashMap::new()),
+        Err(_) => return Measure::Short(HashMap::new()),
+    };
+    let mut complete = true;
+    let mut names = HashMap::new();
+    for entry in read {
+        #[cfg(test)]
+        let entry = tests::entry_read(entry);
+        let Ok(e) = entry else {
+            complete = false;
+            continue;
+        };
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".part") {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow a link: a link is not regular.
+        match e.metadata() {
+            Ok(m) if m.is_dir() => {
+                let len = match dir_size(&e.path()) {
+                    Measure::Whole(len) => len,
+                    Measure::Short(len) => {
+                        complete = false;
+                        len
+                    }
+                };
+                names.insert(
+                    name,
+                    Entry {
+                        len,
+                        regular: false,
+                    },
+                );
+            }
+            Ok(m) => {
+                names.insert(
+                    name,
+                    Entry {
+                        len: m.len(),
+                        regular: m.is_file(),
+                    },
+                );
+            }
+            Err(err) => complete &= err.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+    if complete {
+        Measure::Whole(names)
+    } else {
+        Measure::Short(names)
+    }
+}
+
+/// A record read from a folder, ready to join the list.
+/// Who runs a sweep, which decides whether it may delete.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sweep {
+    /// A listing, a start, a discard or the open: deletes what it finds
+    /// removed (an orphan folder, stale staging files).
+    Ordinary,
+    /// The host's size check, run under the music cache's locks: measures
+    /// and counts what it finds, deletes nothing. What it would delete is
+    /// left to the next ordinary sweep (`sweep_tombstones`).
+    HostCheck,
+}
+
+struct Adopted {
+    record: KeptVideo,
+    /// The stored whole files, by user and key.
+    index: Vec<((String, String), (PathBuf, u64))>,
+    /// A staging file would not delete: the folder stays unknown until a
+    /// settlement.
+    leftover: bool,
+    /// Staging files were left for an ordinary sweep to delete (counted in
+    /// the floor meanwhile).
+    parts_deferred: bool,
+    /// Whether the walk that took the record's floor read the whole folder.
+    exact: bool,
+}
+
+/// What a record found in `item_dir` becomes: its staging files dropped, its
+/// whole files indexed, and a ready record that lost files back to
+/// downloading.
+fn adopt(item_dir: &Path, record: KeptVideo, sweep: Sweep) -> Adopted {
+    // A staging file that will not go keeps the folder unknown until a
+    // sweep deletes it or measures the folder whole. The host's check
+    // deletes none: they count in the floor below until an ordinary sweep.
+    let (leftover, parts_deferred) = match sweep {
+        Sweep::Ordinary => (!drop_parts_of(item_dir, None), false),
+        Sweep::HostCheck => {
+            let (parts, listed) = part_paths(item_dir, ".part");
+            (!listed, !parts.is_empty())
+        }
+    };
+    // A named file is whole only as a regular file under its final name: a
+    // folder in its place (counted by what it holds) is not one, and a
+    // staging file never carries a final name. One a short walk missed
+    // resumes; the folder's own measure below carries the walk's
+    // completeness.
+    let names = match stored_entries(item_dir) {
+        Measure::Whole(e) | Measure::Short(e) => regular_files(&e),
+    };
+    let mut whole = 0usize;
+    let mut on_disk = 0u64;
+    let mut index = Vec::new();
+    for key in &record.files {
+        if let Some(len) = names.get(&file_name(key)) {
+            whole += 1;
+            on_disk = on_disk.saturating_add(*len);
+            index.push((
+                (record.user.clone(), key.clone()),
+                (item_dir.join("files").join(file_name(key)), *len),
+            ));
+        }
+    }
+    let mut record = record;
+    if record.ready() && whole < record.files.len() {
+        emit(
+            true,
+            format!(
+                "pharos: video record incomplete item={} files={} stored={whole}",
+                record.item,
+                record.files.len()
+            ),
+        );
+        let total = u32::try_from(record.files.len()).unwrap_or(u32::MAX);
+        record.state = KeptState::Downloading {
+            done: u32::try_from(whole).unwrap_or(u32::MAX),
+            total,
+            bytes: on_disk,
+        };
+    } else if let KeptState::Downloading { done, total, bytes } = record.state {
+        // The progress a manifest kept is from its last save: the planned
+        // files on disk now say what is done. The reservation stays as
+        // admitted, and the folder's measure below says whether it is known.
+        if !record.files.is_empty() {
+            let now_done = u32::try_from(whole).unwrap_or(u32::MAX);
+            let now_total = u32::try_from(record.files.len()).unwrap_or(u32::MAX);
+            if (done, total, bytes) != (now_done, now_total, on_disk) {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video record progress item={} verdict=rebuilt done={done}->{now_done} total={total}->{now_total} bytes={bytes}->{on_disk} reason=planned_files_on_disk",
+                        record.item
+                    ),
+                );
+            }
+            record.state = KeptState::Downloading {
+                done: now_done,
+                total: now_total,
+                bytes: on_disk,
+            };
+        }
+    }
+    // A record never counts for less than the folder holds: a field a
+    // manifest lacks (an estimate that defaulted to 0) cannot make its
+    // files free. A walk that did not read everything leaves the folder
+    // unknown until a sweep measures it whole.
+    let m = dir_size(item_dir);
+    if record.estimated_bytes == 0 {
+        // No estimate was ever admitted for this record.
+        record.estimate_from_adoption = true;
+    }
+    // A short walk is a lower bound: it only raises the floor.
+    let floor = m.counted(0);
+    if floor > record.estimated_bytes {
+        emit(
+            false,
+            format!(
+                "pharos: video record floor item={} estimate={} measured={floor} whole={} reason=folder_holds_more",
+                record.item,
+                record.estimated_bytes,
+                m.is_whole()
+            ),
+        );
+        record.estimated_bytes = floor;
+    }
+    Adopted {
+        record,
+        index,
+        leftover,
+        parts_deferred,
+        exact: m.is_whole(),
+    }
+}
+
+/// What one folder under a user's folder turned out to be.
+enum Scanned {
+    /// A readable record, adopted.
+    Record(Box<Adopted>),
+    /// A record that cannot be read: left alone, never deleted. Its bytes (as
+    /// far as they can be read) count against the cap, and since the
+    /// record's own reservation is lost, nothing is admitted while it stays.
+    Held { why: String, m: Measure<u64> },
+    /// No record, a removed download, and the folder would not delete.
+    Tombstone {
+        bytes: u64,
+        exact: bool,
+        error: String,
+    },
+    /// Nothing left to count.
+    Removed,
+}
+
+/// Whether `item_dir` (a `root/user/item` folder) is the one `record`'s
+/// own ids name, as [`Inner::item_dir`] derives it.
+fn names_its_folder(item_dir: &Path, record: &KeptVideo) -> bool {
+    let name = |p: Option<&Path>| {
+        p.and_then(Path::file_name)
+            .map(|n| n.to_string_lossy().into_owned())
+    };
+    name(Some(item_dir)) == Some(safe_name(&record.item))
+        && name(item_dir.parent()) == Some(safe_name(&record.user))
+}
+
+fn scan_item(env: &Env, item_dir: &Path, sweep: Sweep) -> Scanned {
+    match read_held(item_dir) {
+        // A record copied into another item's folder would be adopted at a
+        // path its own ids do not name, where removal never looks: it stays
+        // held (as `apply_held` keeps it) for the user to recover or discard.
+        HeldNow::Readable(record) if !names_its_folder(item_dir, &record) => Scanned::Held {
+            why: format!(
+                "record names another folder (record_user={} record_item={})",
+                safe_name(&record.user),
+                safe_name(&record.item)
+            ),
+            m: dir_size(item_dir),
+        },
+        HeldNow::Readable(record) => Scanned::Record(Box::new(adopt(item_dir, *record, sweep))),
+        // The host's check deletes nothing: the folder is measured and
+        // counted as a tombstone, which the next ordinary sweep deletes.
+        HeldNow::NoRecord if sweep == Sweep::HostCheck => {
+            let m = dir_size(item_dir);
+            Scanned::Tombstone {
+                bytes: m.counted(0),
+                exact: m.is_whole(),
+                error: "deletion deferred to an ordinary sweep (host size check)".to_owned(),
+            }
+        }
+        HeldNow::Gone => Scanned::Removed,
+        HeldNow::Still(why) => Scanned::Held {
+            why,
+            m: dir_size(item_dir),
+        },
+        // No record: a removed download whose folder did not delete. Try
+        // again; what stays still counts.
+        HeldNow::NoRecord => match (env.remove_dir)(item_dir) {
+            Ok(()) => Scanned::Removed,
+            Err(e) => {
+                // The figure from before the restart is gone: what is
+                // measured now is all that counts, and a folder not seen
+                // whole blocks admission.
+                let m = dir_size(item_dir);
+                Scanned::Tombstone {
+                    bytes: m.counted(0),
+                    exact: m.is_whole(),
+                    error: e.to_string(),
+                }
+            }
+        },
+    }
+}
+
+/// What listing the store found.
+#[derive(Default)]
+struct Listing {
+    items: Vec<(PathBuf, Scanned)>,
+    /// Folders that could not be listed, and why.
+    failed: Vec<(PathBuf, String)>,
+}
+
+/// Lists `dir` (the root, with `users`, or a user's folder) and scans every
+/// item folder under it that `skip` does not name.
+fn scan_tree(
+    env: &Env,
+    dir: &Path,
+    users: bool,
+    skip: &dyn Fn(&Path) -> bool,
+    out: &mut Listing,
+    sweep: Sweep,
+) {
+    match dirs(dir) {
+        Err(e) => out.failed.push((dir.to_path_buf(), e.to_string())),
+        Ok(children) => {
+            for child in children {
+                if users {
+                    scan_tree(env, &child, false, skip, out, sweep);
+                } else if !skip(&child) {
+                    let scanned = scan_item(env, &child, sweep);
+                    out.items.push((child, scanned));
+                }
+            }
+        }
+    }
+}
+
+impl State {
+    /// Whether `dir` is a folder this state already accounts for.
+    fn knows(&self, dir: &Path) -> bool {
+        self.held.iter().any(|(d, _)| d == dir)
+            || self.tombstones.iter().any(|(d, _)| d == dir)
+            || self
+                .list
+                .iter()
+                .any(|v| self.dir_of(&v.user, &v.item) == *dir)
+    }
+
+    /// Takes what a scan found into the state.
+    fn apply_scanned(&mut self, dir: &Path, scanned: Scanned) {
+        match scanned {
+            Scanned::Record(a) => {
+                if a.leftover {
+                    self.leftover.push(dir.to_path_buf());
+                }
+                if a.parts_deferred && !self.deferred_parts.iter().any(|d| d == dir) {
+                    self.deferred_parts.push(dir.to_path_buf());
+                }
+                if !a.exact {
+                    self.unmeasured.push((
+                        dir.to_path_buf(),
+                        "folder not measured whole when its record was read".to_owned(),
+                    ));
+                    self.remeasure.push(dir.to_path_buf());
+                }
+                self.index.extend(a.index);
+                self.list.push(a.record);
+            }
+            Scanned::Held { why, m } => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video folder held dir={} reason={why} bytes={} exact={} admission=blocked",
+                        dir.display(),
+                        m.counted(0),
+                        m.is_whole()
+                    ),
+                );
+                self.held.push((dir.to_path_buf(), m.counted(0)));
+                self.unmeasured.push((dir.to_path_buf(), why));
+            }
+            Scanned::Tombstone {
+                bytes,
+                exact,
+                error,
+            } => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep tombstone dir={} bytes={bytes} exact={exact} error={error}",
+                        dir.display()
+                    ),
+                );
+                self.measured.insert(dir.to_path_buf(), (0, exact));
+                self.tombstones.push((dir.to_path_buf(), bytes));
+            }
+            Scanned::Removed => {}
+        }
+    }
+
+    /// A folder that cannot be listed hides downloads that may be there, so
+    /// its size is unknown and nothing is admitted while it stays. Logged
+    /// when first found, not at every retry.
+    fn note_unlistable(&mut self, dir: &Path, error: &str) {
+        let reason = format!("cannot be listed: {error}");
+        if self.relist.iter().any(|d| d == dir) {
+            for (d, w) in &mut self.unmeasured {
+                if d == dir {
+                    w.clone_from(&reason);
+                }
+            }
+            return;
+        }
+        emit(
+            true,
+            format!(
+                "pharos: video folder unlistable dir={} error={error} admission=blocked",
+                dir.display()
+            ),
+        );
+        self.relist.push(dir.to_path_buf());
+        self.unmeasured.push((dir.to_path_buf(), reason));
+    }
+}
+
+/// What a walk of a folder found: everything there is, or only what it
+/// could read before something under it could not be read (anything but
+/// being gone), which is then a lower bound. Nothing reads the finding
+/// without saying which: a reader matches, or asks for [`Measure::whole`]
+/// or [`Measure::counted`].
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Measure<T> {
+    /// The walk read everything.
+    Whole(T),
+    /// The walk fell short: what it found is a lower bound.
+    Short(T),
+}
+
+impl<T> Measure<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Measure<U> {
+        match self {
+            Self::Whole(t) => Measure::Whole(f(t)),
+            Self::Short(t) => Measure::Short(f(t)),
+        }
+    }
+
+    /// What was found, only when it is all there is.
+    fn whole(self) -> Option<T> {
+        match self {
+            Self::Whole(t) => Some(t),
+            Self::Short(_) => None,
+        }
+    }
+
+    fn is_whole(&self) -> bool {
+        matches!(self, Self::Whole(_))
+    }
+
+    /// Two walks as one: whole only if both were.
+    fn and<U, V>(self, other: Measure<U>, f: impl FnOnce(T, U) -> V) -> Measure<V> {
+        let whole = self.is_whole() && other.is_whole();
+        let (Self::Whole(t) | Self::Short(t)) = self;
+        let (Measure::Whole(u) | Measure::Short(u)) = other;
+        if whole {
+            Measure::Whole(f(t, u))
+        } else {
+            Measure::Short(f(t, u))
+        }
+    }
+}
+
+impl Measure<u64> {
+    /// The figure to count against the cap: the bytes found, or, when the
+    /// walk was cut short, no less than `floor` (what was known before).
+    fn counted(&self, floor: u64) -> u64 {
+        match *self {
+            Self::Whole(bytes) => bytes,
+            Self::Short(bytes) => bytes.max(floor),
+        }
+    }
+}
+
+/// One entry under a download's `files` folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    /// What it holds: a folder counts every byte under it.
+    len: u64,
+    /// Whether it is a regular file (not a folder, link or anything else).
+    /// Only a regular file can be a whole stored file.
+    regular: bool,
+}
+
+/// The regular files of an inventory, as (name, length).
+fn regular_files(entries: &HashMap<String, Entry>) -> HashMap<String, u64> {
+    entries
+        .iter()
+        .filter(|(_, e)| e.regular)
+        .map(|(n, e)| (n.clone(), e.len))
+        .collect()
+}
+
+/// Every byte of every file under `dir`, whatever it is. A folder that is
+/// gone holds nothing; one that cannot be read is not counted as empty.
+fn dir_size(dir: &Path) -> Measure<u64> {
+    #[cfg(test)]
+    if tests::UNREADABLE.with(|u| u.borrow().iter().any(|p| p == dir)) {
+        return Measure::Short(0);
+    }
+    let gone_or_short = |e: &std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Measure::Whole(0)
+        } else {
+            Measure::Short(0)
+        }
+    };
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) => return gone_or_short(&e),
+    };
+    let mut total = Measure::Whole(0u64);
+    for entry in read {
+        let part = match entry {
+            Err(_) => Measure::Short(0),
+            Ok(e) => match e.metadata() {
+                Ok(m) if m.is_dir() => dir_size(&e.path()),
+                Ok(m) => Measure::Whole(m.len()),
+                Err(err) => gone_or_short(&err),
+            },
+        };
+        total = total.and(part, u64::saturating_add);
+    }
+    total
+}
+
+/// Bytes of whole files on disk under `dir`, whatever plan they belong to.
+/// Not exact when the walk could not complete: the bytes are then a lower
+/// bound, and must not be taken as what the folder holds.
+fn disk_bytes(dir: &Path) -> Measure<u64> {
+    #[cfg(test)]
+    if tests::FAIL_DISK_WALK.with(std::cell::Cell::get) {
+        return Measure::Short(0);
+    }
+    stored_entries(dir).map(|entries| {
+        entries
+            .values()
+            .fold(0u64, |sum, e| sum.saturating_add(e.len))
+    })
+}
+
+/// Deletes the stored files of `item` that `plan` does not name, and
+/// forgets them: a retry that planned afresh (a new play session names
+/// every file anew) must not leave the old plan's files on the disk.
+/// Returns the bytes of unplanned files that could not be deleted, which
+/// still count against the cap; `None` when `run` no longer owns the item.
+/// Ownership is checked under the state lock, and the lock is held through
+/// the deletes and the index, as in `drop_refused_files`, so a removal and
+/// restart in between cannot have the replacement's files deleted. A
+/// listing that came back short never shrinks what the record already
+/// reserved, and leaves the folder unknown until a sweep measures it.
+fn prune_unplanned(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+    plan: &[String],
+) -> Option<u64> {
+    let dir = inner.item_dir(user, item);
+    let keep: HashSet<String> = plan.iter().map(|k| file_name(k)).collect();
+    let files = dir.join("files");
+    let mut st = lock(&inner.state);
+    if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+        return None;
+    }
+    let (names, complete) = match stored_entries(&dir) {
+        Measure::Whole(e) => (e, true),
+        Measure::Short(e) => (e, false),
+    };
+    let (mut removed, mut bytes, mut left) = (0usize, 0u64, 0u64);
+    for (name, Entry { len, .. }) in names {
+        if keep.contains(&name) {
+            continue;
+        }
+        // A folder's `len` is already what it holds.
+        if std::fs::remove_file(files.join(&name)).is_ok() {
+            removed += 1;
+            bytes = bytes.saturating_add(len);
+        } else {
+            left = left.saturating_add(len);
+        }
+    }
+    if !complete {
+        let held = find(&st.list, user, item).map_or(0, reserved);
+        left = left.max(held);
+        if !st.leftover.contains(&dir) {
+            st.leftover.push(dir.clone());
+        }
+    }
+    st.index.retain(|path| {
+        path.parent() != Some(files.as_path()) || {
+            path.file_name()
+                .is_some_and(|n| keep.contains(n.to_string_lossy().as_ref()))
+        }
+    });
+    drop(st);
+    if removed > 0 {
+        emit(
+            false,
+            format!("pharos: video keep pruned item={item} files={removed} bytes={bytes}"),
+        );
+    }
+    if left > 0 {
+        emit(
+            true,
+            format!("pharos: video keep prune left item={item} bytes={left}"),
+        );
+    }
+    Some(left)
+}
+
+/// One planned file; the sliver of a last segment may go without. The
+/// answer is the key and its stored length, `None` when it was skipped.
+async fn fetch_planned(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+    key: String,
+    short_tails: &HashSet<String>,
+) -> Result<(String, Option<u64>), Stop> {
+    match fetch_file(inner, user, item, run, &key, None).await {
+        Ok(len) => Ok((key, Some(len))),
+        // B1476: the sliver of a last segment can fail to encode; the
+        // copy plays without it, ending a frame early.
+        Err(Stop::Failed(reason)) if short_tails.contains(&key) => {
+            emit(
+                true,
+                format!(
+                    "pharos: video keep skipped short tail item={item} url_path={} reason={reason}",
+                    url_path(&key)
+                ),
+            );
+            Ok((key, None))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The playlists a run's planning read, and those of them it fetched.
+#[derive(Default)]
+struct Playlists {
+    read: Vec<String>,
+    fetched: Vec<String>,
+}
+
+/// What an admitted plan leaves for the fetching.
+struct Planned {
+    all: Vec<String>,
+    have: HashSet<String>,
+    names: HashMap<String, u64>,
+    total: u32,
+    short_tails: HashSet<String>,
+}
+
+/// Reads (or reserves and fetches) the playlists, plans the files and
+/// admits the plan. Every playlist read is put in `playlists`, so the
+/// caller can clean up however this ends.
+async fn plan_and_admit(
+    inner: &Arc<Inner>,
+    user: &str,
+    item: &str,
+    run: u64,
+    record: &KeptVideo,
+    playlists: &mut Playlists,
+) -> Result<Planned, Stop> {
+    let resume = !record.files.is_empty();
+    let master = request_key(&record.master_url);
+    // Playlists fetched before the plan is admitted are reserved at their
+    // limit until the admission sets the estimate.
+    let text = playlist(inner, user, item, run, &master, &mut playlists.fetched).await?;
+    let plan = plan_master(&format!("{PLAN_ORIGIN}{master}"), &text)
+        .map_err(|e| Stop::Failed(format!("master playlist not understood: {e}")))?;
+    playlists.read.push(master.clone());
+    let mut files: Vec<String> = Vec::new();
+    let mut duration_ms = 0u64;
+    let mut short_tails: HashSet<String> = HashSet::new();
+    // How many times the planned playlists list each key, all of them
+    // together: a short tail is excused only when it is listed once.
+    let mut listed: HashMap<String, usize> = HashMap::new();
+    for url in &plan.media_playlists {
+        let key = request_key(url);
+        let text = playlist(inner, user, item, run, &key, &mut playlists.fetched).await?;
+        let media = plan_media(url, &text)
+            .map_err(|e| Stop::Failed(format!("{} not understood: {e}", url_path(&key))))?;
+        playlists.read.push(key);
+        duration_ms = duration_ms.max(media.duration_ms);
+        short_tails.extend(media.short_tail.iter().map(|u| request_key(u)));
+        for u in &media.files {
+            *listed.entry(request_key(u)).or_default() += 1;
+        }
+        files.extend(media.files.iter().map(|u| request_key(u)));
+    }
+    // A sliver one playlist may go without is a file another one needs
+    // whole: its failed fetch is never excused.
+    short_tails.retain(|key| {
+        let n = listed.get(key).copied().unwrap_or(0);
+        if n != 1 {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep short tail verdict=not_excused item={item} reason=listed_elsewhere listed={n} url_path={}",
+                    url_path(key)
+                ),
+            );
+        }
+        n == 1
+    });
+    let mut all = playlists.read.clone();
+    all.extend(files);
+    all.extend(record.subtitles.iter().map(|s| request_key(&s.url)));
+    let mut seen = HashSet::new();
+    all.retain(|f| seen.insert(f.clone()));
+
+    let estimate = estimate_bytes(plan.bandwidth_bps, duration_ms);
+    emit(
+        false,
+        format!(
+            "pharos: video keep start item={item} quality={} files={} estimate={estimate} resume={resume}",
+            record.quality_bps,
+            all.len()
+        ),
+    );
+    // Files of an earlier plan go first, so the admission below counts any
+    // that will not (they stay on disk, and against the cap, meanwhile).
+    if !inner.wanted(user, item, run) {
+        return Err(Stop::Gone);
+    }
+    #[cfg(test)]
+    tests::before_prune();
+    let Some(stale) = prune_unplanned(inner, user, item, run, &all) else {
+        return Err(Stop::Gone);
+    };
+    #[cfg(test)]
+    tests::pruned(stale, inner, user, item);
+    // What is on disk already, before the plan is admitted: a resumed
+    // download is admitted for what is left.
+    // Only a regular file is a whole stored file: a folder in a file's
+    // place is fetched again. An inventory that came back short is no
+    // figure for what is stored: the plan is not admitted (its reservation
+    // would be replaced by one counting too little), and the folder stays
+    // unknown until a sweep measures it whole.
+    let dir = inner.item_dir(user, item);
+    let entries = match stored_entries(&dir) {
+        Measure::Whole(entries) => entries,
+        Measure::Short(entries) => {
+            {
+                // Marked unknown only while this run still owns the item, in
+                // the hold that checks it: a run that lost it (removed, or
+                // replaced by another run) stops as gone and marks nothing a
+                // replacement's admission would refuse on.
+                let mut st = lock(&inner.state);
+                if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                    drop(st);
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep inventory verdict=gone item={item} run={run} found={} reason=run_lost_item",
+                            entries.len()
+                        ),
+                    );
+                    return Err(Stop::Gone);
+                }
+                if !st.unmeasured.iter().any(|(d, _)| *d == dir) {
+                    st.unmeasured.push((
+                        dir.clone(),
+                        "folder not listed whole while planning".to_owned(),
+                    ));
+                }
+                if !st.remeasure.contains(&dir) {
+                    st.remeasure.push(dir.clone());
+                }
+            }
+            let reason =
+                "the download's folder could not be listed whole, so what it holds is unknown";
+            emit(
+                true,
+                format!(
+                    "pharos: video keep refused item={item} reason=inventory_short found={} resume={resume} step=plan",
+                    entries.len()
+                ),
+            );
+            return Err(Stop::Refused(reason.to_owned()));
+        }
+    };
+    // Every byte in the folder counts once: a regular file the plan names
+    // is stored, an entry the plan does not name went to the prune (deleted,
+    // or counted in `stale`), and an entry the plan names that is not a
+    // regular file (a folder in a segment's place) is on disk and fetched
+    // again, so it counts in `stale` too.
+    let names = regular_files(&entries);
+    let planned: HashSet<String> = all.iter().map(|k| file_name(k)).collect();
+    let (not_stored, not_stored_bytes) = entries
+        .iter()
+        .filter(|(name, e)| !e.regular && planned.contains(*name))
+        .fold((0usize, 0u64), |(n, b), (_, e)| {
+            (n + 1, b.saturating_add(e.len))
+        });
+    if not_stored > 0 {
+        emit(
+            true,
+            format!(
+                "pharos: video keep inventory item={item} verdict=not_stored reason=not_a_regular_file entries={not_stored} bytes={not_stored_bytes} counted=stale"
+            ),
+        );
+    }
+    let stale = stale.saturating_add(not_stored_bytes);
+    let mut have = HashSet::new();
+    let mut stored_bytes = 0u64;
+    for key in &all {
+        if let Some(len) = names.get(&file_name(key)) {
+            have.insert(key.clone());
+            stored_bytes = stored_bytes.saturating_add(*len);
+        }
+    }
+    let plan = Plan {
+        files: all.clone(),
+        estimate,
+        total: u32::try_from(all.len()).unwrap_or(u32::MAX),
+        // What the plan names is on disk whatever the record says: a new
+        // download over an earlier attempt's files is admitted holding them.
+        // The record's figure is the larger of this and its reservation, so
+        // nothing is counted twice.
+        stored: stored_bytes,
+        stale,
+    };
+    let total = plan.total;
+    // The room is read and the plan admitted under the host's shared
+    // admission lock, taken before the store's own lock (the music cache's
+    // lock is never awaited while the store's is held).
+    let (check, admitted) = {
+        let _admission = inner.env.budget.admission_guard();
+        // Readiness first, then the figures: a library published in between
+        // leaves the check refusing, never passing on the default cap and no
+        // music. The owed and written bytes come from one read (a write that
+        // lands mid-read is in one figure, never both or neither), once, for
+        // the cap and for the free space.
+        let ready = inner.env.budget.accounting_ready();
+        let (other_outstanding, progress) = inner.env.budget.other_pending_bytes();
+        // A resume keeps the cap it was admitted under only while its
+        // reservation already holds the new plan. One whose estimate came
+        // from adoption (the missing files were never reserved), or whose
+        // plan asks for more than it holds, passes the shared cap as a fresh
+        // download, its own reservation not counted.
+        let wants = plan.wants();
+        let replan = if !resume {
+            None
+        } else if record.estimate_from_adoption {
+            Some("estimate_from_adoption")
+        } else if wants > record.estimated_bytes {
+            Some("estimate_raised")
+        } else {
+            None
+        };
+        if let Some(reason) = replan {
+            emit(
+                false,
+                format!(
+                    "pharos: video resume replanned item={item} reason={reason} estimated={} wants={wants} stored={stored_bytes}",
+                    record.estimated_bytes
+                ),
+            );
+        }
+        // What music holds, and what it has approved and not yet written:
+        // both are part of the shared cap.
+        let other = inner
+            .env
+            .budget
+            .other_used_bytes()
+            .saturating_add(other_outstanding)
+            .saturating_add(progress.unwrap_or(0));
+        let cap = inner.env.budget.cap_bytes();
+        let unknown = progress.is_none();
+        let check = if resume && replan.is_none() {
+            Check::Resume {
+                other,
+                cap,
+                ready,
+                unknown,
+            }
+        } else {
+            Check::Fresh {
+                other,
+                cap,
+                ready,
+                unknown,
+            }
+        };
+        (
+            check,
+            inner.admit(user, item, run, &plan, check, other_outstanding),
+        )
+    };
+    match admitted {
+        Ok(()) => {
+            #[cfg(test)]
+            tests::admitted(inner, user, item);
+        }
+        Err(Admission::Gone) => return Err(Stop::Gone),
+        // A plan the disk does not hold would be lost at a restart: the
+        // download stops with the reason rather than fetching on.
+        Err(Admission::Unsaved(e)) => {
+            return Err(Stop::Failed(format!(
+                "the plan's record could not be saved: {e}"
+            )));
+        }
+        Err(Admission::Refused {
+            refusal,
+            used,
+            free,
+            outstanding,
+        }) => {
+            let detail = match check {
+                Check::Fresh { cap, .. } => {
+                    format!("resume={resume} estimate={estimate} used={used} cap={cap}")
+                }
+                Check::Resume { .. } => format!(
+                    "resume=true remaining={} stored={stored_bytes}",
+                    estimate.saturating_sub(stored_bytes)
+                ),
+            };
+            emit(
+                true,
+                format!(
+                    "pharos: video keep refused item={item} reason={refusal} {detail} free={free} outstanding={outstanding}"
+                ),
+            );
+            return Err(Stop::Refused(refusal.to_string()));
+        }
+    }
+    Ok(Planned {
+        all,
+        have,
+        names,
+        total,
+        short_tails,
+    })
+}
+
+/// Waits, on this download's own task (never the UI thread), while a
+/// revoked run of the item still has a staging file open (a park and an
+/// immediate resume): this run writes nothing over bytes in no reservation
+/// of its own, and plans only once they are gone. Their bytes count against
+/// the cap meanwhile ([`State::draining`]). Gone if this run is revoked too.
+async fn wait_for_revoked_writers(
+    inner: &Inner,
+    user: &str,
+    item: &str,
+    run: u64,
+) -> Result<(), Stop> {
+    let started = Instant::now();
+    let mut logged = false;
+    loop {
+        let (busy, staged) = {
+            let st = lock(&inner.state);
+            if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+                return Err(Stop::Gone);
+            }
+            (st.revoked_writer(user, item, run), st.draining())
+        };
+        if !busy {
+            if logged {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep waited item={item} run={run} reason=revoked_writer_stopped ms={}",
+                        started.elapsed().as_millis()
+                    ),
+                );
+            }
+            return Ok(());
+        }
+        if !logged {
+            logged = true;
+            emit(
+                false,
+                format!(
+                    "pharos: video keep waiting item={item} run={run} reason=revoked_writer_running draining={staged}"
+                ),
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Holds a run until the music cache's figures can be read: its cap is
+/// checked against them, so planning before they are refuses, and a
+/// refused run (a download restarted at launch, before the music cache is
+/// up) would end Failed with nothing to restart it. A wait, never a
+/// failure: each look that finds them not ready is logged with what was
+/// missing, and the run asks again after a backoff of up to 30 s, so it
+/// resumes once they are. Nothing is reserved meanwhile. Err(Gone) when
+/// the run no longer owns the download.
+async fn wait_for_accounting(
+    inner: &Arc<Inner>,
+    user: &str,
+    item: &str,
+    run: u64,
+) -> Result<(), Stop> {
+    let mut wait_s = 1u64;
+    let mut logged = None;
+    loop {
+        let (ready, known) = {
+            let budget = &inner.env.budget;
+            let _admission = budget.admission_guard();
+            (
+                budget.accounting_ready(),
+                budget.other_pending_bytes().1.is_some(),
+            )
+        };
+        if ready && known {
+            return Ok(());
+        }
+        if lock(&inner.state)
+            .runs
+            .get(&(user.to_owned(), item.to_owned()))
+            != Some(&run)
+        {
+            return Err(Stop::Gone);
+        }
+        // Logged when the wait starts and when what is missing changes.
+        if logged != Some((ready, known)) {
+            logged = Some((ready, known));
+            emit(
+                true,
+                format!(
+                    "pharos: video keep waiting item={item} run={run} reason=accounting_not_ready music_ready={ready} music_in_progress_known={known} wait_s={wait_s}"
+                ),
+            );
+        }
+        (inner.env.sleep)(wait_s).await;
+        // A host whose sleep returns at once still lets other work run.
+        tokio::task::yield_now().await;
+        wait_s = (wait_s * 2).min(30);
+    }
+}
+
+async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Result<Finished, Stop> {
+    let record = find(&lock(&inner.state).list, user, item)
+        .cloned()
+        .ok_or(Stop::Gone)?;
+    let resume = !record.files.is_empty();
+    wait_for_revoked_writers(inner, user, item, run).await?;
+    wait_for_accounting(inner, user, item, run).await?;
+    // A folder whose adoption walk fell short blocks admission, and no
+    // sweep measures it while this run owns it: the run measures it first.
+    inner.remeasure(Some((user, item, run)));
+    // An earlier run's staging files go before the plan is admitted: the
+    // admission replaces the floor that counted them, and the walks after it
+    // count this run's files only. One that will not go keeps the folder
+    // unknown, so the admission is refused rather than made without it.
+    drop_old_runs_parts(inner, user, item, run);
+    // Every way out of planning passes here: a refusal there (a playlist's
+    // reservation or size limit, the plan's admission) keeps nothing this
+    // run fetched to plan. A new download drops the playlists it read; a
+    // resumed one only those this run fetched, its other files kept for a
+    // later retry.
+    let mut playlists = Playlists::default();
+    let planned = match plan_and_admit(inner, user, item, run, &record, &mut playlists).await {
+        Ok(p) => p,
+        Err(Stop::Refused(reason)) => {
+            let dropped = if resume {
+                &playlists.fetched
+            } else {
+                &playlists.read
+            };
+            drop_refused_files(inner, user, item, run, dropped);
+            emit(
+                false,
+                format!(
+                    "pharos: video keep planning refused item={item} resume={resume} playlists_dropped={}",
+                    dropped.len()
+                ),
+            );
+            return Err(Stop::Refused(reason));
+        }
+        Err(e) => return Err(e),
+    };
+    let Planned {
+        all,
+        have,
+        names,
+        total,
+        short_tails,
+    } = planned;
+    let mut bytes = 0u64;
+    for key in &have {
+        if let Some(len) = names.get(&file_name(key)) {
+            bytes = bytes.saturating_add(*len);
+            inner.record_file(user, item, run, key, inner.file_path(user, item, key), *len);
+        }
+    }
+    let todo = missing_files(&all, &have);
+    let mut done = all.len() - todo.len();
+    inner.publish(user, item, run, (done, total, bytes), 0, true);
+
+    let short_tails = &short_tails;
+    let mut results = stream::iter(todo)
+        .map(|key| fetch_planned(inner, user, item, run, key, short_tails))
+        .buffer_unordered(CONCURRENCY);
+    let mut skipped = Vec::new();
+    while let Some(result) = results.next().await {
+        let (key, len) = result?;
+        match len {
+            Some(len) => bytes = bytes.saturating_add(len),
+            None => skipped.push(key),
+        }
+        done += 1;
+        inner.publish(
+            user,
+            item,
+            run,
+            (done, total, bytes),
+            len.unwrap_or(0),
+            false,
+        );
+    }
+    Ok(Finished {
+        bytes,
+        files: all.len() - skipped.len(),
+        skipped,
+    })
+}
+
+/// What a download that reached its end leaves.
+struct Finished {
+    bytes: u64,
+    /// Files stored, the skipped short tail not counted.
+    files: usize,
+    /// Planned files that were skipped: not stored, so not in the record.
+    skipped: Vec<String>,
+}
+
+async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
+    let started = Instant::now();
+    let outcome = download(&inner, &user, &item, run).await;
+    let ms = started.elapsed().as_millis();
+    let superseded = |what: &str| {
+        emit(
+            false,
+            format!("pharos: video keep stopped item={item} reason={what} ms={ms}"),
+        );
+    };
+    // From here until the terminal figure is published, a settlement
+    // leaves the folder alone, and one already measuring it does not count:
+    // the figure below counts no staging file and would replace its measure.
+    {
+        let dir = inner.item_dir(&user, &item);
+        let mut st = lock(&inner.state);
+        st.bump(&dir);
+        st.terminating.push(dir);
+    }
+    // What the item's folder holds now, whatever plan the files are of,
+    // and the staging files other runs left that would not go (a
+    // settlement kept them, `retained_parts`): they stay on disk after this
+    // run, so the terminal figure counts them. This run's own go below.
+    let disk = disk_bytes(&inner.item_dir(&user, &item)).and(
+        parts_bytes_except(&inner.item_dir(&user, &item), run),
+        u64::saturating_add,
+    );
+    // A lower bound when the walk fell short; only ever taken in a max.
+    let held = disk.counted(0);
+    // The record's figure for the folder: what was found, or, when the walk
+    // fell short (a transient EMFILE reads as nothing), no less than what
+    // the record held before. A short walk also leaves the folder unknown
+    // until a sweep measures it whole (below).
+    // `completed` is what the record held as a download before it became
+    // terminal: a Ready or Failed record reports its estimate as its bytes,
+    // so it must be read before the state changes.
+    let figure = |v: &KeptVideo, completed: u64| disk.counted(v.estimated_bytes.max(completed));
+    // A walk that fell short leaves the folder unknown from before the
+    // terminal record is published: an admission must not see the low
+    // figure first.
+    // Only while this run owns the item: a replacement that took it over
+    // measures the folder itself, and an old run's short walk must not
+    // leave it unknown under the replacement's admission.
+    if !disk.is_whole() {
+        let dir = inner.item_dir(&user, &item);
+        let mut st = lock(&inner.state);
+        let owner = st.runs.get(&(user.clone(), item.clone())) == Some(&run);
+        if owner && !st.leftover.contains(&dir) {
+            st.leftover.push(dir);
+        } else if !owner {
+            emit(
+                false,
+                format!(
+                    "pharos: video folder short walk not marked item={item} run={run} reason=run_superseded"
+                ),
+            );
+        }
+    }
+    let mut cleaned = None;
+    match outcome {
+        Ok(Finished {
+            bytes,
+            files,
+            skipped,
+        }) => {
+            // A skipped short tail can leave its staging file (a write that
+            // failed is an omission, not a failure), which the figure below
+            // does not count: it goes first, and one that will not leaves
+            // the folder unknown before the figure is published.
+            let dir = inner.item_dir(&user, &item);
+            let clean = drop_parts_of(&dir, Some(run));
+            if !clean {
+                let mut st = lock(&inner.state);
+                if !st.leftover.contains(&dir) {
+                    st.leftover.push(dir.clone());
+                }
+            }
+            if !clean || !skipped.is_empty() {
+                emit(
+                    !clean,
+                    format!(
+                        "pharos: video keep staging before ready item={item} run={run} skipped={} verdict={}",
+                        skipped.len(),
+                        if clean { "dropped" } else { "leftover_unknown" }
+                    ),
+                );
+            }
+            cleaned = Some(clean);
+            // The stored files' names are durable before the record that
+            // names them Ready: one folder sync for the whole download, not
+            // one per file. One that fails is not Ready: the run fails,
+            // its files kept for a retry.
+            let saved = match durable_dir(&dir.join("files"), &item, "files_dir") {
+                Err(e) => Err(format!(
+                    "finished but its files could not be made durable: {e}"
+                )),
+                Ok(()) => inner
+                    .update_run_saved(&user, &item, run, |v| {
+                        // A skipped file is not on disk: left in the record, a
+                        // reopen would count it missing and resume the copy.
+                        v.files.retain(|k| !skipped.contains(k));
+                        let completed = v.bytes();
+                        v.state = KeptState::Ready;
+                        // What the folder holds, a file a failed prune could not
+                        // delete included: the record reports all storage used.
+                        v.estimated_bytes = figure(v, completed);
+                    })
+                    .map_err(|e| format!("finished but its record could not be saved: {e}")),
+            };
+            match saved {
+                Ok(true) => {
+                    #[cfg(test)]
+                    tests::sync_step("ready".to_owned());
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep ready item={item} bytes={bytes} files={files} ms={ms}"
+                        ),
+                    );
+                }
+                Ok(false) => superseded("superseded"),
+                Err(reason) => {
+                    // Ready that is not on disk would resume at the next
+                    // open: it is reported as what it is, a failure, and
+                    // the memory and the disk then tell the same story
+                    // (the files stay; a retry finds them).
+                    let _ = inner.update_run(&user, &item, run, |v| {
+                        // A Failed record reports its estimate as its bytes:
+                        // what the folder holds must not drop out of it.
+                        v.estimated_bytes = held.max(v.bytes()).max(v.estimated_bytes);
+                        v.state = KeptState::Failed {
+                            reason: reason.clone(),
+                        };
+                    });
+                    emit(
+                        true,
+                        format!(
+                            "pharos: video keep failed item={item} reason={reason} files={files} bytes={bytes} ms={ms}"
+                        ),
+                    );
+                }
+            }
+        }
+        Err(Stop::Gone) => superseded("removed"),
+        Err(Stop::Parked(why)) => {
+            // Left as it is, Downloading: the record and its files are the
+            // owner's, and its run resumes when the owner signs in again.
+            emit(
+                true,
+                format!("pharos: video keep parked item={item} run={run} reason={why} ms={ms}"),
+            );
+        }
+        Err(Stop::Refused(reason) | Stop::Failed(reason)) => {
+            // The fetches cancelled with the failure leave their staging
+            // files, which the figure below does not count: they go first,
+            // and one that will not leaves the folder unknown before the
+            // smaller figure is published.
+            let dir = inner.item_dir(&user, &item);
+            let clean = drop_parts_of(&dir, Some(run));
+            if !clean {
+                let mut st = lock(&inner.state);
+                if !st.leftover.contains(&dir) {
+                    st.leftover.push(dir.clone());
+                }
+            }
+            emit(
+                !clean,
+                format!(
+                    "pharos: video keep staging after failure item={item} run={run} verdict={}",
+                    if clean { "dropped" } else { "leftover_unknown" }
+                ),
+            );
+            cleaned = Some(clean);
+            #[cfg(test)]
+            tests::before_failed_update();
+            let (mut files, mut bytes) = (0, 0);
+            let applied = inner.update_run(&user, &item, run, |v| {
+                // Not durable when the save fails (logged by `save_record`):
+                // the disk then holds the earlier Downloading record, which
+                // resumes at the next open.
+                if let KeptState::Downloading { done, .. } = v.state {
+                    files = done;
+                }
+                bytes = v.bytes();
+                // A failed attempt's files stay for a retry; the record
+                // holds what is really on disk, not what was planned.
+                v.estimated_bytes = figure(v, bytes);
+                v.state = KeptState::Failed {
+                    reason: reason.clone(),
+                };
+            });
+            #[cfg(test)]
+            tests::after_failed_save();
+            if applied.unwrap_or(true) {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep failed item={item} reason={reason} files={files} bytes={bytes} ms={ms}"
+                    ),
+                );
+            } else {
+                superseded("superseded");
+            }
+        }
+    }
+    // Whatever this run left half staged (a file in flight when the
+    // download was dropped) goes with it; a failure dropped its files above.
+    let cleaned =
+        cleaned.unwrap_or_else(|| drop_parts_of(&inner.item_dir(&user, &item), Some(run)));
+    #[cfg(test)]
+    tests::before_run_exit();
+    let mut resume = None;
+    let owned = {
+        let mut st = lock(&inner.state);
+        let key = (user.clone(), item.clone());
+        let owned = st.runs.get(&key) == Some(&run);
+        // A cleanup that failed leaves the folder unknown whoever owns it;
+        // a short walk only while this run still does.
+        if !cleaned || (owned && !disk.is_whole()) {
+            let dir = inner.item_dir(&user, &item);
+            if !st.leftover.contains(&dir) {
+                st.leftover.push(dir);
+            }
+        }
+        // The terminal figure is out and the leftover with it: settlement
+        // may measure the folder again.
+        let dir = inner.item_dir(&user, &item);
+        if let Some(i) = st.terminating.iter().position(|d| *d == dir) {
+            st.terminating.remove(i);
+        }
+        if owned {
+            st.runs.remove(&key);
+        }
+        let who = (user.clone(), item.clone(), run);
+        let pre_plan = st.playlists_taken.remove(&who).is_some();
+        let landed = st.playlists_landed.remove(&who).unwrap_or(0);
+        st.promoted.remove(&who);
+        let base = st.playlists_base.remove(&who);
+        // A run that ends before its plan is admitted (it parked, or
+        // failed) gives back the playlist allowances it did not use: what
+        // the record reserved before them, and the playlists that landed.
+        // Never under another run, whose reservation it is now, except a
+        // parked run whose allowance a claim kept for its writer and handed
+        // to the record's run now, which has reserved no playlist since:
+        // what it did not use is given back on that record.
+        let gen_now = st.record_gen.get(&key).copied().unwrap_or(0);
+        let handed_to = st.handed_over.remove(&who);
+        let replacement_reserved = st
+            .playlists_taken
+            .keys()
+            .any(|(u, i, _)| *u == user && *i == item);
+        let writing = st.writers.contains_key(&who);
+        let handed = pre_plan && handed_to == Some(gen_now) && !replacement_reserved && !writing;
+        if pre_plan && handed_to == Some(gen_now) && !handed {
+            let why = if writing {
+                "writer_running"
+            } else {
+                "replacement_reserved"
+            };
+            emit(
+                false,
+                format!(
+                    "pharos: video playlist allowance kept item={item} run={run} to_run={gen_now} reason={why}"
+                ),
+            );
+        }
+        let same_record = handed || base.is_some_and(|(_, gen)| gen_now == gen);
+        if pre_plan && base.is_some() && !same_record && handed_to != Some(gen_now) {
+            emit(
+                false,
+                format!(
+                    "pharos: video playlist allowance kept item={item} run={run} reason=record_replaced"
+                ),
+            );
+        }
+        let base = base.filter(|_| same_record).map(|(b, _)| b);
+        if let (true, Some(base), false) = (pre_plan, base, st.runs.contains_key(&key) && !handed) {
+            if let Some(v) = st
+                .list
+                .iter_mut()
+                .find(|v| v.user == user && v.item == item)
+            {
+                let to = base.saturating_add(landed).min(v.estimated_bytes);
+                if to < v.estimated_bytes {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video playlist allowance released item={item} run={run} from={} to={to} landed={landed} reason={}",
+                            v.estimated_bytes,
+                            if handed { "writer_stopped_after_handover" } else { "run_ended" }
+                        ),
+                    );
+                    v.estimated_bytes = to;
+                }
+            }
+        }
+        if owned {
+            st.retained_parts.remove(&inner.item_dir(&user, &item));
+        }
+        let parked = st.parking.get(&key) == Some(&run);
+        if parked {
+            st.parking.remove(&key);
+        }
+        if st.resume_pending.get(&key) == Some(&run) {
+            st.resume_pending.remove(&key);
+            // Only a run that parked leaves its download to resume; one
+            // that ended any other way has nothing to resume. Claimed in
+            // this hold: a removal and restart after it revokes the claimed
+            // id, and the new run's is never overwritten.
+            if owned && parked {
+                resume = Some(st.claim_run(&user, &item));
+            }
+        }
+        owned
+    };
+    if let Some(next) = resume {
+        // A sign-in came while this run was parking: the run it could not
+        // start starts now that the id is free.
+        emit(
+            false,
+            format!(
+                "pharos: video keep resume item={item} run={run} reason=signed_in_while_parking owner={user}"
+            ),
+        );
+        inner.spawn_claimed(user.clone(), item.clone(), next);
+    }
+    // A revoked run's writer is done: a folder its removal could not
+    // delete or bound while it ran is deleted or measured now.
+    if !owned || !cleaned || !disk.is_whole() {
+        inner.sweep_tombstones();
+    }
+}
+
+/// Deletes the files a refused new download had stored, and forgets them,
+/// while `run` still owns the item. Each check and deletion is one step
+/// under the state lock, so a removal and restart in between cannot have
+/// its replacement's file at the same path deleted from under it.
+fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[String]) {
+    for key in keys {
+        let mut st = lock(&inner.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return;
+        }
+        let path = inner.file_path(user, item, key);
+        let _ = std::fs::remove_file(&path);
+        st.index.remove(&(user.to_owned(), key.clone()), &path);
+    }
+}
+
+/// Deletes the staging files earlier runs left in `item`'s folder, each
+/// under the state lock while `run` still owns the item (so a removal and
+/// restart in between cannot have its replacement's file deleted). Called
+/// before `run` stages anything, so a file is kept only while a live writer
+/// of this process has registered its run: an inherited file goes whatever
+/// its suffix, even one that names `run` itself (run ids need not be
+/// distinct across processes). It also
+/// settles what the host's size check deferred there: the folder's parts are
+/// deferred no longer. A file that will not go, or a listing that is not
+/// complete, leaves the folder a leftover (unknown) until a sweep settles it,
+/// so those bytes never drop out of the accounting. A resume runs here, in
+/// an ordinary context, never on the host's path.
+fn drop_old_runs_parts(inner: &Inner, user: &str, item: &str, run: u64) {
+    let dir = inner.item_dir(user, item);
+    let (paths, mut clean) = part_paths(&dir, ".part");
+    let mut dropped = 0usize;
+    // A live writer's file stays: the folder still holds staging bytes.
+    let mut kept_live = false;
+    for path in paths {
+        let st = lock(&inner.state);
+        if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+            return;
+        }
+        // A revoked run of this item still writing keeps its file: its
+        // writer drops it. Anything else is no live writer's.
+        let name = path.to_string_lossy();
+        let live = st
+            .writers
+            .keys()
+            .any(|(u, i, r)| u == user && i == item && name.ends_with(&format!(".{r}.part")));
+        if live {
+            kept_live = true;
+            continue;
+        }
+        match remove_part(&path) {
+            Ok(()) => dropped += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => clean = false,
+        }
+    }
+    let mut st = lock(&inner.state);
+    if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
+        return;
+    }
+    let deferred = st.deferred_parts.contains(&dir);
+    st.deferred_parts.retain(|d| *d != dir);
+    if !clean && !st.leftover.contains(&dir) {
+        st.leftover.push(dir.clone());
+    }
+    // Every inherited file went and the listing was whole: what a
+    // settlement kept for them is on disk no longer. Otherwise the folder
+    // is a leftover, and its settlement measures what is left.
+    let retained = if clean && !kept_live {
+        st.retained_parts.remove(&dir)
+    } else {
+        None
+    };
+    drop(st);
+    if dropped > 0 || deferred || !clean {
+        emit(
+            !clean,
+            format!(
+                "pharos: video keep old parts item={item} run={run} dropped={dropped} deferred={deferred} retained_cleared={} verdict={}",
+                retained.unwrap_or(0),
+                if clean { "settled" } else { "leftover_unknown" }
+            ),
+        );
+    }
+}
+
+/// Deletes one staging file; a test can make it fail.
+fn remove_part(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_PART_DELETE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("part in use"));
+    }
+    std::fs::remove_file(path)
+}
+
+/// The bytes of the staging files in `dir`: whole only when the listing was
+/// complete and every entry could be measured (a file gone since is none);
+/// otherwise a lower bound, never taken as what the folder holds.
+fn parts_bytes(dir: &Path) -> Measure<u64> {
+    parts_measure(dir, None)
+}
+
+/// [`parts_bytes`] without `run`'s own staging files.
+fn parts_bytes_except(dir: &Path, run: u64) -> Measure<u64> {
+    parts_measure(dir, Some(run))
+}
+
+/// The one measure admission and a run's exit both read the staging files
+/// with, so the two never disagree: a regular file by its length, anything
+/// else (a `.part` entry that is a folder) by everything under it
+/// ([`dir_size`]), so a folder's contents are never taken as its own small
+/// length. A short measure stays a lower bound.
+fn parts_measure(dir: &Path, except: Option<u64>) -> Measure<u64> {
+    let own = except.map(|run| format!(".{run}.part"));
+    let (paths, clean) = part_paths(dir, ".part");
+    let mut total = if clean {
+        Measure::Whole(0u64)
+    } else {
+        Measure::Short(0u64)
+    };
+    for path in paths.iter().filter(|p| {
+        !own.as_deref()
+            .is_some_and(|own| p.to_string_lossy().ends_with(own))
+    }) {
+        let part = match std::fs::metadata(path) {
+            Ok(m) if m.is_file() => Measure::Whole(m.len()),
+            Ok(_) => dir_size(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Measure::Whole(0),
+            Err(_) => Measure::Short(0),
+        };
+        total = total.and(part, u64::saturating_add);
+    }
+    total
+}
+
+/// The staging files ending in `suffix` in `dir/files`, and whether the
+/// listing was complete: false when the folder or an entry could not be
+/// read (anything but the folder being gone).
+fn part_paths(dir: &Path, suffix: &str) -> (Vec<PathBuf>, bool) {
+    let read = match std::fs::read_dir(dir.join("files")) {
+        Ok(read) => read,
+        Err(e) => return (Vec::new(), e.kind() == std::io::ErrorKind::NotFound),
+    };
+    let mut clean = true;
+    let mut paths = Vec::new();
+    for entry in read {
+        #[cfg(test)]
+        let entry = tests::entry_read(entry);
+        match entry {
+            Ok(entry) => {
+                if entry.file_name().to_string_lossy().ends_with(suffix) {
+                    paths.push(entry.path());
+                }
+            }
+            // An entry that cannot be read may be a staging file.
+            Err(_) => clean = false,
+        }
+    }
+    (paths, clean)
+}
+
+/// Deletes the staging files `run` left in `dir/files` (every run's, with
+/// `None`); false when one would not go, or the folder or an entry in it
+/// could not be read.
+fn drop_parts_of(dir: &Path, run: Option<u64>) -> bool {
+    let suffix = run.map_or_else(|| ".part".to_owned(), |r| format!(".{r}.part"));
+    let (paths, mut clean) = part_paths(dir, &suffix);
+    for path in paths {
+        match remove_part(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => clean = false,
+        }
+    }
+    clean
+}
+
+impl Inner {
+    /// Runs `run_id`, already named the item's run by [`State::claim_run`].
+    fn spawn_claimed(self: &Arc<Self>, user: String, item: String, run_id: u64) {
+        let handle = self
+            .env
+            .runtime
+            .spawn(run(self.clone(), user, item, run_id));
+        #[cfg(test)]
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
+        #[cfg(not(test))]
+        drop(handle);
+    }
+}
+
+/// Where this open's run ids start: the clock's nanoseconds, and at least
+/// 2^32 past the last base this process handed out. Within one process two
+/// opens never share a base. Across processes nothing is promised: `LAST`
+/// is process-local and the clock can repeat or step back, so a new
+/// process can reuse an earlier one's ids. Inherited staging files do not
+/// rely on the ids: before a run stages anything, every staging file that
+/// no live writer in the registry (`writers`) owns is deleted, whatever its
+/// id (`drop_old_runs_parts`).
+fn open_run_base() -> u64 {
+    #[cfg(test)]
+    if let Some(base) = tests::RUN_BASE.with(std::cell::Cell::get) {
+        return base;
+    }
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX >> 1));
+    let mut prev = LAST.load(std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let base = now.max(prev.saturating_add(1 << 32));
+        match LAST.compare_exchange(
+            prev,
+            base,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => return base,
+            Err(seen) => prev = seen,
+        }
+    }
+}
+
+/// The least time between sweeps started by the host's size check.
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What a held folder's record reads as now.
+enum HeldNow {
+    /// It parses: the folder is a download again.
+    Readable(Box<KeptVideo>),
+    /// The folder is gone.
+    Gone,
+    /// The folder is there with no record: a removed download.
+    NoRecord,
+    /// Still not readable, and why.
+    Still(String),
+}
+
+fn read_held(dir: &Path) -> HeldNow {
+    match std::fs::read(dir.join("manifest.json")) {
+        Ok(bytes) => match serde_json::from_slice::<KeptVideo>(&bytes) {
+            Ok(v) => HeldNow::Readable(Box::new(v)),
+            Err(e) => HeldNow::Still(format!("record damaged: {e}")),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match std::fs::metadata(dir) {
+            Err(m) if m.kind() == std::io::ErrorKind::NotFound => HeldNow::Gone,
+            Err(m) => HeldNow::Still(format!("folder unreadable: {m}")),
+            Ok(_) => HeldNow::NoRecord,
+        },
+        Err(e) => HeldNow::Still(format!("record unreadable: {e}")),
+    }
+}
+
+impl Inner {
+    /// The sweep of unknown folders, at most once per [`SWEEP_EVERY`] when
+    /// the host's size check asks. Logs the verdict.
+    fn sweep_if_due(self: &Arc<Self>) {
+        {
+            let mut last = self
+                .last_sweep
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let now = std::time::Instant::now();
+            if last.is_some_and(|t| now.duration_since(t) < SWEEP_EVERY) {
+                return;
+            }
+            *last = Some(now);
+        }
+        #[cfg(test)]
+        self.host_sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let before = lock(&self.state).unknown_reason();
+        self.sweep_held(Sweep::HostCheck);
+        // The tombstones and leftovers recover too, as `sweep_tombstones`
+        // would recover them, with its claims and writer checks. Measured,
+        // not deleted: this runs under the music cache's locks, and deleting
+        // a whole download there would stall it. A tombstone measured whole
+        // is known and counted at its bytes; its deletion waits for the next
+        // `sweep_tombstones` (a listing, a start or a discard). Settling a
+        // leftover deletes only staging files.
+        self.settle_leftovers(Sweep::HostCheck);
+        self.measure_unknown_tombstones();
+        let after = lock(&self.state).unknown_reason();
+        emit(
+            false,
+            format!(
+                "pharos: video unknown-size sweep from=host_size_check before={} after={}",
+                before.map_or("known".to_owned(), |(d, w)| format!(
+                    "unknown({}: {w})",
+                    d.display()
+                )),
+                after.map_or("known".to_owned(), |(d, w)| format!(
+                    "unknown({}: {w})",
+                    d.display()
+                )),
+            ),
+        );
+    }
+
+    /// Measures the tombstones not measured whole since they last changed,
+    /// leaving any a removal, a writer or a delete is working on. Deletes
+    /// nothing.
+    fn measure_unknown_tombstones(&self) {
+        let dirs: Vec<PathBuf> = {
+            let st = lock(&self.state);
+            st.tombstones
+                .iter()
+                .map(|(d, _)| d.clone())
+                .filter(|d| {
+                    st.measured.get(d) != Some(&(st.epoch(d), true))
+                        && !st.removing.contains(d)
+                        && !st.deleting.contains(d)
+                        && !st.writing(d)
+                })
+                .collect()
+        };
+        for dir in dirs {
+            let bytes = self.measure_tombstone(&dir);
+            let known = {
+                let st = lock(&self.state);
+                st.measured.get(&dir) == Some(&(st.epoch(&dir), true))
+            };
+            emit(
+                !known,
+                format!(
+                    "pharos: video keep tombstone measured dir={} bytes={bytes} whole={known} from=host_size_check",
+                    dir.display()
+                ),
+            );
+        }
+    }
+
+    /// Claims the held folders nothing else is working on.
+    fn claim_held(&self) -> Vec<PathBuf> {
+        let mut st = lock(&self.state);
+        let picked: Vec<PathBuf> = st
+            .held
+            .iter()
+            .map(|(d, _)| d.clone())
+            .filter(|d| {
+                !st.removing.contains(d)
+                    && !st.deleting.contains(d)
+                    && !st.settling.contains(d)
+                    && !st.writing(d)
+            })
+            .collect();
+        st.deleting.extend(picked.iter().cloned());
+        picked
+    }
+
+    /// Reads again the folders held at open. A record that parses now
+    /// (a schema it could not read, fixed) joins the list; a folder that is
+    /// gone is dropped; one left without a record is a removed download and
+    /// becomes a tombstone; one still unreadable has its size measured again.
+    /// Each verdict is logged, a repeat of an unchanged one is not.
+    /// [`Self::sweep_held`] on the blocking pool, unless one started there
+    /// is still running.
+    fn sweep_held_elsewhere(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.ready_sweeping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        /// Clears the flag however the sweep ends, a panic included.
+        struct Done(Arc<Inner>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                self.0.ready_sweeping.store(false, Ordering::Release);
+            }
+        }
+        let done = Done(Arc::clone(self));
+        let handle = self.env.runtime.spawn_blocking(move || {
+            done.0.sweep_held(Sweep::Ordinary);
+            drop(done);
+        });
+        #[cfg(test)]
+        self.tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(handle);
+        #[cfg(not(test))]
+        drop(handle);
+    }
+
+    fn sweep_held(self: &Arc<Self>, sweep: Sweep) {
+        for dir in self.claim_held() {
+            let now = read_held(&dir);
+            self.apply_held(&dir, now, sweep);
+            lock(&self.state).deleting.retain(|d| *d != dir);
+        }
+        self.sweep_relist(sweep);
+        self.sweep_remeasure();
+    }
+
+    /// Lists again the folders that could not be listed at open, and scans
+    /// what turns up: a record is adopted, an unreadable one held, a removed
+    /// download's folder deleted or tombstoned. The block on a folder lifts
+    /// only once its listing succeeds, with everything found counted.
+    fn sweep_relist(self: &Arc<Self>, sweep: Sweep) {
+        // Claimed under the hold that picks them: a sweep already listing a
+        // folder keeps it to itself until its adoptions are in.
+        let (dirs, skipped) = {
+            let mut st = lock(&self.state);
+            let (dirs, skipped): (Vec<PathBuf>, Vec<PathBuf>) = st
+                .relist
+                .iter()
+                .cloned()
+                .partition(|d| !st.relisting.contains(d));
+            st.relisting.extend(dirs.iter().cloned());
+            (dirs, skipped)
+        };
+        for dir in &skipped {
+            emit(
+                false,
+                format!(
+                    "pharos: video folder relist skipped dir={} reason=claimed_by_another_sweep",
+                    dir.display()
+                ),
+            );
+        }
+        for dir in dirs {
+            let mut found = Listing::default();
+            let known = |p: &Path| {
+                let st = lock(&self.state);
+                let skip = st.knows(p)
+                    || st.deleting.iter().any(|d| d == p)
+                    || st.removing.iter().any(|d| d == p)
+                    || st.settling.iter().any(|d| d == p);
+                drop(st);
+                #[cfg(test)]
+                if !skip {
+                    self.relist_step("checked");
+                }
+                skip
+            };
+            scan_tree(&self.env, &dir, dir == self.root, &known, &mut found, sweep);
+            let mut resume = Vec::new();
+            let mut st = lock(&self.state);
+            for (d, scanned) in found.items {
+                if st.knows(&d) {
+                    continue;
+                }
+                if let Scanned::Record(a) = &scanned {
+                    if !interrupted(std::slice::from_ref(&a.record)).is_empty() {
+                        let (user, item) = (a.record.user.clone(), a.record.item.clone());
+                        let id = st.claim_run(&user, &item);
+                        resume.push((user, item, id));
+                    }
+                }
+                st.apply_scanned(&d, scanned);
+            }
+            st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+            let still = found.failed.iter().any(|(d, _)| *d == dir);
+            for (d, e) in &found.failed {
+                st.note_unlistable(d, e);
+            }
+            if !still {
+                st.relist.retain(|d| *d != dir);
+                st.unmeasured.retain(|(d, _)| *d != dir);
+            }
+            drop(st);
+            emit(
+                false,
+                format!(
+                    "pharos: video folder relisted dir={} listed={} resume={}",
+                    dir.display(),
+                    !still,
+                    resume.len()
+                ),
+            );
+            for (user, item, id) in resume {
+                self.spawn_claimed(user, item, id);
+            }
+            lock(&self.state).relisting.retain(|d| *d != dir);
+            #[cfg(test)]
+            self.relist_step("adopted");
+        }
+    }
+
+    #[cfg(test)]
+    fn relist_step(&self, step: &'static str) {
+        let hook = self
+            .relist_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(f) = hook {
+            f(step);
+        }
+    }
+
+    /// Measures again the adopted folders whose first walk was not whole. A
+    /// whole walk sets the record's floor and lifts the block. A folder a
+    /// download is writing waits until it is idle.
+    fn sweep_remeasure(&self) {
+        self.remeasure(None);
+    }
+
+    /// Measures the folders of `remeasure` again: every idle one, or with
+    /// `own`, only that run's own folder. A run recovered at open whose
+    /// adoption walk fell short owns its folder, so a sweep never measures
+    /// it; before it plans, the run measures it itself while it has no
+    /// writer, and a whole walk lifts the block it would otherwise be
+    /// refused by. A walk that is short again keeps it.
+    fn remeasure(&self, own: Option<(&str, &str, u64)>) {
+        let own_dir = own.map(|(u, i, _)| self.item_dir(u, i));
+        let idle = |st: &State, d: &Path| {
+            let owned_by_others = st.runs.iter().any(|((u, i), r)| {
+                st.dir_of(u, i) == *d && own.map_or(true, |(ou, oi, or)| (ou, oi, or) != (u, i, *r))
+            });
+            let own_still = own.map_or(true, |(u, i, r)| {
+                st.runs.get(&(u.to_owned(), i.to_owned())) == Some(&r)
+            });
+            !st.writing(d) && !owned_by_others && own_still && !st.removing.iter().any(|r| r == d)
+        };
+        let dirs: Vec<(PathBuf, u64)> = {
+            let mut st = lock(&self.state);
+            let picked: Vec<(PathBuf, u64)> = st
+                .remeasure
+                .iter()
+                .filter(|d| own_dir.as_ref().map_or(true, |o| o == *d))
+                .filter(|d| idle(&st, d) && !st.remeasuring.iter().any(|(r, _)| r == *d))
+                .map(|d| (d.clone(), st.epoch(d)))
+                .collect();
+            st.remeasuring.extend(picked.iter().cloned());
+            picked
+        };
+        for (dir, epoch) in dirs {
+            let walked = dir_size(&dir).whole();
+            #[cfg(test)]
+            tests::before_remeasure_apply();
+            let mut st = lock(&self.state);
+            st.remeasuring.retain(|(r, _)| *r != dir);
+            let Some(m) = walked else {
+                continue;
+            };
+            // A download started, wrote or was removed since the claim: its
+            // inventory is newer than this walk, which must not lift the block.
+            let now = st.epoch(&dir);
+            if now != epoch || !idle(&st, &dir) || !st.remeasure.contains(&dir) {
+                drop(st);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video folder remeasure verdict=stale dir={} bytes={m} claimed_epoch={epoch} epoch={now}",
+                        dir.display()
+                    ),
+                );
+                continue;
+            }
+            let root = st.root.clone();
+            for v in &mut st.list {
+                if root.join(safe_name(&v.user)).join(safe_name(&v.item)) == dir
+                    && m > v.estimated_bytes
+                {
+                    v.estimated_bytes = m;
+                }
+            }
+            st.remeasure.retain(|d| *d != dir);
+            st.unmeasured.retain(|(d, _)| *d != dir);
+            drop(st);
+            emit(
+                false,
+                format!(
+                    "pharos: video folder remeasured dir={} bytes={m} by={}",
+                    dir.display(),
+                    if own.is_some() { "own_run" } else { "sweep" }
+                ),
+            );
+        }
+    }
+
+    /// Applies what [`read_held`] found for a claimed `dir`.
+    fn apply_held(self: &Arc<Self>, dir: &Path, now: HeldNow, sweep: Sweep) {
+        let verdict = |v: &str, why: &str| {
+            emit(
+                false,
+                format!(
+                    "pharos: video held folder verdict={v} dir={} reason={why}",
+                    dir.display()
+                ),
+            );
+        };
+        let release = |st: &mut State| {
+            st.held.retain(|(d, _)| d != dir);
+            st.unmeasured.retain(|(d, _)| d != dir);
+        };
+        match now {
+            HeldNow::Readable(record) => {
+                if self.item_dir(&record.user, &record.item) != dir {
+                    verdict("still_held", "record names another folder");
+                    return;
+                }
+                let adopted = adopt(dir, *record, sweep);
+                let (user, item) = (adopted.record.user.clone(), adopted.record.item.clone());
+                let resume = !interrupted(std::slice::from_ref(&adopted.record)).is_empty();
+                let mut st = lock(&self.state);
+                if !st.held.iter().any(|(d, _)| d == dir) || find(&st.list, &user, &item).is_some()
+                {
+                    return;
+                }
+                release(&mut st);
+                st.apply_scanned(dir, Scanned::Record(Box::new(adopted)));
+                st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+                let resume = resume.then(|| st.claim_run(&user, &item));
+                drop(st);
+                verdict("released", "record readable");
+                if let Some(id) = resume {
+                    self.spawn_claimed(user, item, id);
+                }
+            }
+            HeldNow::Gone => {
+                release(&mut lock(&self.state));
+                verdict("dropped", "folder gone");
+            }
+            HeldNow::NoRecord => {
+                let m = dir_size(dir);
+                let mut st = lock(&self.state);
+                if !st.held.iter().any(|(d, _)| d == dir) {
+                    return;
+                }
+                release(&mut st);
+                st.measured.insert(dir.to_path_buf(), (0, m.is_whole()));
+                st.tombstones.push((dir.to_path_buf(), m.counted(0)));
+                drop(st);
+                verdict("tombstoned", "no record, a removed download");
+            }
+            HeldNow::Still(why) => {
+                let m = dir_size(dir);
+                let mut st = lock(&self.state);
+                let changed = st
+                    .held
+                    .iter()
+                    .find(|(d, _)| d == dir)
+                    .is_some_and(|(_, b)| *b != m.counted(0))
+                    || st.unmeasured.iter().any(|(d, w)| d == dir && *w != why);
+                for (d, b) in &mut st.held {
+                    if d == dir {
+                        *b = m.counted(0);
+                    }
+                }
+                for (d, w) in &mut st.unmeasured {
+                    if d == dir {
+                        why.clone_into(w);
+                    }
+                }
+                drop(st);
+                if changed {
+                    verdict(
+                        "still_held",
+                        &format!("{why} bytes={} exact={}", m.counted(0), m.is_whole()),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Deletes the held folders whose record is still unreadable, and
+    /// returns the bytes they held. One whose record reads now is released,
+    /// never deleted. A folder that will not delete becomes a tombstone,
+    /// counted and swept like a removed download's. Returns the bytes freed
+    /// and the folders that would not delete.
+    fn discard_held(self: &Arc<Self>) -> (u64, Vec<PathBuf>) {
+        let mut freed = 0u64;
+        let mut failed = Vec::new();
+        for dir in self.claim_held() {
+            let now = read_held(&dir);
+            // A record that reads but names another folder (or ids already
+            // listed from their own folder) is never released: discarding
+            // it removes the folder, as an unreadable one is.
+            let recoverable = match &now {
+                HeldNow::Readable(record) => {
+                    self.item_dir(&record.user, &record.item) == dir
+                        && find(&lock(&self.state).list, &record.user, &record.item).is_none()
+                }
+                _ => true,
+            };
+            match now {
+                HeldNow::Readable(record) if recoverable => {
+                    self.apply_held(&dir, HeldNow::Readable(record), Sweep::Ordinary);
+                }
+                HeldNow::Gone => self.apply_held(&dir, HeldNow::Gone, Sweep::Ordinary),
+                HeldNow::Readable(_) | HeldNow::NoRecord | HeldNow::Still(_) => {
+                    let bytes = lock(&self.state)
+                        .held
+                        .iter()
+                        .find(|(d, _)| *d == dir)
+                        .map_or(0, |(_, b)| *b);
+                    match (self.env.remove_dir)(&dir) {
+                        Ok(()) => {
+                            let mut st = lock(&self.state);
+                            st.held.retain(|(d, _)| *d != dir);
+                            st.unmeasured.retain(|(d, _)| *d != dir);
+                            freed = freed.saturating_add(bytes);
+                            drop(st);
+                            emit(
+                                false,
+                                format!(
+                                    "pharos: video held folder verdict=discarded dir={} bytes={bytes}",
+                                    dir.display()
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            let m = dir_size(&dir);
+                            let mut st = lock(&self.state);
+                            st.held.retain(|(d, _)| *d != dir);
+                            st.unmeasured.retain(|(d, _)| *d != dir);
+                            st.measured.insert(dir.clone(), (0, m.is_whole()));
+                            st.tombstones.push((dir.clone(), m.counted(0)));
+                            drop(st);
+                            emit(
+                                true,
+                                format!(
+                                    "pharos: video held folder verdict=discard_failed dir={} bytes={} error={e}",
+                                    dir.display(),
+                                    m.counted(0)
+                                ),
+                            );
+                            failed.push(dir.clone());
+                        }
+                    }
+                }
+            }
+            let mut st = lock(&self.state);
+            st.deleting.retain(|d| *d != dir);
+            // Never reported as done while the folder is still held.
+            if st.held.iter().any(|(d, _)| *d == dir) {
+                drop(st);
+                emit(
+                    true,
+                    format!(
+                        "pharos: video held folder verdict=still_held dir={} reason=discard_did_not_remove",
+                        dir.display()
+                    ),
+                );
+                failed.push(dir.clone());
+            }
+        }
+        (freed, failed)
+    }
+
+    /// Discards the held folders, retries at once the ones that would not
+    /// delete, and returns the final outcome over every folder attempted:
+    /// the bytes both passes freed, or Err naming the folders still there.
+    fn discard_and_retry(self: &Arc<Self>) -> Result<u64, String> {
+        // Folders an earlier discard or removal left are the retry's too:
+        // its sweep tries them again, and the outcome counts them.
+        let earlier: Vec<PathBuf> = lock(&self.state)
+            .tombstones
+            .iter()
+            .map(|(d, _)| d.clone())
+            .collect();
+        let (mut freed, failed) = self.discard_held();
+        // What a folder that would not delete is counted for now, read
+        // before the retry re-measures it.
+        let before: Vec<(PathBuf, u64)> = {
+            let st = lock(&self.state);
+            let mut targets = earlier.clone();
+            for dir in &failed {
+                if !targets.contains(dir) {
+                    targets.push(dir.clone());
+                }
+            }
+            targets
+                .into_iter()
+                .map(|dir| {
+                    let bytes = st
+                        .tombstones
+                        .iter()
+                        .find(|(d, _)| *d == dir)
+                        .map_or(0, |(_, b)| *b);
+                    (dir, bytes)
+                })
+                .collect()
+        };
+        if !earlier.is_empty() {
+            emit(
+                false,
+                format!(
+                    "pharos: video held discard retry verdict=included reason=earlier_tombstones count={}",
+                    earlier.len()
+                ),
+            );
+        }
+        // What would not delete is a tombstone now: try it again at once.
+        self.sweep_tombstones();
+        let mut remaining = Vec::new();
+        {
+            let st = lock(&self.state);
+            for (dir, bytes) in before {
+                let still = st.tombstones.iter().any(|(d, _)| *d == dir)
+                    || st.held.iter().any(|(d, _)| *d == dir);
+                if still {
+                    remaining.push(dir.display().to_string());
+                } else {
+                    freed = freed.saturating_add(bytes);
+                }
+            }
+        }
+        emit(
+            !remaining.is_empty(),
+            format!(
+                "pharos: video held discard verdict={} freed={freed} remaining={}",
+                if remaining.is_empty() {
+                    "done"
+                } else {
+                    "partial"
+                },
+                remaining.len()
+            ),
+        );
+        if remaining.is_empty() {
+            Ok(freed)
+        } else {
+            Err(format!(
+                "{} folders could not be deleted and stay counted: {}",
+                remaining.len(),
+                remaining.join(", ")
+            ))
+        }
+    }
+}
+
+impl DiskVideoStore {
+    /// The newest whole file indexed for `user`'s `key`, Ready download or
+    /// not (tests): what a download has stored so far, which
+    /// [`VideoStore::stored_file`] serves only once the download is Ready.
+    #[cfg(test)]
+    fn indexed_file(&self, user: &str, key: &str) -> Option<StoredFile> {
+        let (path, len) = lock(&self.inner.state)
+            .index
+            .copies(&(user.to_owned(), key.to_owned()))
+            .last()
+            .cloned()?;
+        Some(StoredFile {
+            path,
+            len,
+            content_type: content_type_for(key),
+        })
+    }
+
+    /// Opens the store at `root`: reads every manifest, indexes the whole
+    /// files, and restarts the downloads a closed app left half done.
+    pub fn open(root: PathBuf, env: Env) -> Arc<Self> {
+        let inner = Arc::new(Inner {
+            root,
+            env,
+            state: Mutex::new(State::default()),
+            saves: Mutex::new(()),
+            last_sweep: Mutex::new(None),
+            ready_sweeping: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            tasks: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            relist_hook: Mutex::new(None),
+            #[cfg(test)]
+            host_sweeps: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            plans_admitted: Mutex::new(Vec::new()),
+        });
+        let mut st = State::default();
+        st.root.clone_from(&inner.root);
+        // Run ids name staging files (`<name>.<run>.part`): ids that started
+        // at 1 on every open made an earlier process's `.1.part` look like
+        // the new run's own. Each open starts from its own base instead, so
+        // anything inherited is foreign and is settled or counted.
+        st.next_run = open_run_base();
+        let mut found = Listing::default();
+        scan_tree(
+            &inner.env,
+            &inner.root,
+            true,
+            &|_| false,
+            &mut found,
+            Sweep::Ordinary,
+        );
+        for (dir, scanned) in found.items {
+            st.apply_scanned(&dir, scanned);
+        }
+        for (dir, error) in found.failed {
+            st.note_unlistable(&dir, &error);
+        }
+        st.list.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+        let restart: Vec<(KeptVideo, u64)> = interrupted(&st.list)
+            .into_iter()
+            .map(|v| {
+                let id = st.claim_run(&v.user, &v.item);
+                (v, id)
+            })
+            .collect();
+        *lock(&inner.state) = st;
+        emit(
+            false,
+            format!(
+                "pharos: video store open root={} videos={} resume={}",
+                inner.root.display(),
+                lock(&inner.state).list.len(),
+                restart.len()
+            ),
+        );
+        for (v, id) in restart {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep resume item={} files={}",
+                    v.item,
+                    v.files.len()
+                ),
+            );
+            inner.spawn_claimed(v.user, v.item, id);
+        }
+        Arc::new(Self { inner })
+    }
+
+    /// Bytes in staging files not yet whole, all downloads (tests).
+    #[cfg(test)]
+    fn staged_bytes(&self) -> u64 {
+        lock(&self.inner.state).staged.values().sum()
+    }
+
+    /// Waits for every download started so far to stop (tests).
+    #[cfg(test)]
+    pub(crate) async fn settled(&self) {
+        loop {
+            let next = self
+                .inner
+                .tasks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop();
+            match next {
+                // A download that panicked fails the test that waits on
+                // it; one that ended (`Stop::Failed` included) or was
+                // aborted is a normal end.
+                Some(task) => {
+                    if let Err(e) = task.await {
+                        if e.is_panic() {
+                            std::panic::resume_unwind(e.into_panic());
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// The folders directly under `dir`. A folder that is not there lists
+/// nothing; one that cannot be listed (or whose entries cannot all be
+/// read) is an error, not an empty list: what is under it is unknown.
+fn dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    #[cfg(test)]
+    if tests::UNREADABLE.with(|u| u.borrow().iter().any(|p| p == dir)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        let path = entry?.path();
+        // `is_dir` would read a failed lookup as "not a folder" and drop a
+        // folder that may hold downloads. Symlinks are followed, as
+        // `is_dir` did; one that dangles (or an entry that vanished) is
+        // nothing to list.
+        #[cfg(test)]
+        if tests::UNLOOKUPABLE.with(|u| u.borrow().contains(&path)) {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_dir() => out.push(path),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
+impl VideoStore for DiskVideoStore {
+    fn park_runs(&self, owner: Option<&str>) {
+        // Revoked under the store's lock: each run stops at its next check
+        // (a chunk, a promotion, the next file) and its staging file goes
+        // as a revoked run's does. The records are left as they are.
+        let parked: Vec<(String, String, u64)> = {
+            let mut st = lock(&self.inner.state);
+            let mut parked = Vec::new();
+            st.runs.retain(|(user, item), run| {
+                let ours = owner.map_or(true, |o| o == user);
+                if ours {
+                    parked.push((user.clone(), item.clone(), *run));
+                }
+                !ours
+            });
+            // A sign-in's resume deferred to a start's first save belongs to
+            // the session that ended: the save must not start a run for it.
+            let before = st.resume_after_save.len();
+            st.resume_after_save
+                .retain(|(user, _)| owner.is_some_and(|o| o != user));
+            let dropped = before - st.resume_after_save.len();
+            if dropped > 0 {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep resume verdict=dropped reason=session_ended deferred={dropped} ended_for={}",
+                        owner.unwrap_or("unknown")
+                    ),
+                );
+            }
+            parked
+        };
+        for (user, item, run) in parked {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep parked item={item} run={run} reason=session_ended owner={user} ended_for={}",
+                    owner.unwrap_or("unknown")
+                ),
+            );
+        }
+    }
+
+    fn resume_user(&self, user: &str) {
+        // Each pick is claimed in the hold that checked it has no run: a
+        // removal and restart after the hold revokes the claimed id, so the
+        // stale resume never takes the replacement's download.
+        let resume: Vec<(String, u64)> = {
+            let mut st = lock(&self.inner.state);
+            let mut resume = Vec::new();
+            for v in interrupted(&st.list).into_iter().filter(|v| v.user == user) {
+                let key = (v.user.clone(), v.item.clone());
+                // A start whose first record is not saved yet may still be
+                // rolled back: a run started for it now would write on
+                // with no record. The start resumes it once the save
+                // settles.
+                if st.pending_starts.contains_key(&key) {
+                    st.resume_after_save.insert(key);
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep resume item={} verdict=deferred reason=start_not_saved owner={user}",
+                            v.item
+                        ),
+                    );
+                    continue;
+                }
+                let Some(&run) = st.runs.get(&key) else {
+                    // A run parked by a session end may still hold playlist
+                    // allowances on this record: settled here, in this hold,
+                    // before the claim moves the record to the new run.
+                    let id = st.claim_parked(&v.user, &v.item);
+                    resume.push((v.item, id));
+                    continue;
+                };
+                // A run still going keeps the download. The sign-in is kept
+                // for it all the same: a run refused the credentials just
+                // before this (parking, or about to be marked so) would
+                // leave the download stranded until the next sign-in. If
+                // the run ends parked it starts the new run as it gives up
+                // its id; any other end drops the request.
+                let why = if st.parking.get(&key) == Some(&run) {
+                    "run_parking"
+                } else {
+                    "run_active"
+                };
+                st.resume_pending.insert(key, run);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep resume item={} run={run} verdict=pending reason={why} owner={user}",
+                        v.item
+                    ),
+                );
+            }
+            resume
+        };
+        #[cfg(test)]
+        tests::after_resume_pick();
+        for (item, id) in resume {
+            emit(
+                false,
+                format!(
+                    "pharos: video keep resume item={item} run={id} reason=signed_in owner={user}"
+                ),
+            );
+            self.inner.spawn_claimed(user.to_owned(), item, id);
+        }
+    }
+
+    fn videos(&self, user: &str) -> Vec<KeptVideo> {
+        // The page that lists the downloads reads the held folders again, so
+        // one whose record became readable is not stranded.
+        self.inner.sweep_held(Sweep::Ordinary);
+        lock(&self.inner.state)
+            .list
+            .iter()
+            .filter(|v| v.user == user)
+            .cloned()
+            .collect()
+    }
+
+    fn ready_videos(&self, user: &str) -> Vec<KeptVideo> {
+        // The list in memory: the poll runs on the UI thread, and the held
+        // folders' recovery (manifests read again, folders measured) can
+        // take long on a big one. It runs on the blocking pool instead, and
+        // a download it brings back Ready is seen by the next poll.
+        let ready = lock(&self.inner.state)
+            .list
+            .iter()
+            .filter(|v| v.user == user && v.ready())
+            .cloned()
+            .collect();
+        self.inner.sweep_held_elsewhere();
+        ready
+    }
+
+    fn start(&self, request: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+        let (user, item) = (request.user.clone(), request.item.clone());
+        let budget = &self.inner.env.budget;
+        // The size is not known until the playlists are read, so this
+        // catches only a full cap or a full disk; the rest is checked after
+        // planning and shows as a failed download. The room is read under
+        // the host's shared admission lock, before the store's own lock is
+        // taken, and the check and the new record sit under one hold of it.
+        self.inner.sweep_held(Sweep::Ordinary);
+        self.inner.sweep_tombstones();
+        let mut replaced: Option<KeptVideo> = None;
+        // The figure of a tombstone this start absorbed, to put back if the
+        // start is rolled back.
+        let mut absorbed: Option<u64> = None;
+        let mut run_id = 0u64;
+        let (started, used) = {
+            let _admission = budget.admission_guard();
+            // Readiness first, then the figures (see `Check::Fresh`): the
+            // owed and written bytes from one read.
+            let ready = budget.accounting_ready();
+            let (other_outstanding, progress) = budget.other_pending_bytes();
+            let (other, cap) = (
+                budget
+                    .other_used_bytes()
+                    .saturating_add(other_outstanding)
+                    .saturating_add(progress.unwrap_or(0)),
+                budget.cap_bytes(),
+            );
+            let mut st = lock(&self.inner.state);
+            let used = st.reserved_by_others(&user, &item).saturating_add(other);
+            // Owed bytes first, then the free space (as in `admit`).
+            let owed = st
+                .outstanding(&user, &item)
+                .saturating_add(other_outstanding);
+            let room = budget.free_bytes().saturating_sub(owed);
+            let dir = self.inner.item_dir(&user, &item);
+            let started = st
+                .unknown_folder()
+                .map_or(Ok(()), Err)
+                .and_then(|()| {
+                    if ready {
+                        Ok(())
+                    } else {
+                        Err(KeepVideoRefusal::Host(
+                            "the music cache is not up yet, so the shared cap cannot be checked"
+                                .to_owned(),
+                        ))
+                    }
+                })
+                .and_then(|()| {
+                    if progress.is_some() {
+                        Ok(())
+                    } else {
+                        emit(
+                            true,
+                            format!(
+                                "pharos: video keep refused item={item} reason=music_size_unknown"
+                            ),
+                        );
+                        Err(KeepVideoRefusal::Host(
+                            "the size of the music cache's unfinished downloads is unknown (reason=music_size_unknown), so the shared cap cannot be checked"
+                                .to_owned(),
+                        ))
+                    }
+                })
+                .and_then(|()| {
+                    // The folder is being swept: a download begun in it now
+                    // would have its files deleted.
+                    if st.deleting.contains(&dir) || st.settling.contains(&dir) {
+                        Err(KeepVideoRefusal::Host(format!(
+                            "{} is being cleaned up, try again in a moment",
+                            dir.display()
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| fits(0, used, cap, room))
+                .and_then(|()| {
+                    check_not_kept(&st.list, &user, &item)?;
+                    replaced = find(&st.list, &user, &item).cloned();
+                    let mut record = new_record(&request, (self.inner.env.now)());
+                    // A failed attempt's files stay on disk until a plan prunes
+                    // them; the replacement keeps counting them meanwhile.
+                    if let Some(old) = find(&st.list, &user, &item) {
+                        record.estimated_bytes = old.estimated_bytes;
+                    }
+                    // So do the bytes of a removed download's folder that would
+                    // not delete: the record takes the folder over whole. Its
+                    // reservation floor becomes the tombstone's figure (a
+                    // valid measurement, or the start was refused above as
+                    // unknown), and the tombstone goes in the same hold, so
+                    // the folder is accounted by the record as any running
+                    // download's is, and a later writer's epoch bump cannot
+                    // mark a folder the record owns as unknown.
+                    if let Some((_, left)) = st.tombstones.iter().find(|(d, _)| *d == dir) {
+                        let left = *left;
+                        record.estimated_bytes = record.estimated_bytes.max(left);
+                        absorbed = Some(left);
+                        st.drop_tombstone(&dir);
+                    }
+                    insert_front(&mut st.list, record);
+                    // The run is named in the same hold: a rollback below
+                    // touches the record only while this start still owns it.
+                    run_id = st.claim_run(&user, &item);
+                    st.pending_starts.insert((user.clone(), item.clone()), run_id);
+                    // A settlement that began before this start must not act
+                    // on the folder as it saw it.
+                    st.bump(&dir);
+                    Ok(())
+                });
+            (started, used)
+        };
+        if let Err(refusal) = started {
+            emit(
+                true,
+                format!("pharos: video keep refused item={item} reason={refusal} used={used}"),
+            );
+            return Err(refusal);
+        }
+        // A record that cannot be written would not survive a restart: the
+        // download is refused, and the accounting goes back to what it was
+        // (the record it replaced is put back, its reservation with it).
+        #[cfg(test)]
+        tests::before_first_save();
+        if let Err(e) = self.inner.save_record(&user, &item) {
+            let refusal =
+                KeepVideoRefusal::Host(format!("the download's record could not be saved: {e}"));
+            #[cfg(test)]
+            tests::before_start_rollback();
+            let rolled_back = {
+                let _admission = budget.admission_guard();
+                let mut st = lock(&self.inner.state);
+                // A removal and a newer start may have taken the item over
+                // since: their record is theirs, and stays. A session end
+                // that parked this start's run leaves the record this
+                // start's all the same: it is rolled back.
+                let key = (user.clone(), item.clone());
+                let ours = st.pending_starts.get(&key) == Some(&run_id);
+                if ours {
+                    st.pending_starts.remove(&key);
+                    // The record goes: a sign-in that waited for it has
+                    // nothing to resume.
+                    st.resume_after_save.remove(&key);
+                    if st.runs.get(&key) == Some(&run_id) {
+                        st.runs.remove(&key);
+                    }
+                    take(&mut st.list, &user, &item);
+                    if let Some(old) = replaced {
+                        insert_front(&mut st.list, old);
+                    }
+                    if let Some(left) = absorbed {
+                        // The folder is the tombstone's again, as it was
+                        // measured.
+                        let dir = self.inner.item_dir(&user, &item);
+                        let epoch = st.epoch(&dir);
+                        st.tombstones.push((dir.clone(), left));
+                        st.measured.insert(dir, (epoch, true));
+                    }
+                }
+                ours
+            };
+            emit(
+                true,
+                format!(
+                    "pharos: video keep refused item={item} reason={refusal} verdict={} run={run_id}",
+                    if rolled_back {
+                        "rolled_back"
+                    } else {
+                        "superseded_left_alone"
+                    }
+                ),
+            );
+            return Err(refusal);
+        }
+        let run_id = {
+            let mut st = lock(&self.inner.state);
+            let key = (user.clone(), item.clone());
+            let ours = st.pending_starts.get(&key) == Some(&run_id);
+            if ours {
+                st.pending_starts.remove(&key);
+            }
+            // A sign-in that waited for this save: if a sign-out parked the
+            // start's run meanwhile, the download starts again now, claimed
+            // in this hold.
+            let replay = ours && st.resume_after_save.remove(&key);
+            if replay && st.runs.get(&key) != Some(&run_id) {
+                let next = st.claim_run(&user, &item);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep resume item={item} run={next} reason=signed_in_before_save owner={user}"
+                    ),
+                );
+                next
+            } else {
+                run_id
+            }
+        };
+        self.inner.spawn_claimed(user, item, run_id);
+        Ok(())
+    }
+
+    fn remove(&self, user: &str, item: &str) {
+        // The folder turns unknown in this hold: under the lock the host
+        // shares with music admission, so an admission never reads its
+        // figures half before and half after. Held for the transition only,
+        // never while the folder is deleted. Taken before `saves`, in the
+        // order a save under admission takes them (see `Inner::saves`).
+        let admission = self.inner.env.budget.admission_guard();
+        // Held to the end: no record is written into the folder while it
+        // goes, and none after.
+        let _saving = self
+            .inner
+            .saves
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let record = {
+            let mut st = lock(&self.inner.state);
+            let Some(record) = take(&mut st.list, user, item) else {
+                return;
+            };
+            #[cfg(test)]
+            tests::at_removal_mark();
+            st.runs.remove(&(user.to_owned(), item.to_owned()));
+            st.pending_starts
+                .remove(&(user.to_owned(), item.to_owned()));
+            st.resume_after_save
+                .remove(&(user.to_owned(), item.to_owned()));
+            st.record_gen.remove(&(user.to_owned(), item.to_owned()));
+            st.retained_parts.remove(&self.inner.item_dir(user, item));
+            // Every file indexed under the item's folder goes, as in
+            // `prune_unplanned`: the playlists are indexed before the plan
+            // is admitted and are not in the record's files, and a folder
+            // that will not delete must not go on answering requests.
+            let files = self.inner.item_dir(user, item).join("files");
+            st.index
+                .retain(|path| path.parent() != Some(files.as_path()));
+            // What the record reserved keeps counting, as a tombstone, from
+            // the moment the record leaves the list: there is no instant
+            // when the folder counts for nothing while it is deleted.
+            let dir = self.inner.item_dir(user, item);
+            st.tombstones.retain(|(d, _)| *d != dir);
+            st.tombstones.push((dir.clone(), reserved(&record)));
+            // The reservation is an estimate, not a bound on the folder
+            // (staged `.part` files, files an earlier plan left, a file
+            // larger than planned), so until the folder is deleted or
+            // measured after the last thing that can change it, its size
+            // is not known (`State::unknown_reason`): nothing is admitted.
+            st.removing.push(dir.clone());
+            st.measured.remove(&dir);
+            st.bump(&dir);
+            record
+        };
+        drop(admission);
+        let dir = self.inner.item_dir(user, item);
+        // The record goes first, so a folder that will not delete cannot
+        // bring the download back at the next open.
+        match std::fs::remove_file(dir.join("manifest.json")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                // The record is still on disk and would bring the download
+                // back at the next open, so the removal has not happened:
+                // the record stays, as a failed one, and the caller sees it.
+                self.inner.keep_after_failed_unlink(record, &dir, &e);
+                return;
+            }
+        }
+        let removed = (self.inner.env.remove_dir)(&dir);
+        let mut left = 0;
+        if removed.is_ok() {
+            lock(&self.inner.state).drop_tombstone(&dir);
+        } else {
+            // The bytes still on disk keep counting against the cap until
+            // a later sweep deletes the folder. The removal is over: the
+            // folder is no longer in removal, and is measured now unless a
+            // revoked run's writer is still in it, in which case that
+            // run's end measures (it sweeps after its writer stopped). The
+            // folder is unknown until then, by derivation.
+            lock(&self.inner.state).removing.retain(|d| *d != dir);
+            #[cfg(test)]
+            tests::after_removal_unmarked();
+            left = self.inner.measure_tombstone(&dir);
+        }
+        emit(
+            false,
+            format!(
+                "pharos: video keep remove item={item} files={} verdict={}",
+                record.files.len(),
+                match &removed {
+                    Ok(()) => "removed".to_owned(),
+                    Err(e) => format!("kept_on_disk bytes={left} error={e}"),
+                }
+            ),
+        );
+    }
+
+    fn save_position(&self, user: &str, item: &str, position_ms: u64) {
+        // The position stays in memory if the save fails, and the failure
+        // is logged by `save_record` (the trait has no way to return it).
+        let _ = self
+            .inner
+            .update(user, item, |v| v.position_ms = position_ms);
+    }
+
+    fn cap_bytes(&self) -> u64 {
+        self.inner.env.budget.cap_bytes()
+    }
+
+    /// The one cap music and video share, set through the budget (the
+    /// phone's music cache): `cap_bytes` reads the same cap back. The free
+    /// floor is the budget's own and stays.
+    fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+        let set = self.inner.env.budget.set_cap_bytes(bytes);
+        match &set {
+            Ok(()) => emit(
+                false,
+                format!("pharos: video cap verdict=set bytes={bytes}"),
+            ),
+            Err(e) => emit(
+                true,
+                format!("pharos: video cap verdict=refused bytes={bytes} error={e}"),
+            ),
+        }
+        set
+    }
+
+    fn size_unknown(&self) -> bool {
+        if lock(&self.inner.state).unknown_folder().is_none() {
+            return false;
+        }
+        // The music cache asks this on its admission path; in a process
+        // that never lists the downloads (the car's) nothing else would
+        // read the held folders again. Rate-limited, and safe where the
+        // cache holds its lock: the sweep takes only this store's state
+        // lock and reads files, never a budget or the shared admission
+        // lock (order: shared lock, then store lock).
+        self.inner.sweep_if_due();
+        lock(&self.inner.state).unknown_folder().is_some()
+    }
+
+    fn accounting(&self) -> (u64, u64, bool) {
+        // A sweep first when a folder is unknown (it may adopt or measure
+        // it; see `size_unknown`), then every figure in one hold.
+        if lock(&self.inner.state).unknown_folder().is_some() {
+            self.inner.sweep_if_due();
+        }
+        let st = lock(&self.inner.state);
+        (
+            st.kept(),
+            st.outstanding("", ""),
+            st.unknown_folder().is_some(),
+        )
+    }
+
+    fn unreadable_count(&self) -> usize {
+        lock(&self.inner.state).held.len()
+    }
+
+    fn leftover_count(&self) -> usize {
+        lock(&self.inner.state).tombstones.len()
+    }
+
+    fn discard_unreadable(&self) -> Result<u64, String> {
+        self.inner.discard_and_retry()
+    }
+
+    fn outstanding_bytes(&self) -> u64 {
+        // No record has an empty user, so this is every record's.
+        lock(&self.inner.state).outstanding("", "")
+    }
+
+    fn kept_bytes(&self) -> u64 {
+        lock(&self.inner.state).kept()
+    }
+
+    fn used_bytes(&self, user: &str) -> u64 {
+        self.usage(user).used
+    }
+
+    fn usage(&self, user: &str) -> super::kept_video::Usage {
+        // One hold serves both figures. The shared total is what admission
+        // counts against the cap: every user's downloads and reservations,
+        // the folders a removal left, and the other kinds beside them. The
+        // video subtotal is `user`'s own.
+        let (video, kept) = {
+            let st = lock(&self.inner.state);
+            let video = st
+                .list
+                .iter()
+                .filter(|v| v.user == user)
+                .map(KeptVideo::bytes)
+                .sum::<u64>();
+            (video, st.kept())
+        };
+        super::kept_video::Usage {
+            video,
+            used: kept.saturating_add(self.inner.env.budget.other_used_bytes()),
+        }
+    }
+
+    fn video_bytes(&self, user: &str) -> u64 {
+        lock(&self.inner.state)
+            .list
+            .iter()
+            .filter(|v| v.user == user)
+            .map(KeptVideo::bytes)
+            .sum::<u64>()
+    }
+
+    fn free_bytes(&self) -> u64 {
+        self.inner.env.budget.free_bytes()
+    }
+
+    fn stored_file(&self, user: &str, key: &str) -> Option<StoredFile> {
+        let (path, len) = {
+            let st = lock(&self.inner.state);
+            let copies = st.index.copies(&(user.to_owned(), key.to_owned()));
+            // The newest copy that belongs to one of the user's Ready
+            // downloads: a running download's files are not served yet.
+            let ready = copies.iter().rev().find(|(p, _)| {
+                let dir = p.parent().and_then(Path::parent);
+                st.list.iter().any(|v| {
+                    v.user == user && v.ready() && dir == Some(st.dir_of(user, &v.item).as_path())
+                })
+            });
+            match ready {
+                Some(copy) => copy.clone(),
+                None => {
+                    if !copies.is_empty() {
+                        emit(
+                            false,
+                            format!(
+                                "pharos: video request verdict=not_served_offline reason=download_not_ready url_path={} copies={}",
+                                url_path(key),
+                                copies.len()
+                            ),
+                        );
+                    }
+                    return None;
+                }
+            }
+        };
+        Some(StoredFile {
+            path,
+            len,
+            content_type: content_type_for(key),
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    /// What a folder holds, for a test that needs it whole: a short walk
+    /// fails the test rather than reading as fewer bytes.
+    fn on_disk(dir: &std::path::Path) -> u64 {
+        super::dir_size(dir)
+            .whole()
+            .unwrap_or_else(|| panic!("{} not measured whole", dir.display()))
+    }
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::native::kept_video::DEFAULT_QUALITY_BPS;
+    use crate::native::offline_ui::{FREE_GUARD_BYTES, GIB};
+
+    thread_local! {
+        /// While set, deleting a folder fails (a file in use, say).
+        static FAIL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// With `FAIL_REMOVE`, the folder is also left unreadable: a plain
+        /// file stands where it was.
+        static LEAVE_UNREADABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Folders `dir_size` cannot read (a root user cannot be denied).
+        pub(super) static UNREADABLE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// While set, a chunk's write is held pending before its flush.
+        static HOLD_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// While set, the chunk writes of this item alone are held.
+        static HOLD_ITEM: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    thread_local! {
+        /// While set, a chunk's flush fails, once written, for the staging
+        /// files whose name starts with this.
+        pub(super) static FAIL_FLUSH_OF: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn flush_fault(part: &Path) -> std::io::Result<()> {
+        let failing = FAIL_FLUSH_OF.with(|f| {
+            f.borrow().as_ref().is_some_and(|prefix| {
+                part.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with(prefix.as_str()))
+            })
+        });
+        if failing {
+            return Err(std::io::Error::other("disk full"));
+        }
+        Ok(())
+    }
+
+    thread_local! {
+        /// While `Some`, every sync, rename and the Ready publication, in
+        /// the order they happen.
+        static SYNC_STEPS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+        /// Runs once right after a file is renamed into place, before its
+        /// staging guard drops: it sees the state as a reader would.
+        pub(super) static AFTER_PROMOTE: RefCell<Option<AfterPromote>> = RefCell::new(None);
+    }
+
+    /// What `AFTER_PROMOTE` runs: the state, the staged key, its length.
+    pub(super) type AfterPromote = Box<dyn FnOnce(&State, &(String, String, u64), u64)>;
+
+    thread_local! {
+        /// A folder sync of the folder named `.0` fails with OS error `.1`,
+        /// `.2` more times.
+        static DIR_SYNC_FAULT: RefCell<Option<(String, i32, usize)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn dir_sync_fault(dir: &Path) -> std::io::Result<()> {
+        DIR_SYNC_FAULT.with(|f| {
+            let mut f = f.borrow_mut();
+            if let Some((name, code, left)) = f.as_mut() {
+                if *left > 0 && dir.file_name().is_some_and(|n| n == name.as_str()) {
+                    *left -= 1;
+                    return Err(std::io::Error::from_raw_os_error(*code));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    thread_local! {
+        /// While set, every open's run ids start here: the clock repeating
+        /// across two opens.
+        pub(super) static RUN_BASE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn sync_step(step: String) {
+        SYNC_STEPS.with(|s| {
+            if let Some(steps) = s.borrow_mut().as_mut() {
+                steps.push(step);
+            }
+        });
+    }
+
+    pub(super) async fn hold_write(item: &str) {
+        while HOLD_WRITE.with(std::cell::Cell::get)
+            || HOLD_ITEM.with(|h| h.borrow().as_deref() == Some(item))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    thread_local! {
+        /// Entries whose metadata lookup fails after they were listed.
+        pub(super) static UNLOOKUPABLE: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// Runs as a folder is being deleted.
+        static DURING_REMOVE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    type SaveHook = Box<dyn Fn(&KeptVideo)>;
+
+    thread_local! {
+        /// Runs as a tombstoned folder has been walked, before the result is
+        /// taken.
+        static DURING_MEASURE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+        /// Runs once a removal has left its folder, before it is measured.
+        static AFTER_UNMARKED: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn during_measure() {
+        DURING_MEASURE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs once a settlement has claimed its folder, before it drops a
+        /// staging file.
+        static BEFORE_SETTLE_DROP: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+        /// While set, reading a directory entry fails after the directory
+        /// opened.
+        pub(super) static FAIL_ENTRY_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Runs once a start's record has failed to save, before it is
+        /// rolled back.
+        pub(super) static BEFORE_START_ROLLBACK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// Runs as a plan is about to be admitted.
+        pub(super) static BEFORE_PLAN_ADMIT: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_plan_admit() {
+        BEFORE_PLAN_ADMIT.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs as a removal marks its folder of unknown size.
+        pub(super) static AT_REMOVAL_MARK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn at_removal_mark() {
+        AT_REMOVAL_MARK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs as a start is about to save its first record.
+        pub(super) static BEFORE_FIRST_SAVE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_first_save() {
+        BEFORE_FIRST_SAVE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    pub(super) fn before_start_rollback() {
+        BEFORE_START_ROLLBACK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs once a failed download has dropped (or failed to drop) its
+        /// staging files, before its Failed record is published.
+        pub(super) static BEFORE_FAILED_UPDATE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// Runs after a fetch was refused the credentials, at the point the
+        /// run used to mark itself parking.
+        pub(super) static BEFORE_PARK_MARK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_park_mark() {
+        BEFORE_PARK_MARK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs once `resume_user` has picked and claimed its downloads,
+        /// before it starts them.
+        pub(super) static AFTER_RESUME_PICK: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn after_resume_pick() {
+        AFTER_RESUME_PICK.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs once a run's outcome is published, before it gives up its id.
+        pub(super) static BEFORE_RUN_EXIT: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_run_exit() {
+        BEFORE_RUN_EXIT.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs once a remeasure has walked its folder, before the walk is
+        /// applied.
+        pub(super) static BEFORE_REMEASURE_APPLY: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_remeasure_apply() {
+        BEFORE_REMEASURE_APPLY.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    pub(super) fn before_failed_update() {
+        BEFORE_FAILED_UPDATE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs once a failed or refused download's record is saved, before
+        /// the run ends.
+        pub(super) static AFTER_FAILED_SAVE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn after_failed_save() {
+        AFTER_FAILED_SAVE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs between a plan being wanted and its prune.
+        static BEFORE_PRUNE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+        /// Runs once the prune is done, before the plan's inventory.
+        pub(super) static AFTER_PRUNE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+        /// What the last prune returned, and whether it left the folder unknown.
+        static PRUNED: RefCell<Option<(u64, bool)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn before_prune() {
+        BEFORE_PRUNE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// The admitted record's figure (`reserved`), set as a plan is
+        /// admitted, before anything is fetched.
+        static ADMITTED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    thread_local! {
+        /// Each progress publish's owed figure for its run, before and
+        /// after it, read in the one hold.
+        pub(super) static PUBLISHED: RefCell<Vec<(Option<u64>, Option<u64>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn published(before: Option<u64>, after: Option<u64>) {
+        PUBLISHED.with(|p| p.borrow_mut().push((before, after)));
+    }
+
+    pub(super) fn admitted(inner: &Inner, user: &str, item: &str) {
+        let figure = find(&lock(&inner.state).list, user, item).map(reserved);
+        ADMITTED.with(|a| a.set(figure));
+    }
+
+    pub(super) fn pruned(stale: u64, inner: &Inner, user: &str, item: &str) {
+        AFTER_PRUNE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+        let unknown = lock(&inner.state)
+            .leftover
+            .contains(&inner.item_dir(user, item));
+        PRUNED.with(|p| *p.borrow_mut() = Some((stale, unknown)));
+    }
+
+    pub(super) fn before_settle_drop() {
+        BEFORE_SETTLE_DROP.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    /// An entry as read from a listing; a test can make the read fail.
+    pub(super) fn entry_read(
+        entry: std::io::Result<std::fs::DirEntry>,
+    ) -> std::io::Result<std::fs::DirEntry> {
+        if FAIL_ENTRY_READ.with(std::cell::Cell::get) {
+            return Err(std::io::Error::other("entry unreadable"));
+        }
+        entry
+    }
+
+    pub(super) fn after_removal_unmarked() {
+        AFTER_UNMARKED.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    thread_local! {
+        /// While set, the walk of a folder's whole files comes back short
+        /// (as a transient EMFILE would leave it).
+        pub(super) static FAIL_DISK_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// While set, deleting a staging file fails.
+        pub(super) static FAIL_PART_DELETE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Runs as a record is about to be written, with that record.
+        static DURING_SAVE: RefCell<Option<SaveHook>> = RefCell::new(None);
+    }
+
+    pub(super) fn during_save(video: &KeptVideo) {
+        DURING_SAVE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f(video);
+            }
+        });
+    }
+
+    thread_local! {
+        /// Runs when a removal's manifest unlink has failed, before the
+        /// record is put back.
+        static AT_UNLINK_FAILURE: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn at_unlink_failure() {
+        AT_UNLINK_FAILURE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+    }
+
+    fn removing(dir: &Path) -> std::io::Result<()> {
+        DURING_REMOVE.with(|d| {
+            if let Some(f) = d.borrow().as_ref() {
+                f();
+            }
+        });
+        if FAIL_REMOVE.with(std::cell::Cell::get) {
+            if LEAVE_UNREADABLE.with(std::cell::Cell::get) {
+                let _ = std::fs::remove_dir_all(dir);
+                let _ = std::fs::write(dir, b"x");
+            }
+            Err(std::io::Error::other("in use"))
+        } else {
+            std::fs::remove_dir_all(dir)
+        }
+    }
+
+    thread_local! {
+        pub(super) static CAPTURED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn captured() -> Vec<String> {
+        CAPTURED.with(|c| c.borrow().clone())
+    }
+
+    const MASTER: &str = "#EXTM3U\n\
+        #EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\n\
+        /videos/1/h264cmaf/main.m3u8?PlaySessionId=p\n";
+    const MEDIA: &str = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n\
+        #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"init.mp4?PlaySessionId=p\"\n\
+        #EXTINF:6.0,\n0.m4s?PlaySessionId=p\n#EXTINF:6.0,\n1.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n";
+    const MASTER_KEY: &str = "/videos/1/master.m3u8?PlaySessionId=p";
+    const MEDIA_KEY: &str = "/videos/1/h264cmaf/main.m3u8?PlaySessionId=p";
+    const SEG0: &str = "/videos/1/h264cmaf/0.m4s?PlaySessionId=p";
+    const SEG1: &str = "/videos/1/h264cmaf/1.m4s?PlaySessionId=p";
+    const INIT: &str = "/videos/1/h264cmaf/init.mp4?PlaySessionId=p";
+
+    /// The keys and bytes of the one-title stream the tests download, for
+    /// another module's fake server.
+    pub(crate) fn stream_files() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            (MASTER_KEY, MASTER.as_bytes().to_vec()),
+            (MEDIA_KEY, MEDIA.as_bytes().to_vec()),
+            (INIT, vec![1; 10]),
+            (SEG0, vec![2; 100]),
+            (SEG1, vec![3; 100]),
+        ]
+    }
+
+    /// A server in memory: a key answers its bytes, or fails as scripted.
+    #[derive(Default)]
+    struct FakeServer {
+        files: Mutex<HashMap<String, Vec<u8>>>,
+        /// key -> statuses to answer before the file (`0` = no network).
+        failures: Mutex<HashMap<String, Vec<u16>>>,
+        asked: Mutex<Vec<String>>,
+        /// key -> a flag; the first request for the key waits for the flag
+        /// to be set, then answers 403.
+        holds: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        /// key -> a flag; the first body for the key stops after its first
+        /// chunk until the flag is set.
+        mid_holds: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        /// key -> set once that held body has stopped at its checkpoint
+        /// (its first chunk written and staged).
+        mid_reached: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        /// key -> a flag; the first request for the key waits for the flag,
+        /// then is answered as any other.
+        slow_opens: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+        /// Keys whose held body fails, once released, instead of sending its
+        /// second chunk.
+        mid_fails: Mutex<HashSet<String>>,
+        /// The token file as the phone's fetcher reads it: the token and its
+        /// user. Unset, the test does not model it and every owner passes.
+        token_file: Mutex<Option<(String, Option<String>)>>,
+        /// Each request sent, with the token it carried.
+        sent: Mutex<Vec<(String, Option<String>)>>,
+        /// key -> the key the server redirects it to (followed, as the
+        /// phone's client follows a same-origin redirect).
+        redirects: Mutex<HashMap<String, String>>,
+        /// The server's address with its base path; unset, the planning
+        /// origin with none.
+        base: Mutex<Option<String>>,
+        /// key -> why its request fails in a way no retry changes.
+        refusals: Mutex<HashMap<String, String>>,
+    }
+
+    impl FakeServer {
+        /// Holds the first request for `key` until the returned flag is set.
+        fn hold_first(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.holds.lock().unwrap().insert(key.into(), flag.clone());
+            flag
+        }
+
+        /// Holds the first request for `key` until the flag is set, then
+        /// answers it normally.
+        fn slow_first_open(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.slow_opens
+                .lock()
+                .unwrap()
+                .insert(key.into(), flag.clone());
+            flag
+        }
+
+        /// Holds the first body for `key` after its first chunk.
+        fn hold_mid_body(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            self.mid_reached
+                .lock()
+                .unwrap()
+                .insert(key.into(), Arc::default());
+            self.mid_holds
+                .lock()
+                .unwrap()
+                .insert(key.into(), flag.clone());
+            flag
+        }
+
+        /// Holds the first body for `key` after its first chunk, and fails it
+        /// once released.
+        fn fail_mid_body(&self, key: &str) -> Arc<std::sync::atomic::AtomicBool> {
+            self.mid_fails.lock().unwrap().insert(key.into());
+            self.hold_mid_body(key)
+        }
+
+        /// Waits until the held body for `key` has stopped at its
+        /// checkpoint: its first chunk is written and staged. Bounded by
+        /// wall time, not by a count of polls, so a slow machine waits
+        /// longer rather than failing.
+        async fn reached_mid_body(&self, key: &str) {
+            let reached = self
+                .mid_reached
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .expect("no body is held for this key");
+            let start = std::time::Instant::now();
+            while !reached.load(Ordering::SeqCst) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(30),
+                    "the held body never reached its checkpoint"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        /// Waits until `key` has been asked for `times` times; fails after
+        /// 30 s of wall time, naming the requests that were made, so a
+        /// request that never comes is a failure, not a hang.
+        async fn asked_times(&self, key: &str, times: usize) {
+            self.asked_times_within(key, times, std::time::Duration::from_secs(30))
+                .await;
+        }
+
+        async fn asked_times_within(&self, key: &str, times: usize, limit: std::time::Duration) {
+            let start = std::time::Instant::now();
+            while self.asked().iter().filter(|k| *k == key).count() < times {
+                assert!(
+                    start.elapsed() < limit,
+                    "{key} was not asked {times} times; asked: {:?}",
+                    self.asked()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+
+        fn with_stream() -> Arc<Self> {
+            let s = Arc::new(Self::default());
+            let mut f = s.files.lock().unwrap();
+            f.insert(MASTER_KEY.into(), MASTER.as_bytes().to_vec());
+            f.insert(MEDIA_KEY.into(), MEDIA.as_bytes().to_vec());
+            f.insert(INIT.into(), vec![1; 10]);
+            f.insert(SEG0.into(), vec![2; 100]);
+            f.insert(SEG1.into(), vec![3; 100]);
+            drop(f);
+            s
+        }
+
+        fn fail(&self, key: &str, statuses: &[u16]) {
+            self.failures
+                .lock()
+                .unwrap()
+                .insert(key.into(), statuses.to_vec());
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+
+        /// Puts `user`'s token on file, as a sign-in does.
+        fn sign_in(&self, user: &str) {
+            *self.token_file.lock().unwrap() = Some((format!("tok-{user}"), Some(user.to_owned())));
+        }
+
+        /// The token for a request of `owner`'s run, decided as the phone's
+        /// fetcher decides it; `Ok(None)` when the test models no token.
+        fn token(&self, owner: &str) -> Result<Option<String>, String> {
+            match self.token_file.lock().unwrap().as_ref() {
+                None => Ok(None),
+                Some((token, user)) => {
+                    super::super::kept_video::token_for_owner(Some(token), user.as_deref(), owner)
+                        .map(Some)
+                }
+            }
+        }
+
+        fn sent(&self) -> Vec<(String, Option<String>)> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    struct FakeBody(
+        Vec<Vec<u8>>,
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+        /// Fails once released, rather than sending the rest.
+        bool,
+        /// The key a redirect answered it from.
+        Option<String>,
+    );
+
+    impl Body for FakeBody {
+        fn next_chunk(&mut self) -> BoxFut<'_, Result<Option<Vec<u8>>, FetchError>> {
+            Box::pin(async move {
+                // A held body waits before its second chunk, and says it
+                // has got there (the first chunk is written and staged).
+                if let (Some(flag), 1) = (self.1.clone(), self.0.len()) {
+                    if let Some(reached) = &self.2 {
+                        reached.store(true, Ordering::SeqCst);
+                    }
+                    while !flag.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    if self.3 {
+                        return Err(FetchError {
+                            status: None,
+                            message: "connection reset mid-body".to_owned(),
+                        });
+                    }
+                }
+                Ok(if self.0.is_empty() {
+                    None
+                } else {
+                    Some(self.0.remove(0))
+                })
+            })
+        }
+
+        fn final_key(&self) -> Option<String> {
+            self.4.clone()
+        }
+    }
+
+    impl Fetcher for FakeServer {
+        fn check_owner(&self, owner: &str) -> Result<(), String> {
+            self.token(owner).map(|_| ())
+        }
+
+        fn server_base(&self) -> String {
+            self.base
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| PLAN_ORIGIN.to_owned())
+        }
+
+        fn open<'a>(
+            &'a self,
+            owner: &'a str,
+            key: &'a str,
+        ) -> BoxFut<'a, Result<Box<dyn Body>, OpenFailed>> {
+            Box::pin(async move {
+                self.asked.lock().unwrap().push(key.to_owned());
+                let slow = self.slow_opens.lock().unwrap().remove(key);
+                if let Some(flag) = slow {
+                    while !flag.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+                // The token is read as the request goes out, as the phone's
+                // fetcher reads it.
+                let token = self.token(owner).map_err(OpenFailed::NotOwner)?;
+                self.sent.lock().unwrap().push((key.to_owned(), token));
+                if let Some(why) = self.refusals.lock().unwrap().get(key).cloned() {
+                    return Err(OpenFailed::Refused(why));
+                }
+                self.body(key).await.map_err(OpenFailed::Fetch)
+            })
+        }
+    }
+
+    impl FakeServer {
+        async fn body(&self, key: &str) -> Result<Box<dyn Body>, FetchError> {
+            {
+                let hold = self.holds.lock().unwrap().remove(key);
+                if let Some(flag) = hold {
+                    while !flag.load(Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                    return Err(FetchError {
+                        status: Some(403),
+                        message: String::new(),
+                    });
+                }
+                if let Some(next) = {
+                    let mut f = self.failures.lock().unwrap();
+                    f.get_mut(key)
+                        .filter(|v| !v.is_empty())
+                        .map(|v| v.remove(0))
+                } {
+                    return Err(FetchError {
+                        status: (next != 0).then_some(next),
+                        message: "no signal".into(),
+                    });
+                }
+                let moved = self.redirects.lock().unwrap().get(key).cloned();
+                let key = moved.as_deref().unwrap_or(key);
+                match self.files.lock().unwrap().get(key) {
+                    // Two chunks, so a body really streams.
+                    Some(b) => {
+                        let mid = b.len() / 2;
+                        let gate = self.mid_holds.lock().unwrap().remove(key);
+                        let fails = self.mid_fails.lock().unwrap().remove(key);
+                        let reached = gate
+                            .as_ref()
+                            .and_then(|_| self.mid_reached.lock().unwrap().get(key).cloned());
+                        Ok(Box::new(FakeBody(
+                            vec![
+                                b.get(..mid).unwrap_or_default().to_vec(),
+                                b.get(mid..).unwrap_or_default().to_vec(),
+                            ],
+                            gate,
+                            reached,
+                            fails,
+                            moved,
+                        )) as Box<dyn Body>)
+                    }
+                    None => Err(FetchError {
+                        status: Some(403),
+                        message: String::new(),
+                    }),
+                }
+            }
+        }
+    }
+
+    struct FakeBudget {
+        cap: AtomicU64,
+        other: AtomicU64,
+        other_outstanding: AtomicU64,
+        ready: AtomicBool,
+        free: AtomicU64,
+        /// Admission guards held now, taken in all, and readings made with
+        /// none held.
+        held: Arc<AtomicUsize>,
+        taken: AtomicUsize,
+        unguarded: AtomicUsize,
+        /// Runs whenever the free space is measured.
+        on_free: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        /// The other kinds' owed and written figures, in the order read.
+        reads: Mutex<Vec<&'static str>>,
+        /// When set, the guard excludes as the host's does: one holder at a
+        /// time, the others wait.
+        exclusive: AtomicBool,
+        lock: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    struct FakeGuard(
+        Arc<AtomicUsize>,
+        Option<Arc<(Mutex<bool>, std::sync::Condvar)>>,
+    );
+
+    impl Drop for FakeGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+            if let Some(lock) = &self.1 {
+                *lock.0.lock().unwrap() = false;
+                lock.1.notify_all();
+            }
+        }
+    }
+
+    impl FakeBudget {
+        fn read(&self) {
+            if self.held.load(Ordering::SeqCst) == 0 {
+                self.unguarded.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl FakeBudget {
+        fn roomy() -> Arc<Self> {
+            Arc::new(Self {
+                cap: AtomicU64::new(4 * GIB),
+                other: AtomicU64::new(0),
+                other_outstanding: AtomicU64::new(0),
+                ready: AtomicBool::new(true),
+                free: AtomicU64::new(100 * GIB),
+                held: Arc::default(),
+                taken: AtomicUsize::new(0),
+                unguarded: AtomicUsize::new(0),
+                on_free: Mutex::new(None),
+                reads: Mutex::new(Vec::new()),
+                exclusive: AtomicBool::new(false),
+                lock: Arc::default(),
+            })
+        }
+    }
+
+    impl Budget for FakeBudget {
+        fn cap_bytes(&self) -> u64 {
+            self.read();
+            self.cap.load(Ordering::SeqCst)
+        }
+        fn set_cap_bytes(&self, bytes: u64) -> Result<(), String> {
+            if bytes == 0 {
+                return Err("the music cache refused 0".to_owned());
+            }
+            self.cap.store(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+        fn other_used_bytes(&self) -> u64 {
+            self.read();
+            self.other.load(Ordering::SeqCst)
+        }
+        fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+            self.read();
+            self.reads.lock().unwrap().push("pending");
+            (self.other_outstanding.load(Ordering::SeqCst), Some(0))
+        }
+        fn accounting_ready(&self) -> bool {
+            self.ready.load(Ordering::SeqCst)
+        }
+        fn free_bytes(&self) -> u64 {
+            self.read();
+            if let Some(hook) = self.on_free.lock().unwrap().as_ref() {
+                hook();
+            }
+            self.free.load(Ordering::SeqCst)
+        }
+        fn admission_guard(&self) -> Box<dyn std::any::Any> {
+            let lock = self.exclusive.load(Ordering::SeqCst).then(|| {
+                let mut busy = self.lock.0.lock().unwrap();
+                while *busy {
+                    busy = self.lock.1.wait(busy).unwrap();
+                }
+                *busy = true;
+                self.lock.clone()
+            });
+            self.held.fetch_add(1, Ordering::SeqCst);
+            self.taken.fetch_add(1, Ordering::SeqCst);
+            Box::new(FakeGuard(self.held.clone(), lock))
+        }
+    }
+
+    struct Rig {
+        /// The store's root, the same for every reopen: a folder inside
+        /// `_scope`, not made until the store makes it.
+        dir: PathBuf,
+        server: Arc<FakeServer>,
+        budget: Arc<FakeBudget>,
+        slept: Arc<Mutex<Vec<u64>>>,
+        opened: AtomicUsize,
+        /// The folder this rig made for itself, removed when it drops (a
+        /// failed assertion included). Last, so it goes after the rest.
+        _scope: super::super::test_dir::TmpDir,
+    }
+
+    impl Rig {
+        fn new(tag: &str) -> Self {
+            let scope = super::super::test_dir::TmpDir::new(&format!("kept-video-{tag}"));
+            CAPTURED.with(|c| c.borrow_mut().clear());
+            Self {
+                dir: scope.path().join("videos"),
+                server: FakeServer::with_stream(),
+                budget: FakeBudget::roomy(),
+                slept: Arc::default(),
+                opened: AtomicUsize::new(0),
+                _scope: scope,
+            }
+        }
+
+        fn open(&self) -> Arc<DiskVideoStore> {
+            self.open_with(self.budget.clone())
+        }
+
+        fn open_with(&self, budget: Arc<dyn Budget>) -> Arc<DiskVideoStore> {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            let slept = self.slept.clone();
+            DiskVideoStore::open(
+                self.dir.clone(),
+                Env {
+                    fetcher: self.server.clone(),
+                    budget,
+                    sleep: Arc::new(move |secs| {
+                        slept.lock().unwrap().push(secs);
+                        Box::pin(async {})
+                    }),
+                    now: || "2026-11-16T09:00:00Z".to_owned(),
+                    runtime: tokio::runtime::Handle::current(),
+                    remove_dir: removing,
+                },
+            )
+        }
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn request(item: &str) -> KeepVideoRequest {
+        KeepVideoRequest {
+            item: item.into(),
+            version: String::new(),
+            user: "u1".into(),
+            title: "Film one".into(),
+            kind: "movie".into(),
+            runtime_ms: 12_000,
+            master_url: MASTER_KEY.into(),
+            audio: None,
+            subtitles: vec![],
+            quality_bps: DEFAULT_QUALITY_BPS,
+        }
+    }
+
+    fn only(store: &DiskVideoStore) -> KeptVideo {
+        let v = store.videos("u1");
+        assert_eq!(v.len(), 1, "{v:?}");
+        v[0].clone()
+    }
+
+    /// Waits until `item`'s plan is admitted or its download has failed
+    /// (a reservation alone sets an estimate before either), and returns
+    /// its record then.
+    async fn plan_decided(store: &DiskVideoStore, item: &str) -> KeptVideo {
+        let mut waited = 0;
+        loop {
+            let admitted = store
+                .inner
+                .plans_admitted
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|i| i == item);
+            let v = store.videos("u1").into_iter().find(|v| v.item == item);
+            if let Some(v) = v {
+                if admitted || matches!(v.state, KeptState::Failed { .. }) {
+                    return v;
+                }
+            }
+            waited += 1;
+            assert!(waited < 5_000, "item {item}: no plan decided");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    fn lines(prefix: &str) -> Vec<String> {
+        captured()
+            .into_iter()
+            .filter(|l| l.starts_with(prefix))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_download_fetches_every_file_and_ends_ready() {
+        let rig = Rig::new("whole");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        assert_eq!(v.files, [MASTER_KEY, MEDIA_KEY, INIT, SEG0, SEG1]);
+        assert_eq!(
+            v.estimated_bytes,
+            MASTER.len() as u64 + MEDIA.len() as u64 + 210
+        );
+        for (key, byte) in [(SEG0, 2u8), (INIT, 1), (SEG1, 3)] {
+            let f = store.stored_file("u1", key).unwrap();
+            assert_eq!(std::fs::read(&f.path).unwrap().first(), Some(&byte));
+            assert_eq!(f.len, std::fs::metadata(&f.path).unwrap().len());
+        }
+        assert_eq!(
+            store.stored_file("u1", SEG0).unwrap().content_type,
+            "video/mp4"
+        );
+        assert_eq!(
+            store.stored_file("u1", MEDIA_KEY).unwrap().content_type,
+            "application/vnd.apple.mpegurl"
+        );
+        assert!(store.stored_file("u1", "/videos/1/other.m4s").is_none());
+        let dir = rig.dir.join("u1").join("1").join("files");
+        assert!(
+            std::fs::read_dir(dir).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".part")),
+            "no temp file is left"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_signals_name_start_and_end_with_the_item_and_its_size() {
+        let rig = Rig::new("signals");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let start = lines("pharos: video keep start");
+        assert_eq!(start.len(), 1);
+        assert!(
+            start[0].contains("item=1") && start[0].contains("files=5"),
+            "{start:?}"
+        );
+        let ready = lines("pharos: video keep ready");
+        assert_eq!(ready.len(), 1);
+        assert!(
+            ready[0].contains("item=1")
+                && ready[0].contains("files=5")
+                && ready[0].contains("bytes="),
+            "{ready:?}"
+        );
+        assert!(lines("pharos: video keep failed").is_empty());
+    }
+
+    /// Two of a user's downloads that store the same request key each keep
+    /// their own copy: removing the one indexed last leaves the other's
+    /// copy answering, before a restart and after it.
+    #[tokio::test]
+    async fn removing_one_of_two_downloads_sharing_a_key_keeps_the_others_copy() {
+        let rig = Rig::new("shared-key");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        let one = store.inner.item_dir("u1", "1").join("files");
+        store.remove("u1", "2");
+        store.settled().await;
+        for key in [SEG0, SEG1, INIT, MEDIA_KEY] {
+            let f = store
+                .stored_file("u1", key)
+                .unwrap_or_else(|| panic!("{key} stopped answering after the other copy went"));
+            assert_eq!(f.path.parent(), Some(one.as_path()), "{key}");
+            assert!(f.path.exists(), "{key}");
+        }
+        drop(store);
+        let store = rig.open();
+        store.remove("u1", "2");
+        store.settled().await;
+        assert!(store.stored_file("u1", SEG0).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_restart_fetches_only_the_files_that_are_missing() {
+        let rig = Rig::new("resume");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let gone = store.stored_file("u1", SEG1).unwrap().path;
+        drop(store);
+        std::fs::remove_file(gone).unwrap();
+        rig.server.asked.lock().unwrap().clear();
+
+        let store = rig.open();
+        assert_eq!(
+            lines("pharos: video keep resume").len(),
+            1,
+            "a ready copy with a file gone is resumed"
+        );
+        store.settled().await;
+        assert_eq!(
+            rig.server.asked(),
+            [SEG1],
+            "only the missing file is asked for"
+        );
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(store.stored_file("u1", SEG1).is_some());
+    }
+
+    /// A download interrupted by a restart that opens before the music
+    /// cache's figures are ready waits for them, Downloading, and resumes
+    /// once they are: it does not end Failed with nothing to restart it.
+    #[tokio::test]
+    async fn a_restart_before_accounting_is_ready_waits_and_resumes() {
+        let rig = Rig::new("restart-not-ready");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        let manifest = rig.dir.join("u1").join("1").join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 4,
+            total: 5,
+            bytes: 1,
+        };
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        rig.slept.lock().unwrap().clear();
+        let store = rig.open();
+        for _ in 0..2000 {
+            if rig.slept.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let v = only(&store);
+        assert!(
+            matches!(v.state, KeptState::Downloading { .. }),
+            "the restarted download did not wait for accounting: {v:?}"
+        );
+        assert!(
+            !lines("pharos: video keep waiting item=1").is_empty(),
+            "the wait was not logged"
+        );
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_download_resumes_after_a_restart() {
+        let rig = Rig::new("interrupted");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Failed { .. }), "{v:?}");
+        drop(store);
+
+        // The app was closed with it half done: the record says Downloading.
+        let manifest = rig.dir.join("u1").join("1").join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 4,
+            total: 5,
+            bytes: 1,
+        };
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        rig.server.asked.lock().unwrap().clear();
+        let store = rig.open();
+        store.settled().await;
+        // The failure may have cut a file in flight beside it short (the
+        // init or the other segment), so those may be asked for again; the
+        // playlists, whole before any media file starts, are not.
+        let asked = rig.server.asked();
+        assert!(asked.contains(&SEG1.to_owned()), "{asked:?}");
+        assert!(
+            asked.iter().all(|k| !k.contains(".m3u8")),
+            "no playlist is refetched: {asked:?}"
+        );
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_busy_server_is_retried_with_backoff_and_the_signal_names_the_status() {
+        let rig = Rig::new("retry");
+        rig.server.fail(SEG0, &[503, 0, 404]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert_eq!(*rig.slept.lock().unwrap(), [1, 2, 4]);
+        let failed = lines("pharos: video keep file failed");
+        assert_eq!(failed.len(), 3);
+        assert!(failed[0].contains("status=503") && failed[0].contains("attempt=1"));
+        assert!(failed[1].contains("status=none") && failed[1].contains("attempt=2"));
+        assert!(failed[2].contains("status=404"));
+        assert!(failed[0].contains("url_path=/videos/1/h264cmaf/0.m4s"));
+        assert!(
+            !failed[0].contains("PlaySessionId"),
+            "no query in a log line"
+        );
+    }
+
+    /// CR 4642574399: a request that fails in a way no retry changes (here
+    /// too many redirects) fails the download at once, not after the
+    /// network backoff, and the log says it was terminal.
+    #[tokio::test]
+    async fn a_terminal_request_failure_is_not_retried() {
+        let rig = Rig::new("terminal");
+        rig.server
+            .refusals
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), "too many redirects".into());
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("not failed");
+        };
+        assert!(reason.contains("too many redirects"), "{reason}");
+        assert!(
+            rig.slept.lock().unwrap().is_empty(),
+            "a terminal failure was retried"
+        );
+        let failed = lines("pharos: video keep file failed");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(
+            failed[0].contains("terminal=true") && failed[0].contains("attempt=1"),
+            "{failed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_file_fails_the_download_naming_the_path_and_status() {
+        let rig = Rig::new("refused-file");
+        rig.server.fail(SEG0, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("not failed");
+        };
+        assert!(
+            reason.contains("/videos/1/h264cmaf/0.m4s") && reason.contains("403"),
+            "{reason}"
+        );
+        assert!(rig.slept.lock().unwrap().is_empty(), "403 is not retried");
+        let failed = lines("pharos: video keep failed");
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0].contains("item=1") && failed[0].contains("reason="),
+            "{failed:?}"
+        );
+        // A failed download may be started again, and finishes.
+        rig.server.failures.lock().unwrap().clear();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_download_over_the_cap_is_refused_and_keeps_nothing() {
+        let rig = Rig::new("over-cap");
+        rig.budget.cap.store(1_000, Ordering::SeqCst);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("not failed");
+        };
+        assert!(reason.contains("cap"), "{reason}");
+        let refused = lines("pharos: video keep refused");
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].contains("estimate=") && refused[0].contains("cap=1000"),
+            "{refused:?}"
+        );
+        assert!(store.stored_file("u1", MASTER_KEY).is_none());
+        assert!(
+            !rig.server.asked().contains(&SEG0.to_owned()),
+            "no segment was fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_musics_share_of_the_budget_counts_against_the_cap() {
+        let rig = Rig::new("shared");
+        // 4 GiB shared, music holding nearly all of it: the film does not fit.
+        rig.budget.other.store(4 * GIB - 10, Ordering::SeqCst);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert_eq!(store.used_bytes("u1"), 4 * GIB - 10);
+        // The videos' own figure leaves the music out: none landed.
+        assert_eq!(store.video_bytes("u1"), 0, "music counted as video");
+    }
+
+    /// A music write the cache has approved, and not yet landed, is room a
+    /// video admission cannot count: the free figure does not lack those
+    /// bytes yet. (The phone's budget reports them from the cache's
+    /// reservation, `Library::music_outstanding_bytes`.)
+    #[tokio::test]
+    async fn a_video_admission_does_not_count_room_an_approved_music_write_will_take() {
+        let rig = Rig::new("music-approved");
+        let free = 100 * GIB;
+        rig.budget.free.store(free, Ordering::SeqCst);
+        // The cap is out of the way: this is about the free space.
+        rig.budget.cap.store(1_000 * GIB, Ordering::SeqCst);
+        // Music is approved for all the room above the guard, and has yet to
+        // write it.
+        rig.budget
+            .other_outstanding
+            .store(free - FREE_GUARD_BYTES, Ordering::SeqCst);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("admitted against room the music write will take");
+        };
+        assert!(reason.contains("guard"), "{reason}");
+        // Once the music write lands (or its job ends) the room is the video's.
+        rig.budget.other_outstanding.store(0, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "still refused after the release");
+    }
+
+    /// The music side as the library reports it: a window held mid-download
+    /// (`Library::music_outstanding_bytes`, covered in pharos-content by
+    /// `a_download_held_mid_window_is_outstanding_until_the_job_ends`).
+    struct FakeMusic {
+        outstanding: AtomicU64,
+        /// Written to in-flight `.part` files: in the cap, not in free space.
+        in_progress: AtomicU64,
+        /// Set when the music cache could not read its parts.
+        in_progress_unknown: AtomicBool,
+        used: AtomicU64,
+    }
+
+    impl crate::native::ports::MusicSide for FakeMusic {
+        fn cache_cap(&self) -> Option<u64> {
+            Some(100 * GIB)
+        }
+        fn used_bytes(&self) -> Option<u64> {
+            Some(self.used.load(Ordering::SeqCst))
+        }
+        fn cache_enabled(&self) -> bool {
+            true
+        }
+        fn set_cache_cap(&self, _: u64) -> Result<(), String> {
+            Err("the fake music keeps its cap".to_owned())
+        }
+        fn pending(&self) -> (u64, Option<u64>) {
+            (
+                self.outstanding.load(Ordering::SeqCst),
+                (!self.in_progress_unknown.load(Ordering::SeqCst))
+                    .then(|| self.in_progress.load(Ordering::SeqCst)),
+            )
+        }
+    }
+
+    /// The phone's budget: every music figure through the shared functions
+    /// `PhoneBudget` calls, the free space and the lock from the rig.
+    struct MusicBudget {
+        music: Arc<FakeMusic>,
+        base: Arc<FakeBudget>,
+    }
+
+    impl Budget for MusicBudget {
+        fn cap_bytes(&self) -> u64 {
+            crate::native::ports::music_cap(Some(&*self.music))
+        }
+        fn other_used_bytes(&self) -> u64 {
+            crate::native::ports::music_used(Some(&*self.music))
+        }
+        fn accounting_ready(&self) -> bool {
+            crate::native::ports::music_ready(Some(&*self.music))
+        }
+        fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+            crate::native::ports::music_pending(Some(&*self.music))
+        }
+        fn free_bytes(&self) -> u64 {
+            self.base.free_bytes()
+        }
+        fn admission_guard(&self) -> Box<dyn std::any::Any> {
+            self.base.admission_guard()
+        }
+    }
+
+    /// A budget whose music parts are unmeasurable while `armed`.
+    struct FlipBudget {
+        base: Arc<FakeBudget>,
+        armed: AtomicBool,
+    }
+
+    impl Budget for FlipBudget {
+        fn cap_bytes(&self) -> u64 {
+            self.base.cap_bytes()
+        }
+        fn other_used_bytes(&self) -> u64 {
+            self.base.other_used_bytes()
+        }
+        fn free_bytes(&self) -> u64 {
+            self.base.free_bytes()
+        }
+        fn accounting_ready(&self) -> bool {
+            self.base.accounting_ready()
+        }
+        fn other_pending_bytes(&self) -> (u64, Option<u64>) {
+            let (owed, parts) = self.base.other_pending_bytes();
+            if self.armed.load(Ordering::SeqCst) {
+                (owed, None)
+            } else {
+                (owed, parts)
+            }
+        }
+        fn admission_guard(&self) -> Box<dyn std::any::Any> {
+            self.base.admission_guard()
+        }
+    }
+
+    /// CR outside-diff kept_video_disk.rs:1894: music accounting readable
+    /// when the accounting wait ends but unreadable at the plan's admission
+    /// refuses a resume too, not only a fresh download: it is never
+    /// admitted on free space alone.
+    #[tokio::test]
+    async fn a_resume_is_refused_when_music_turns_unmeasurable_before_admission() {
+        let rig = Rig::new("resume-music-unknown");
+        rig.server.sign_in("u1");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let budget = Arc::new(FlipBudget {
+            base: rig.budget.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let store = rig.open_with(budget.clone());
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        store.park_runs(Some("u1"));
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(!only(&store).files.is_empty(), "no plan to resume");
+        // Armed once the accounting wait has passed, before the plan reads
+        // the figures for its admission.
+        let b2 = budget.clone();
+        set_hook(&AFTER_PRUNE, move || b2.armed.store(true, Ordering::SeqCst));
+        store.resume_user("u1");
+        store.settled().await;
+        clear_hook(&AFTER_PRUNE);
+        assert!(
+            !only(&store).ready(),
+            "a resume was admitted with music unmeasured: {:?}",
+            only(&store).state
+        );
+        assert!(
+            lines("pharos: video keep refused item=1 reason=music_size_unknown")
+                .iter()
+                .any(|l| l.contains("resume=true")),
+            "{:?}",
+            captured()
+        );
+    }
+
+    /// A music download held mid-window leaves one window of free space
+    /// owed: a video that fits the free space only if that window is
+    /// ignored is refused by the 2 GiB guard, and admitted once the
+    /// music's reservation is released.
+    #[tokio::test]
+    async fn a_video_is_refused_by_the_guard_while_a_music_window_is_held() {
+        let rig = Rig::new("music-window");
+        // Room for the film above the guard, but not for it and the window.
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES + 4_000_000, Ordering::SeqCst);
+        let music = Arc::new(FakeMusic {
+            outstanding: AtomicU64::new(8 * 1024 * 1024),
+            in_progress: AtomicU64::new(0),
+            in_progress_unknown: AtomicBool::new(false),
+            used: AtomicU64::new(0),
+        });
+        let store = rig.open_with(Arc::new(MusicBudget {
+            music: music.clone(),
+            base: rig.budget.clone(),
+        }));
+        let refusal = store.start(request("1")).unwrap_err();
+        assert!(
+            refusal.to_string().contains("guard"),
+            "refused, but not by the guard: {refusal}"
+        );
+        assert!(store.videos("u1").is_empty());
+        music.outstanding.store(0, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
+    /// Music approved and not yet written is part of the shared cap: a
+    /// video that fits beside the music's finished bytes only is refused
+    /// while a music download is in flight, and admitted once it lands or
+    /// releases. The free space is ample, so only the cap decides.
+    #[tokio::test]
+    async fn a_video_admission_counts_music_in_flight_against_the_cap() {
+        let rig = Rig::new("music-cap-outstanding");
+        // Room for the film (about 3 MB) beside the finished music, but not
+        // beside an approved 500 kB write too.
+        rig.budget
+            .other
+            .store(4 * GIB - 3_100_000, Ordering::SeqCst);
+        rig.budget
+            .other_outstanding
+            .store(500_000, Ordering::SeqCst);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("admitted past the cap with a music write in flight");
+        };
+        assert!(
+            reason.contains("cap") || reason.contains("room"),
+            "{reason}"
+        );
+        rig.budget.other_outstanding.store(0, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
+    /// A music download paused after a reservation refresh has written
+    /// bytes (which `used` skips) and reserves only what is left. The cap
+    /// counts both; the free-space check only the second. The video fits
+    /// beside the finished music and the remainder but not beside the
+    /// written bytes too, and the free space is ample, so the cap decides.
+    #[tokio::test]
+    async fn a_video_admission_counts_the_bytes_a_music_download_has_written() {
+        let rig = Rig::new("music-cap-written");
+        let music = Arc::new(FakeMusic {
+            outstanding: AtomicU64::new(500_000),
+            in_progress: AtomicU64::new(600_000),
+            in_progress_unknown: AtomicBool::new(false),
+            used: AtomicU64::new(100 * GIB - 4_000_000),
+        });
+        let store = rig.open_with(Arc::new(MusicBudget {
+            music: music.clone(),
+            base: rig.budget.clone(),
+        }));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("admitted past the cap with written music bytes uncounted");
+        };
+        assert!(
+            reason.contains("cap") || reason.contains("room"),
+            "{reason}"
+        );
+        // The download landed: its bytes are in `used`, once, and fit.
+        music.in_progress.store(0, Ordering::SeqCst);
+        music.outstanding.store(0, Ordering::SeqCst);
+        music.used.store(100 * GIB - 3_300_000, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
+    /// Music's unfinished downloads that could not be measured are unknown,
+    /// not 0: a new video is refused with the reason in the message and the
+    /// log, admitted once they can be read.
+    #[tokio::test]
+    async fn a_video_is_refused_while_the_music_parts_cannot_be_measured() {
+        let rig = Rig::new("music-parts-unknown");
+        let music = Arc::new(FakeMusic {
+            outstanding: AtomicU64::new(0),
+            in_progress: AtomicU64::new(0),
+            in_progress_unknown: AtomicBool::new(true),
+            used: AtomicU64::new(0),
+        });
+        let store = rig.open_with(Arc::new(MusicBudget {
+            music: music.clone(),
+            base: rig.budget.clone(),
+        }));
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("1")) else {
+            panic!("admitted with the music parts unmeasured");
+        };
+        assert!(why.contains("reason=music_size_unknown"), "{why}");
+        assert!(!lines("pharos: video keep refused item=1 reason=music_size_unknown").is_empty());
+        assert!(store.videos("u1").is_empty());
+        music.in_progress_unknown.store(false, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+    }
+
+    /// The music side's cap check reads the video's whole reservation: a
+    /// download in flight counts at its estimate, not at the bytes written
+    /// so far, so music cannot take what the video has been admitted for.
+    #[tokio::test]
+    async fn a_video_in_flight_is_counted_at_its_estimate_for_the_music_cap() {
+        let rig = Rig::new("video-in-flight-held");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        // The playlists are staged (and reserved) before the plan is
+        // admitted: wait for the admission itself.
+        plan_decided(&store, "1").await;
+        assert!(
+            store.kept_bytes() >= estimate_bytes(2_000_000, 12_000),
+            "an in-flight video counted at {}",
+            store.kept_bytes()
+        );
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+    }
+
+    #[tokio::test]
+    async fn a_download_that_would_leave_under_the_guard_is_refused() {
+        let rig = Rig::new("guard");
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES - 1, Ordering::SeqCst);
+        let store = rig.open();
+        // Under the guard already: refused before any request.
+        let refusal = store.start(request("1")).unwrap_err();
+        assert!(
+            matches!(refusal, KeepVideoRefusal::LowSpace { .. }),
+            "{refusal:?}"
+        );
+        assert!(store.videos("u1").is_empty());
+        assert!(rig.server.asked().is_empty());
+        assert_eq!(lines("pharos: video keep refused").len(), 1);
+
+        // Room for the check but not for the film: refused after planning.
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES + 100, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("not failed");
+        };
+        assert!(reason.contains("guard"), "{reason}");
+    }
+
+    /// A file in flight when the download fails is dropped half staged;
+    /// the run takes its staging file with it.
+    /// A download resumed after a restart is held to the free-space guard
+    /// for what is left to fetch, and 0 free (an unreadable measure) is no
+    /// room.
+    #[tokio::test]
+    async fn a_resumed_download_needs_room_for_what_is_left() {
+        for free in [0, FREE_GUARD_BYTES + 100] {
+            let rig = Rig::new("resume-room");
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            let gone = store.indexed_file("u1", SEG1).unwrap().path;
+            drop(store);
+            std::fs::remove_file(gone).unwrap();
+            rig.server.asked.lock().unwrap().clear();
+            rig.budget.free.store(free, Ordering::SeqCst);
+
+            let store = rig.open();
+            store.settled().await;
+            let KeptState::Failed { reason } = only(&store).state else {
+                panic!("free={free}: a resume without room went on");
+            };
+            assert!(reason.contains("guard"), "{reason}");
+            assert!(rig.server.asked().is_empty(), "nothing was fetched");
+            let refused = lines("pharos: video keep refused");
+            assert!(
+                refused.len() == 1
+                    && refused[0].contains("resume=true")
+                    && refused[0].contains(&format!("free={free}")),
+                "{refused:?}"
+            );
+            // The stored files stay: with room again the copy finishes.
+            assert!(store.indexed_file("u1", SEG0).is_some());
+        }
+    }
+
+    /// A resume whose plan asks for more than its record reserves (a
+    /// finished download that lost a segment holds only what was on disk)
+    /// is held to the shared cap, its own reservation not counted: with
+    /// music holding the rest of the cap it is refused and fetches nothing.
+    #[tokio::test]
+    async fn a_resume_that_raises_its_reservation_passes_the_shared_cap() {
+        let rig = Rig::new("resume-raise");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let gone = store.indexed_file("u1", SEG1).unwrap().path;
+        drop(store);
+        std::fs::remove_file(&gone).unwrap();
+        rig.server.asked.lock().unwrap().clear();
+        let held = on_disk(&rig.dir.join("u1").join("1"));
+        let cap = rig.budget.cap.load(Ordering::SeqCst);
+        rig.budget.other.store(cap - held, Ordering::SeqCst);
+
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { .. } = only(&store).state else {
+            panic!("a resume past the shared cap went on");
+        };
+        assert!(rig.server.asked().is_empty(), "something was fetched");
+        assert!(!gone.exists(), "the missing segment was fetched");
+        let refused = lines("pharos: video keep refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("resume=true") && l.contains("cap=")),
+            "the resume skipped the shared cap: {refused:?}"
+        );
+        assert!(!lines("pharos: video resume replanned item=1 reason=estimate_raised").is_empty());
+        assert!(
+            store.indexed_file("u1", SEG0).is_some(),
+            "stored files dropped"
+        );
+    }
+
+    /// Each admission (the start's, each playlist's and the plan's) reads
+    /// the other kinds' owed and written bytes once, together, as `Budget`
+    /// hands them: a write landing mid-read is in one figure, never both or
+    /// neither.
+    #[tokio::test]
+    async fn an_admission_reads_the_pending_bytes_once() {
+        let rig = Rig::new("read-order");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        let reads = rig.budget.reads.lock().unwrap().clone();
+        // The start; the run's look at whether the music's figures can be
+        // read (`wait_for_accounting`, not an admission: it reads only
+        // whether the written figure is known); the two playlists'
+        // reservations, then the plan.
+        assert_eq!(reads, vec!["pending"; 5]);
+    }
+
+    /// A resume missing its playlist with no room left under the shared cap
+    /// is refused before the playlist is fetched: a playlist fetched to
+    /// plan is reserved at its limit first, so nothing is written.
+    #[tokio::test]
+    async fn a_resume_missing_its_playlist_with_no_room_fetches_nothing() {
+        let rig = Rig::new("resume-playlist");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let master = store.stored_file("u1", MASTER_KEY).unwrap().path;
+        drop(store);
+        std::fs::remove_file(&master).unwrap();
+        rig.server.asked.lock().unwrap().clear();
+        let files = rig.dir.join("u1").join("1").join("files");
+        let media = on_disk(&files);
+        let cap = rig.budget.cap.load(Ordering::SeqCst);
+        rig.budget.other.store(cap - media, Ordering::SeqCst);
+
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { .. } = only(&store).state else {
+            panic!("a resume with no room went on");
+        };
+        assert!(rig.server.asked().is_empty(), "something was fetched");
+        assert!(!master.exists(), "the playlist was written");
+        assert_eq!(on_disk(&files), media, "media written");
+        let refused = lines("pharos: video keep refused item=1");
+        assert!(
+            refused.iter().any(|l| l.contains("step=playlist")),
+            "{refused:?}"
+        );
+    }
+
+    /// A cap with room for one playlist's reservation and not two: the
+    /// master is fetched, the media playlist's reservation refuses, and the
+    /// planning keeps nothing it fetched, on disk or in the index. A new
+    /// download drops what it read; a resume only what this run fetched,
+    /// its media kept.
+    #[tokio::test]
+    async fn a_refusal_while_planning_keeps_no_playlist_it_fetched() {
+        // A new download.
+        let rig = Rig::new("plan-refused-new");
+        rig.budget
+            .cap
+            .store(PLAYLIST_MAX_BYTES + 100, Ordering::SeqCst);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { .. } = only(&store).state else {
+            panic!("planning went on past the cap");
+        };
+        assert!(rig.server.asked().contains(&MASTER_KEY.to_owned()));
+        assert!(!rig.server.asked().contains(&MEDIA_KEY.to_owned()));
+        assert!(store.stored_file("u1", MASTER_KEY).is_none(), "indexed");
+        let files = rig.dir.join("u1").join("1").join("files");
+        assert_eq!(on_disk(&files), 0, "a playlist was kept");
+        drop(store);
+
+        // A resume missing both playlists.
+        let rig = Rig::new("plan-refused-resume");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let held = store.kept_bytes();
+        let master = store.stored_file("u1", MASTER_KEY).unwrap().path;
+        let media = store.stored_file("u1", MEDIA_KEY).unwrap().path;
+        let seg = store.stored_file("u1", SEG0).unwrap().path;
+        drop(store);
+        std::fs::remove_file(&master).unwrap();
+        std::fs::remove_file(&media).unwrap();
+        rig.server.asked.lock().unwrap().clear();
+        // What the record counts once adopted: no less than its folder.
+        let own = held.max(on_disk(&rig.dir.join("u1").join("1")));
+        rig.budget
+            .cap
+            .store(own + PLAYLIST_MAX_BYTES + 100, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { .. } = only(&store).state else {
+            panic!("a resume went on past the cap");
+        };
+        assert_eq!(
+            rig.server.asked(),
+            [MASTER_KEY.to_owned()],
+            "{:?} held={held}",
+            lines("pharos: video")
+        );
+        assert!(!master.exists(), "the fetched master was kept");
+        assert!(store.stored_file("u1", MASTER_KEY).is_none(), "indexed");
+        assert!(seg.exists(), "the resume's media was dropped");
+        assert!(!lines(
+            "pharos: video keep planning refused item=1 resume=true playlists_dropped=1"
+        )
+        .is_empty());
+    }
+
+    /// A media body larger than the plan's estimate. With room, the
+    /// reservation grows ahead of the chunk that would pass it and the
+    /// download finishes counted. Over the shared cap, or with the free
+    /// space below the guard, that chunk is refused: nothing past the
+    /// reservation is written, its staging file goes, and the download
+    /// fails naming the reason.
+    #[tokio::test]
+    async fn a_chunk_past_the_reservation_is_refused_unless_the_reservation_can_grow() {
+        // The plan estimates 3 MB; the segment alone is 4 MB, in two chunks.
+        let big = 4_000_000u64;
+        for case in ["cap", "floor", "roomy"] {
+            let rig = Rig::new(&format!("grow-{case}"));
+            rig.server
+                .files
+                .lock()
+                .unwrap()
+                .insert(SEG1.into(), vec![3; usize::try_from(big).unwrap()]);
+            let cap = 3_200_000;
+            if case == "cap" {
+                rig.budget.cap.store(cap, Ordering::SeqCst);
+            }
+            let release = rig.server.hold_mid_body(SEG1);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            let files = rig.dir.join("u1").join("1").join("files");
+            // The first chunk is written: the disk fills up now.
+            let mut waited = 0;
+            while on_disk(&files) < big / 2 {
+                waited += 1;
+                assert!(waited < 5_000, "{case}: the first chunk never landed");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            if case == "floor" {
+                rig.budget
+                    .free
+                    .store(FREE_GUARD_BYTES + 100_000, Ordering::SeqCst);
+            }
+            release.store(true, Ordering::SeqCst);
+            store.settled().await;
+            let v = only(&store);
+            let on_disk = on_disk(&files);
+            if case == "roomy" {
+                assert_eq!(v.state, KeptState::Ready, "{case}");
+                assert!(
+                    store.kept_bytes() >= on_disk && on_disk >= big,
+                    "{case}: kept {} of {on_disk}",
+                    store.kept_bytes()
+                );
+                assert!(!lines("pharos: video keep reservation verdict=extended").is_empty());
+                continue;
+            }
+            let KeptState::Failed { reason } = &v.state else {
+                panic!("{case}: a chunk past the reservation was written: {v:?}");
+            };
+            let why = if case == "cap" {
+                "reason=over_cap"
+            } else {
+                "reason=low_space"
+            };
+            assert!(reason.contains(why), "{case}: {reason}");
+            assert!(
+                lines("pharos: video keep refused")
+                    .iter()
+                    .any(|l| l.contains("reason=reservation_exceeded") && l.contains(why)),
+                "{case}: {:?}",
+                captured()
+            );
+            assert!(
+                on_disk < big,
+                "{case}: the second chunk was written ({on_disk})"
+            );
+            assert!(
+                std::fs::read_dir(&files)
+                    .unwrap()
+                    .flatten()
+                    .all(|e| e.path().extension().is_none_or(|x| x != "part")),
+                "{case}: the refused chunk's staging file stayed"
+            );
+            if case == "cap" {
+                assert!(
+                    store.kept_bytes() <= cap,
+                    "{case}: kept {}",
+                    store.kept_bytes()
+                );
+            }
+        }
+    }
+
+    /// Two fetches of one download: one has claimed a chunk it has not yet
+    /// written, the other needs the reservation to grow. The claimed chunk
+    /// is still owed (the free space has not lost it), so the growth is
+    /// held to the free space less it, and refused when that is short.
+    #[tokio::test]
+    async fn growth_counts_a_claimed_unwritten_chunk_as_owed() {
+        let rig = Rig::new("grow-claimed");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let _ = plan_decided(&store, "1").await;
+        let (run, estimate) = {
+            let st = lock(&store.inner.state);
+            (
+                st.runs[&("u1".to_owned(), "1".to_owned())],
+                find(&st.list, "u1", "1").unwrap().estimated_bytes,
+            )
+        };
+        // The other fetch claims most of the reservation, its write pending.
+        let mut pending = Staged {
+            inner: &store.inner,
+            who: ("u1".to_owned(), "1".to_owned(), run),
+            len: 0,
+            part: PathBuf::new(),
+            claim: 0,
+            promoted: false,
+            why: "cancelled",
+        };
+        let claimed = estimate - 500_000;
+        assert!(pending.claim(claimed).is_ok());
+        // The disk has room for what is owed and 200 kB more: not for the
+        // 500 kB growth this fetch asks for.
+        let owed = {
+            let st = lock(&store.inner.state);
+            estimate - st.run_on_disk(find(&st.list, "u1", "1").unwrap(), run)
+        };
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES + owed + 200_000, Ordering::SeqCst);
+        let grown = store
+            .inner
+            .extend_reservation("u1", "1", run, estimate + 500_000);
+        assert!(
+            matches!(grown, Err(ClaimRefused::Reason(ref why)) if why.contains("reason=low_space")),
+            "grown past the free space: the claimed chunk was counted as written"
+        );
+        drop(pending);
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+    }
+
+    /// A plan admitted beside stale files its prune could not delete holds
+    /// estimate plus stale. The stale share is on disk, so media stop at
+    /// the plan's own share: past it the reservation must grow, and over
+    /// the cap it cannot. A cap that fits estimate plus stale exactly still
+    /// lets a download within its plan finish.
+    #[tokio::test]
+    async fn media_cannot_grow_into_the_stale_share_of_a_reservation() {
+        for big in [true, false] {
+            let rig = Rig::new(if big {
+                "stale-share"
+            } else {
+                "stale-share-fits"
+            });
+            rig.server.fail(SEG1, &[403]);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            // 2 MB an earlier plan left that the prune cannot delete.
+            let files = rig.dir.join("u1").join("1").join("files");
+            let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+            std::fs::create_dir(&stuck).unwrap();
+            std::fs::write(stuck.join("inner"), vec![0u8; 2_000_000]).unwrap();
+            let stale = on_disk(&stuck);
+            let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+            {
+                let mut f = rig.server.files.lock().unwrap();
+                let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+                for (key, body) in old {
+                    let body = match String::from_utf8(body.clone()) {
+                        Ok(text) => renamed(&text).into_bytes(),
+                        Err(_) => body,
+                    };
+                    f.insert(renamed(&key), body);
+                }
+                if big {
+                    // 4 MB of media against a 3 MB plan.
+                    f.insert(renamed(SEG1), vec![3; 4_000_000]);
+                }
+            }
+            rig.server.failures.lock().unwrap().clear();
+            let estimate = estimate_bytes(2_000_000, 12_000);
+            // The cap fits the plan and the stale files exactly.
+            rig.budget.cap.store(estimate + stale, Ordering::SeqCst);
+            let mut again = request("1");
+            again.master_url = renamed(MASTER_KEY);
+            store.start(again).unwrap();
+            store.settled().await;
+            let v = only(&store);
+            let media = on_disk(&files).saturating_sub(stale);
+            if big {
+                assert!(
+                    matches!(v.state, KeptState::Failed { .. }),
+                    "media grew into the stale share: {v:?}"
+                );
+                assert!(media <= estimate, "media reached {media} past {estimate}");
+            } else {
+                assert_eq!(v.state, KeptState::Ready, "an exact fit was refused");
+            }
+        }
+    }
+
+    /// The stale share an admitted plan counts as on disk belongs to its
+    /// record: once the download is removed, a restart of it owes its
+    /// pending playlist reservation in full, not less an obsolete share. A
+    /// second download that fits only if that reservation were already on
+    /// disk is refused at the guard.
+    #[tokio::test]
+    async fn a_removed_downloads_stale_share_is_not_counted_for_its_restart() {
+        let rig = Rig::new("stale-after-remove");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        // 2 MB an earlier plan left that the prune cannot delete.
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 2_000_000]).unwrap();
+        rig.server.failures.lock().unwrap().clear();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        store.remove("u1", "1");
+        store.settled().await;
+        assert!(store.videos("u1").is_empty());
+        // The restart waits at its first playlist, reserved and not on disk.
+        let master = rig.server.slow_first_open(MASTER_KEY);
+        rig.server.asked.lock().unwrap().clear();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MASTER_KEY, 1).await;
+        let owed = store.outstanding_bytes();
+        assert_eq!(
+            owed, PLAYLIST_MAX_BYTES,
+            "the restart's reservation is not owed in full"
+        );
+        // Room for the second film above the guard, but not for both it and
+        // the playlist the restart still owes.
+        // What the second film's plan asks of the free space: its estimate
+        // less its two playlists, stored before it is admitted.
+        let need = estimate_bytes(2_000_000, 12_000) - (MASTER.len() + MEDIA.len()) as u64;
+        rig.budget.free.store(
+            FREE_GUARD_BYTES + need + PLAYLIST_MAX_BYTES - 1,
+            Ordering::SeqCst,
+        );
+        store.start(request("2")).unwrap();
+        let start = std::time::Instant::now();
+        let second = loop {
+            let v = store
+                .videos("u1")
+                .into_iter()
+                .find(|v| v.item == "2")
+                .unwrap();
+            if !matches!(v.state, KeptState::Downloading { .. }) {
+                break v;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "{v:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        };
+        master.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let KeptState::Failed { reason } = &second.state else {
+            panic!("admitted past the guard: {second:?}");
+        };
+        assert!(reason.contains("guard"), "{reason}");
+    }
+
+    /// A new download (not a resume: its record names no files) over files
+    /// a failed attempt left is admitted holding the bytes its plan finds on
+    /// disk, not 0: before its first progress save, the record already
+    /// counts files larger than its estimate.
+    #[tokio::test]
+    async fn a_new_download_over_stored_files_counts_them_from_admission() {
+        let rig = Rig::new("fresh-over-stored");
+        // Larger than the plan's whole estimate.
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![1; 4_000_000]);
+        let fail = rig.server.hold_first(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.indexed_file("u1", SEG0).is_none() {
+            waited += 1;
+            assert!(waited < 5_000, "the first segment was not stored");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        fail.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        let files = rig.dir.join("u1").join("1").join("files");
+        let on_disk = on_disk(&files);
+        ADMITTED.with(|a| a.set(None));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let admitted = ADMITTED
+            .with(std::cell::Cell::get)
+            .expect("no plan was admitted");
+        assert!(
+            admitted >= on_disk,
+            "admitted at {admitted} with {on_disk} of its files on disk"
+        );
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// A folder retained inside `files/` (the prune cannot delete it)
+    /// counts at every byte under it in the terminal figure, after Ready and
+    /// after Failed alike, not at its directory entry's size. One with a
+    /// subfolder that cannot be read is not measured short: the folder is
+    /// unknown, so nothing is admitted against a figure that leaves it out.
+    #[tokio::test]
+    async fn a_retained_folder_counts_in_full_after_ready_and_failed() {
+        for case in ["ready", "failed", "unreadable"] {
+            let rig = Rig::new(&format!("kept-dir-{case}"));
+            let files = rig.dir.join("u1").join("1").join("files");
+            let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+            let deep = stuck.join("deep");
+            if case == "failed" {
+                rig.server.fail(SEG1, &[403]);
+            }
+            let store = rig.open();
+            // Made as the plan prunes (an open would sweep a folder with no
+            // record): the prune cannot delete a folder, so it stays.
+            let (made, under) = (stuck.clone(), deep.clone());
+            let hide = case == "unreadable";
+            set_hook(&BEFORE_PRUNE, move || {
+                std::fs::create_dir_all(&under).unwrap();
+                std::fs::write(made.join("inner"), vec![0u8; 2_000_000]).unwrap();
+                std::fs::write(under.join("inner"), vec![0u8; 1_000]).unwrap();
+                if hide {
+                    UNREADABLE.with(|u| u.borrow_mut().push(under.clone()));
+                }
+            });
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            clear_hook(&BEFORE_PRUNE);
+            assert!(stuck.exists(), "the retained folder went");
+            // From the state: the host's check behind `size_unknown` would
+            // measure the folder and mend the figure.
+            let unknown = lock(&store.inner.state).unknown_folder().is_some();
+            let kept = store.kept_bytes();
+            UNREADABLE.with(|u| u.borrow_mut().clear());
+            let v = only(&store);
+            let on_disk = on_disk(&files);
+            match case {
+                "ready" => assert_eq!(v.state, KeptState::Ready),
+                _ => assert!(matches!(v.state, KeptState::Failed { .. }), "{case}: {v:?}"),
+            }
+            if hide {
+                assert!(unknown, "an unreadable subfolder was measured as whole");
+            }
+            assert!(
+                unknown || kept >= on_disk,
+                "{case}: kept {kept} with {on_disk} on disk"
+            );
+        }
+    }
+
+    /// A new download over a planned file larger than its estimate and a
+    /// stale file the prune cannot delete is admitted holding both: the
+    /// larger of estimate and stored, plus the stale share, never the larger
+    /// of stored and estimate plus stale.
+    #[tokio::test]
+    async fn an_oversized_planned_file_and_a_stale_one_are_both_reserved() {
+        let rig = Rig::new("oversized-and-stale");
+        // Larger than the plan's whole estimate.
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![1; 4_000_000]);
+        let fail = rig.server.hold_first(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.indexed_file("u1", SEG0).is_none() {
+            waited += 1;
+            assert!(waited < 5_000, "the first segment was not stored");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        fail.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        // 2 MB of an earlier plan that the prune cannot delete.
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 2_000_000]).unwrap();
+        let on_disk = on_disk(&files);
+        ADMITTED.with(|a| a.set(None));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let admitted = ADMITTED
+            .with(std::cell::Cell::get)
+            .expect("no plan was admitted");
+        assert!(
+            admitted >= on_disk,
+            "admitted at {admitted} with {on_disk} on disk"
+        );
+    }
+
+    /// A playlist past its limit is refused and not kept: its reservation
+    /// was for the limit.
+    #[tokio::test]
+    async fn a_playlist_past_its_limit_is_refused_and_not_kept() {
+        let rig = Rig::new("playlist-limit");
+        let big = format!("{MASTER}{}", "#\n".repeat(200));
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(MASTER_KEY.into(), big.into_bytes());
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("an oversized playlist was taken");
+        };
+        assert!(reason.contains("playlist_too_large"), "{reason}");
+        assert!(store.stored_file("u1", MASTER_KEY).is_none());
+        let files = rig.dir.join("u1").join("1").join("files");
+        assert_eq!(on_disk(&files), 0, "something was kept");
+        assert!(!lines("pharos: video keep refused item=1 reason=playlist_too_large").is_empty());
+    }
+
+    /// A running download beside 20 MB of stale files its prune could not
+    /// delete owes only its plan's share: the stale files are on disk
+    /// already, so the free space has lost them. A second download that
+    /// fits the free space left above the guard is admitted beside it.
+    #[tokio::test]
+    async fn stale_files_on_disk_are_not_owed_by_a_running_download() {
+        let rig = Rig::new("stale-not-owed");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 20_000_000]).unwrap();
+        rig.server.failures.lock().unwrap().clear();
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        // Room above the guard for both plans, not for the stale files too.
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES + 7_000_000, Ordering::SeqCst);
+        let release = rig.server.hold_mid_body(SEG1);
+        store.start(request("1")).unwrap();
+        let first = plan_decided(&store, "1").await;
+        assert!(
+            !matches!(first.state, KeptState::Failed { .. }),
+            "{first:?}"
+        );
+        rig.server.reached_mid_body(SEG1).await;
+        let owed = store.outstanding_bytes();
+        assert!(
+            owed <= estimate,
+            "the running download owes {owed}, past its plan's {estimate}"
+        );
+        store.start(request("2")).unwrap();
+        let second = plan_decided(&store, "2").await;
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            !matches!(second.state, KeptState::Failed { .. }),
+            "the second was refused: {second:?}"
+        );
+    }
+
+    /// Two downloads that each fit alone but not together: the second
+    /// is refused against the first's reservation, not admitted beside it.
+    #[tokio::test]
+    async fn a_second_download_is_held_to_the_firsts_reserved_estimate() {
+        let rig = Rig::new("reserve");
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        rig.budget.cap.store(estimate + 1_000, Ordering::SeqCst);
+        // The first download stays under way, holding its reservation.
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        store.start(request("2")).unwrap();
+        let mut waited = 0;
+        loop {
+            let second = store.videos("u1").into_iter().find(|v| v.item == "2");
+            if second
+                .as_ref()
+                .is_some_and(|v| matches!(v.state, KeptState::Failed { .. }))
+            {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "the second download was admitted: {second:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let state = |item: &str| {
+            store
+                .videos("u1")
+                .into_iter()
+                .find(|v| v.item == item)
+                .unwrap()
+                .state
+        };
+        assert_eq!(state("1"), KeptState::Ready);
+        let KeptState::Failed { reason } = state("2") else {
+            panic!("the second was admitted");
+        };
+        assert!(reason.contains("cap"), "{reason}");
+        let refused = lines("pharos: video keep refused");
+        assert!(
+            refused.len() == 1 && refused[0].contains("item=2"),
+            "{refused:?}"
+        );
+    }
+
+    /// Admission reads the other kind's bytes and reserves its own under the
+    /// host's shared lock, so music cannot commit in between.
+    #[tokio::test]
+    async fn admission_reads_the_budget_only_under_the_shared_lock() {
+        let rig = Rig::new("gate");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        // A restart resumes a copy with a file gone: another admission.
+        let gone = store.stored_file("u1", SEG1).unwrap().path;
+        drop(store);
+        std::fs::remove_file(gone).unwrap();
+        let store = rig.open();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(
+            rig.budget.taken.load(Ordering::SeqCst) >= 3,
+            "start, its plan, and the resumed plan each take the lock"
+        );
+        assert_eq!(
+            rig.budget.unguarded.load(Ordering::SeqCst),
+            0,
+            "a reading was made without the shared lock"
+        );
+        assert_eq!(rig.budget.held.load(Ordering::SeqCst), 0, "all released");
+    }
+
+    /// The free space already lacks what a download has staged in a file not
+    /// yet whole; only the rest of its estimate is still to come out of it.
+    #[tokio::test]
+    async fn staged_bytes_are_not_counted_as_still_to_write() {
+        let rig = Rig::new("staged");
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The first download holds its SEG0 half written (50 bytes staged)
+        // with everything else stored.
+        let stored = (MASTER.len() + MEDIA.len() + 10 + 100) as u64;
+        let mut waited = 0;
+        loop {
+            let bytes = match store.videos("u1").first().map(|v| v.state.clone()) {
+                Some(KeptState::Downloading { bytes, .. }) => bytes,
+                _ => 0,
+            };
+            if bytes == stored && store.staged_bytes() == 50 {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "bytes={bytes} staged={}",
+                store.staged_bytes()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // The disk now lacks what was written: room for the second film
+        // beyond the guard, exactly, once the first's staged bytes are not
+        // counted twice.
+        rig.budget.free.store(
+            2 * estimate + FREE_GUARD_BYTES - stored - 50,
+            Ordering::SeqCst,
+        );
+        store.start(request("2")).unwrap();
+        // The first writer stays held until the second's plan is decided.
+        plan_decided(&store, "2").await;
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let videos = store.videos("u1");
+        let second = videos.iter().find(|v| v.item == "2").unwrap();
+        assert_eq!(
+            second.state,
+            KeptState::Ready,
+            "refused for room it had: {second:?}"
+        );
+    }
+
+    /// What the running downloads still owe is read before the free space
+    /// is measured, in one critical section: a write landing in between
+    /// would otherwise lower the owed figure after free was read and be
+    /// counted as room. The measure is made under the store's state lock,
+    /// after the owed figure is taken from it.
+    #[tokio::test]
+    async fn the_free_space_is_measured_after_what_is_owed_is_read() {
+        let rig = Rig::new("owed-before-free");
+        let store = rig.open();
+        let inner = store.inner.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let locked = Arc::new(AtomicUsize::new(0));
+        let (c, l) = (calls.clone(), locked.clone());
+        *rig.budget.on_free.lock().unwrap() = Some(Box::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            if inner.state.try_lock().is_err() {
+                l.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        // Other readers measure free space too; the admission is the one
+        // made under the lock.
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert!(
+            locked.load(Ordering::SeqCst) >= 1,
+            "free was read outside the owed read"
+        );
+    }
+
+    /// An old run still draining after a restart stages bytes the new
+    /// run's estimate does not cover: they do not reduce what is owed.
+    #[tokio::test]
+    async fn a_stale_runs_staged_bytes_do_not_reduce_what_is_owed() {
+        let rig = Rig::new("stale-staged");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let mut waited = 0;
+        while store.staged_bytes() != 50 {
+            waited += 1;
+            assert!(waited < 2_000, "staged={}", store.staged_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let owed = store.outstanding_bytes();
+        let run = lock(&store.inner.state).runs[&("u1".to_owned(), "1".to_owned())];
+        let mut stale = Staged {
+            inner: &store.inner,
+            who: ("u1".to_owned(), "1".to_owned(), run + 1_000),
+            len: 0,
+            part: PathBuf::new(),
+            claim: 0,
+            promoted: false,
+            why: "cancelled",
+        };
+        stale.add(7_000);
+        assert_eq!(store.staged_bytes(), 7_050);
+        assert_eq!(
+            store.outstanding_bytes(),
+            owed,
+            "counted the old run's bytes"
+        );
+        drop(stale);
+        assert_eq!(store.staged_bytes(), 50);
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+    }
+
+    /// `start` reads what running downloads owe before it measures free
+    /// space, under the state lock, like admission does.
+    #[tokio::test]
+    async fn start_measures_free_space_after_reading_what_is_owed() {
+        let rig = Rig::new("start-order");
+        let store = rig.open();
+        let inner = store.inner.clone();
+        let locked = Arc::new(AtomicUsize::new(0));
+        let l = locked.clone();
+        *rig.budget.on_free.lock().unwrap() = Some(Box::new(move || {
+            if inner.state.try_lock().is_err() {
+                l.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        store.start(request("1")).unwrap();
+        // The one reading made by `start` itself, before the task runs.
+        assert_eq!(
+            locked.load(Ordering::SeqCst),
+            1,
+            "free read before the owed read"
+        );
+        store.settled().await;
+    }
+
+    /// Starting an item again whose removed folder would not delete: the
+    /// folder's bytes stop counting as a tombstone, so the new record
+    /// carries them until its plan is admitted.
+    #[tokio::test]
+    async fn a_restart_over_an_undeleted_folder_carries_its_bytes() {
+        let rig = Rig::new("restart-tombstone");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        let left = store.kept_bytes();
+        assert!(left > 0);
+        store.start(request("1")).unwrap();
+        // Before the run's plan is admitted.
+        assert_eq!(store.kept_bytes(), left, "the folder counted for less");
+        FAIL_REMOVE.with(|f| f.set(false));
+        store.settled().await;
+    }
+
+    /// Free space is shared too: a second download must leave the guard free
+    /// after the first has written what it still has to write.
+    #[tokio::test]
+    async fn a_second_download_is_held_to_the_free_space_the_first_still_needs() {
+        let rig = Rig::new("reserve-free");
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        // Room for one film beyond the guard, not for two.
+        rig.budget
+            .free
+            .store(FREE_GUARD_BYTES + estimate + 1_000, Ordering::SeqCst);
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        store.start(request("2")).unwrap();
+        let mut waited = 0;
+        loop {
+            let second = store.videos("u1").into_iter().find(|v| v.item == "2");
+            if second
+                .as_ref()
+                .is_some_and(|v| matches!(v.state, KeptState::Failed { .. }))
+            {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "the second download was admitted: {second:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let videos = store.videos("u1");
+        let state = |item: &str| {
+            videos
+                .iter()
+                .find(|v| v.item == item)
+                .unwrap()
+                .state
+                .clone()
+        };
+        assert_eq!(state("1"), KeptState::Ready);
+        let KeptState::Failed { reason } = state("2") else {
+            panic!("the second was admitted");
+        };
+        assert!(reason.contains("guard"), "{reason}");
+        let refused = lines("pharos: video keep refused");
+        assert!(
+            refused.len() == 1
+                && refused[0].contains("item=2")
+                && refused[0].contains("outstanding="),
+            "{refused:?}"
+        );
+    }
+
+    /// CR 4644634603: the shared total a user sees is the device's, as
+    /// admission counts it (another user's downloads included); the video
+    /// subtotal is the user's own.
+    #[tokio::test]
+    async fn the_shared_usage_counts_every_users_downloads() {
+        let rig = Rig::new("usage-device-wide");
+        let store = rig.open();
+        let mut other = request("2");
+        other.user = "u2".into();
+        store.start(other).unwrap();
+        store.settled().await;
+        let theirs = store.videos("u2")[0].bytes();
+        assert!(theirs > 0);
+        let usage = store.usage("u1");
+        assert_eq!(
+            (usage.video, usage.used),
+            (0, store.kept_bytes()),
+            "the shared total left out another user's downloads"
+        );
+        assert!(usage.used >= theirs);
+        assert_eq!(store.usage("u2").video, theirs);
+    }
+
+    /// The host counts these bytes against the cap it shares with music:
+    /// every user's, a download under way at its whole estimate.
+    #[tokio::test]
+    async fn the_kept_bytes_cover_every_user_and_a_running_downloads_estimate() {
+        let rig = Rig::new("kept-bytes");
+        let store = rig.open();
+        let mut other = request("2");
+        other.user = "u2".into();
+        store.start(other).unwrap();
+        store.settled().await;
+        let ready = store.videos("u2")[0].bytes();
+        assert!(ready > 0);
+        assert_eq!(store.kept_bytes(), ready);
+
+        // A second user's download stays under way.
+        let _held = rig.server.hold_mid_body(SEG0);
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 2).await;
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        let mut waited = 0;
+        while store.kept_bytes() != ready + estimate {
+            waited += 1;
+            assert!(waited < 2_000, "kept_bytes={}", store.kept_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // What the running one has yet to write: its estimate less what it
+        // has stored whole or staged; the finished one has nothing left.
+        let mut waited = 0;
+        loop {
+            let stored = match store.videos("u1")[0].state {
+                KeptState::Downloading { bytes, .. } => bytes,
+                ref other => panic!("not running: {other:?}"),
+            };
+            if store.outstanding_bytes() == estimate - stored - store.staged_bytes() {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "outstanding={} estimate={estimate} stored={stored}",
+                store.outstanding_bytes()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_download_leaves_no_staging_file_behind() {
+        let rig = Rig::new("parts");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        let dir = rig.dir.join("u1").join("1").join("files");
+        let names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.ends_with(".part")), "{names:?}");
+    }
+
+    /// A retry whose plan is new (a fresh play session names every file
+    /// anew) removes the files of the plan it replaces.
+    #[tokio::test]
+    async fn a_retry_with_a_new_plan_removes_the_old_plans_files() {
+        let rig = Rig::new("new-plan");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert!(
+            store.indexed_file("u1", INIT).is_some(),
+            "the old plan left files"
+        );
+
+        // The next attempt negotiates a new session: every key changes.
+        let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+            for (key, body) in old {
+                let body = match String::from_utf8(body.clone()) {
+                    Ok(text) => renamed(&text).into_bytes(),
+                    Err(_) => body,
+                };
+                f.insert(renamed(&key), body);
+            }
+        }
+        rig.server.failures.lock().unwrap().clear();
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        assert!(
+            store.indexed_file("u1", INIT).is_none(),
+            "the old file is not indexed"
+        );
+        let dir = rig.dir.join("u1").join("1").join("files");
+        let on_disk = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(on_disk, v.files.len(), "only the new plan's files remain");
+        assert_eq!(v.files.len(), 5);
+        assert_eq!(lines("pharos: video keep pruned").len(), 1);
+    }
+
+    /// A failed attempt leaves files on disk; they stay counted through the
+    /// next attempt even when it fails before it has a plan to prune to.
+    #[tokio::test]
+    async fn a_failed_attempts_files_stay_counted_when_the_retry_fails_in_planning() {
+        let rig = Rig::new("retry-fails");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        let dir = rig.dir.join("u1").join("1");
+        let on_disk = disk_bytes(&dir).whole().unwrap();
+        assert!(on_disk > 0);
+        assert_eq!(
+            store.kept_bytes(),
+            on_disk,
+            "a failed record reports what is on disk"
+        );
+
+        // The retry negotiates a session the server cannot answer: it fails
+        // reading its master playlist, before any plan.
+        let mut again = request("1");
+        again.master_url = MASTER_KEY.replace("PlaySessionId=p", "PlaySessionId=q");
+        store.start(again).unwrap();
+        assert_eq!(
+            store.kept_bytes(),
+            on_disk,
+            "the old files stay counted while the retry starts"
+        );
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert_eq!(
+            disk_bytes(&dir).whole().unwrap(),
+            on_disk,
+            "nothing was pruned without a plan"
+        );
+        assert_eq!(store.kept_bytes(), on_disk, "and they are still counted");
+    }
+
+    /// A stale file the prune cannot delete still counts against the cap.
+    #[tokio::test]
+    async fn a_file_the_prune_cannot_delete_is_counted_in_the_ready_record() {
+        let rig = Rig::new("prune-fails");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        // A directory where a stale file should be: remove_file refuses it.
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 10]).unwrap();
+
+        let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+            for (key, body) in old {
+                let body = match String::from_utf8(body.clone()) {
+                    Ok(text) => renamed(&text).into_bytes(),
+                    Err(_) => body,
+                };
+                f.insert(renamed(&key), body);
+            }
+        }
+        rig.server.failures.lock().unwrap().clear();
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        assert!(stuck.exists(), "the stale entry could not go");
+        let planned: u64 = v
+            .files
+            .iter()
+            .map(|k| {
+                std::fs::metadata(store.stored_file("u1", k).unwrap().path)
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert!(
+            v.estimated_bytes > planned,
+            "the record counts the stuck entry: {} vs {planned}",
+            v.estimated_bytes
+        );
+        assert_eq!(
+            v.estimated_bytes,
+            disk_bytes(&rig.dir.join("u1").join("1")).whole().unwrap()
+        );
+    }
+
+    /// While the retry runs, the stale file the prune could not delete is
+    /// part of its reservation, not only of the count after it is done.
+    #[tokio::test]
+    async fn a_file_the_prune_cannot_delete_stays_in_the_running_downloads_reservation() {
+        let rig = Rig::new("prune-fails-running");
+        let _never = rig.server.hold_mid_body(SEG0);
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let files = rig.dir.join("u1").join("1").join("files");
+        let stuck = files.join(file_name("/stale/from/another/plan.m4s"));
+        std::fs::create_dir(&stuck).unwrap();
+        std::fs::write(stuck.join("inner"), vec![0u8; 1_000]).unwrap();
+        // A folder counts at what it holds.
+        let stuck_len = on_disk(&stuck);
+        assert!(stuck_len > 0);
+
+        let renamed = |t: &str| t.replace("PlaySessionId=p", "PlaySessionId=q");
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            let old: Vec<(String, Vec<u8>)> = f.drain().collect();
+            for (key, body) in old {
+                let body = match String::from_utf8(body.clone()) {
+                    Ok(text) => renamed(&text).into_bytes(),
+                    Err(_) => body,
+                };
+                f.insert(renamed(&key), body);
+            }
+        }
+        rig.server.failures.lock().unwrap().clear();
+        // The retry stays under way, its first segment held.
+        let _held = rig.server.hold_mid_body(&renamed(SEG0));
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        rig.server.asked_times(&renamed(SEG0), 1).await;
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        assert_eq!(
+            store.kept_bytes(),
+            estimate + stuck_len,
+            "the reservation holds the plan and the file that would not go"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_start_of_a_kept_item_is_refused() {
+        let rig = Rig::new("twice");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(matches!(
+            store.start(request("1")),
+            Err(KeepVideoRefusal::AlreadyKept { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn removing_deletes_the_files_the_index_and_the_record() {
+        let rig = Rig::new("remove");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        store.remove("u1", "1");
+        assert!(store.videos("u1").is_empty());
+        assert!(store.stored_file("u1", SEG0).is_none());
+        assert!(!rig.dir.join("u1").join("1").exists());
+        let line = lines("pharos: video keep remove");
+        assert!(
+            line[0].contains("item=1") && line[0].contains("verdict=removed"),
+            "{line:?}"
+        );
+        // And it does not come back after a restart.
+        drop(store);
+        assert!(rig.open().videos("u1").is_empty());
+    }
+
+    /// A folder that will not delete and cannot be measured is not counted
+    /// as empty: it keeps the bytes the record reserved, and a later failed
+    /// sweep keeps the figure it had.
+    #[tokio::test]
+    async fn an_unreadable_folder_is_not_counted_as_empty() {
+        let rig = Rig::new("tombstone-unreadable");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let reserved = reserved(&only(&store));
+        assert!(reserved > 0);
+
+        FAIL_REMOVE.with(|f| f.set(true));
+        LEAVE_UNREADABLE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        LEAVE_UNREADABLE.with(|f| f.set(false));
+        assert_eq!(store.kept_bytes(), reserved, "counted as empty");
+
+        // A sweep that fails again over a folder it cannot read keeps it.
+        store.inner.sweep_tombstones();
+        assert_eq!(store.kept_bytes(), reserved, "the sweep forgot the figure");
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// Only a missing manifest marks a removed download. One that is there
+    /// but cannot be read leaves its folder alone.
+    #[tokio::test]
+    async fn an_unreadable_manifest_does_not_get_its_folder_deleted() {
+        let rig = Rig::new("manifest-unreadable");
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files").join("keep"), b"bytes").unwrap();
+        // A directory where the manifest should be: reading it fails with
+        // something other than "not found".
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        let store = rig.open();
+        assert!(dir.join("files").join("keep").exists(), "the folder went");
+        assert!(store.videos("u1").is_empty());
+        let held = lines("pharos: video folder held");
+        assert!(
+            held.len() == 1
+                && held[0].contains("reason=record unreadable")
+                && held[0].contains("admission=blocked"),
+            "{held:?}"
+        );
+        // The folder's bytes count against the cap, though it is not swept,
+        // and nothing is admitted while its record's reservation is lost.
+        assert_eq!(store.kept_bytes(), 5, "the held folder counts for nothing");
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("2")) else {
+            panic!("admitted beside a folder of unknown size");
+        };
+        assert!(why.contains("unknown"), "{why}");
+        assert!(store.size_unknown(), "the host is not told");
+        assert!(dir.join("files").join("keep").exists(), "swept");
+    }
+
+    /// A user folder that cannot be listed hides downloads that may be
+    /// there: nothing is admitted while it stays.
+    #[tokio::test]
+    async fn an_unlistable_user_folder_blocks_admission() {
+        let rig = Rig::new("user-unlistable");
+        let user = rig.dir.join("u9");
+        std::fs::create_dir_all(&user).unwrap();
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        let held = lines("pharos: video folder unlistable");
+        assert!(
+            held.len() == 1 && held[0].contains("admission=blocked"),
+            "{held:?}"
+        );
+        assert!(store.size_unknown(), "the host is not told");
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("1")) else {
+            panic!("admitted beside a folder that cannot be listed");
+        };
+        assert!(why.contains("cannot be listed"), "{why}");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+    }
+
+    /// A store root that is not a folder cannot be listed either; one that
+    /// is not there is an empty store.
+    #[tokio::test]
+    async fn an_unlistable_root_blocks_admission_and_a_missing_one_is_empty() {
+        let rig = Rig::new("root-unlistable");
+        // Missing: an empty store that takes downloads.
+        let store = rig.open();
+        assert!(!store.size_unknown());
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        // A plain file where the root should be.
+        std::fs::remove_dir_all(&rig.dir).unwrap();
+        std::fs::write(&rig.dir, b"x").unwrap();
+        let store = rig.open();
+        assert!(store.size_unknown(), "a root that is a file is not empty");
+        assert!(matches!(
+            store.start(request("2")),
+            Err(KeepVideoRefusal::Host(_))
+        ));
+        std::fs::remove_file(&rig.dir).unwrap();
+    }
+
+    /// An entry that listed but whose lookup then fails is not "not a
+    /// folder": its size is unknown and admission is blocked.
+    // `std::os::unix::fs::symlink` makes the dangling link.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_whose_metadata_fails_after_listing_blocks_admission() {
+        let rig = Rig::new("entry-metadata");
+        let item = rig.dir.join("u9").join("1");
+        std::fs::create_dir_all(&item).unwrap();
+        // The user folder lists; its entry then cannot be looked up.
+        UNLOOKUPABLE.with(|u| u.borrow_mut().push(item.clone()));
+        let store = rig.open();
+        let held = lines("pharos: video folder unlistable");
+        assert!(
+            held.len() == 1 && held[0].contains("admission=blocked"),
+            "{held:?}"
+        );
+        assert!(store.size_unknown(), "dropped from the listing");
+        UNLOOKUPABLE.with(|u| u.borrow_mut().clear());
+        // A dangling link is nothing to list, not an unknown size.
+        std::fs::remove_dir_all(&item).unwrap();
+        std::os::unix::fs::symlink(rig.dir.join("gone"), &item).unwrap();
+        let store = rig.open();
+        assert!(!store.size_unknown(), "a dangling link blocked admission");
+    }
+
+    /// A chunk counts as staged only once its write has completed: with
+    /// the write held pending the bytes are on their way to disk but the
+    /// free-space reading does not lack them yet, so they are still owed.
+    #[tokio::test]
+    async fn a_chunk_is_not_staged_until_its_write_completes() {
+        let rig = Rig::new("pending-write");
+        HOLD_WRITE.with(|h| h.set(true));
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The first chunk is written and held before its flush.
+        let mut waited = 0;
+        loop {
+            let started = std::fs::read_dir(rig.dir.join("u1").join("1").join("files"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    e.path().extension().is_some_and(|x| x == "part")
+                        && e.metadata().is_ok_and(|m| m.len() > 0)
+                });
+            if started {
+                break;
+            }
+            waited += 1;
+            assert!(waited < 2_000, "no write began");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // Give a counted chunk every chance to show.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            matches!(only(&store).state, KeptState::Downloading { .. }),
+            "went on past a write that had not completed: {:?}",
+            only(&store).state
+        );
+        assert_eq!(
+            store.staged_bytes(),
+            0,
+            "counted before the write completed"
+        );
+        HOLD_WRITE.with(|h| h.set(false));
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// A removal whose folder will not delete and cannot be measured whole
+    /// marks the size unknown at once, not at the next sweep.
+    #[tokio::test]
+    async fn a_removal_that_cannot_measure_the_folder_blocks_admission_at_once() {
+        let rig = Rig::new("remove-unmeasured");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        FAIL_REMOVE.with(|f| f.set(true));
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        store.remove("u1", "1");
+        // Straight after, before any sweep.
+        assert!(store.size_unknown(), "known until the next sweep");
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("2")) else {
+            panic!("admitted beside a folder of unknown size");
+        };
+        assert!(why.contains("unknown"), "{why}");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// A removal turns its folder unknown under the lock music admission
+    /// takes, so an admission never trusts a "known" read from before the
+    /// mark with figures from after it; the lock is let go before the
+    /// folder is deleted. The figures the music cache reads come from one
+    /// snapshot that shows the mark.
+    #[tokio::test]
+    async fn a_removal_marks_its_folder_unknown_under_the_admission_lock() {
+        let rig = Rig::new("remove-under-admission");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let held = rig.budget.held.clone();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let s2 = seen.clone();
+        set_hook(&AT_REMOVAL_MARK, move || {
+            s2.set(Some(held.load(Ordering::SeqCst)))
+        });
+        // Read inside the deletion: the admission lock is let go by then.
+        let deleting = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (d2, held2) = (deleting.clone(), rig.budget.held.clone());
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                d2.set(Some(held2.load(Ordering::SeqCst)));
+            }));
+        });
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        clear_hook(&AT_REMOVAL_MARK);
+        assert!(
+            seen.get().is_some_and(|n| n > 0),
+            "the folder turned unknown outside the admission lock: {:?}",
+            seen.get()
+        );
+        assert_eq!(
+            deleting.get(),
+            Some(0),
+            "the admission lock was held while the folder was deleted"
+        );
+        assert_eq!(
+            rig.budget.held.load(Ordering::SeqCst),
+            0,
+            "held through the delete"
+        );
+    }
+
+    /// A removal waits for the admission lock before it takes the saves
+    /// lock, the order a save under admission takes them in: a save made
+    /// while admission is held (as a plan's is) is not blocked by a removal
+    /// waiting on that admission.
+    #[tokio::test]
+    async fn a_removal_takes_admission_before_the_saves_lock() {
+        let rig = Rig::new("remove-lock-order");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        rig.budget.exclusive.store(true, Ordering::SeqCst);
+        let guard = rig.budget.admission_guard();
+        let s2 = store.clone();
+        let removal = std::thread::spawn(move || s2.remove("u1", "1"));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s3 = store.clone();
+        let save = std::thread::spawn(move || {
+            s3.save_position("u1", "1", 5_000);
+            let _ = tx.send(());
+        });
+        let saved = rx.recv_timeout(std::time::Duration::from_secs(3)).is_ok();
+        drop(guard);
+        removal.join().unwrap();
+        save.join().unwrap();
+        rig.budget.exclusive.store(false, Ordering::SeqCst);
+        assert!(
+            saved,
+            "a save under admission waited on a removal holding the saves lock"
+        );
+    }
+
+    /// The process's one log capture, for the tests that read the music
+    /// cache's log: a logger can be installed once per process.
+    fn capture_music_log() -> &'static Mutex<Vec<String>> {
+        struct Capture;
+        static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, r: &log::Record) {
+                LINES.lock().unwrap().push(r.args().to_string());
+            }
+            fn flush(&self) {}
+        }
+        static CAPTURE: Capture = Capture;
+        INSTALL.call_once(|| {
+            assert!(
+                log::set_logger(&CAPTURE).is_ok(),
+                "another logger was installed first"
+            );
+            log::set_max_level(log::LevelFilter::Info);
+        });
+        &LINES
+    }
+
+    /// The phone's registration, run for real on a root where the folder
+    /// cannot be created (a plain file stands there): no store is opened,
+    /// the hook is installed first, on a real `Library`, the way the phone
+    /// installs it, and the music cache refuses a download as
+    /// `outside_size_unknown` rather than counting the video as zero. The
+    /// registration function is `ports::register_video_root`, the code the
+    /// Android crate calls; only its closures (the global hook slot, the
+    /// store's runtime) are the phone's.
+    #[test]
+    fn a_store_that_could_not_be_created_leaves_music_refused() {
+        let rig = Rig::new("no-store");
+        std::fs::create_dir_all(&rig.dir).unwrap();
+        let root = rig.dir.join("video");
+        std::fs::write(&root, b"a file where the folder should be").unwrap();
+        let lines = capture_music_log();
+        let base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let lib = pharos_content::Library::connect_with(
+            &base,
+            &rig.dir.join("token"),
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        static NO_STORE: crate::native::ports::Slot<dyn VideoStore> =
+            crate::native::ports::Slot::new();
+        let once = crate::native::ports::OpenOnce::new();
+        let opened = std::cell::Cell::new(false);
+        let outcome = crate::native::ports::register_video_root(
+            &root,
+            &once,
+            // The phone: `set_outside_used(outside_bytes_hook())` on its
+            // library; here the same hook over a slot of this test's own,
+            // which nothing fills.
+            || lib.set_outside_used(crate::native::ports::outside_bytes_hook_for(&NO_STORE)),
+            || {
+                opened.set(true);
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(outcome, crate::native::ports::Registration::NoFolder(_)),
+            "{outcome:?}"
+        );
+        assert!(!opened.get(), "a store was opened over a file");
+        lib.prefetch(&["track/2".to_owned()]);
+        let mut waited = 0;
+        let refused = loop {
+            let found = lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("reason=outside_size_unknown") && l.contains("track/2"));
+            if found || waited > 5_000 {
+                break found;
+            }
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        assert!(refused, "music was admitted with no video store");
+    }
+
+    /// The whole path of the unknown-size block into music: a real store
+    /// with a subtree it cannot read, registered as the phone registers it,
+    /// the very hook the phone installs (`ports::outside_bytes_hook`), and
+    /// a real music download through `Library`, which the cache refuses
+    /// before any network use.
+    ///
+    /// Stubbed: only the server, one nothing listens on. The phone crate is
+    /// Android-only and cannot host a test; it registers the same hook.
+    #[test]
+    fn music_is_refused_through_the_real_hook_while_a_video_subtree_is_unreadable() {
+        let lines = capture_music_log();
+
+        // A real store, with its root unreadable the way a restart can find it.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rig = Rig::new("music-refused");
+        let user = rig.dir.join("u9");
+        std::fs::create_dir_all(&user).unwrap();
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = {
+            let _enter = rt.enter();
+            rig.open()
+        };
+        assert!(store.size_unknown());
+
+        // The music side: a real Library and cache, the phone's hook.
+        let base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let lib = pharos_content::Library::connect_with(
+            &base,
+            &rig.dir.join("token"),
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        // A slot of this test's own, filled as the phone fills the global.
+        static SLOT: crate::native::ports::Slot<dyn VideoStore> = crate::native::ports::Slot::new();
+        SLOT.set(store.clone()).unwrap();
+        lib.set_outside_used(crate::native::ports::outside_bytes_hook_for(&SLOT));
+        lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        lib.prefetch(&["track/1".to_owned()]);
+        let mut waited = 0;
+        let refused = loop {
+            let found = lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("reason=outside_size_unknown") && l.contains("track/1"));
+            if found {
+                break true;
+            }
+            waited += 1;
+            if waited > 5_000 {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        assert!(
+            refused,
+            "music was not refused: {:?}",
+            lines.lock().unwrap()
+        );
+    }
+
+    /// The car's case end to end: a process that never lists the downloads.
+    /// A held folder whose record reads again is swept by the music cache's
+    /// own size check (a real `Library` download, under the shared admission
+    /// lock, through `ports::outside_bytes` as the phone's hook calls it),
+    /// and the track is admitted, with no `videos()` call. The process-wide
+    /// port slot belongs to another test, so the hook is built over this
+    /// store directly.
+    #[test]
+    fn a_music_download_sweeps_a_readable_held_folder_and_is_admitted() {
+        let music = capture_music_log();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = rt.enter();
+        let (rig, store, good, manifest) = rt.block_on(held_download("music-sweep"));
+
+        let base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let lib = pharos_content::Library::connect_with(
+            &base,
+            &rig.dir.join("token"),
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        let hooked = store.clone();
+        lib.set_outside_used(Arc::new(move || {
+            crate::native::ports::outside_bytes(Some(&*hooked))
+        }));
+        lib.enable_cache(&rig.dir.join("audio"), 1 << 20).unwrap();
+        // Repaired only now, with the sweep made due: the cache's own start
+        // (which runs the hook) cannot have released the folder, so only the
+        // music job's check can.
+        std::fs::write(&manifest, &good).unwrap();
+        assert_eq!(store.unreadable_count(), 1, "released before the job ran");
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let swept = store.inner.host_sweeps.load(Ordering::SeqCst);
+        lib.prefetch(&["track/3".to_owned()]);
+        // Admitted: the job passes `ensure_free` and goes on to resolve the
+        // track (nothing listens, so the resolve is retried).
+        let seen = |want: &str| {
+            music
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("id=track/3") && l.contains(want))
+        };
+        let mut waited = 0;
+        while !seen("reason=resolve") && !seen("reason=outside_size_unknown") && waited < 5_000 {
+            waited += 1;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(lib);
+        assert!(
+            !seen("reason=outside_size_unknown"),
+            "music was refused: {:?}",
+            music.lock().unwrap()
+        );
+        assert!(seen("reason=resolve"), "music was not admitted");
+        assert_eq!(store.unreadable_count(), 0, "the folder is still held");
+        // The job's thread ran the sweep (the log capture is per thread, so
+        // the count is what proves it).
+        assert!(
+            store.inner.host_sweeps.load(Ordering::SeqCst) > swept,
+            "the music job did not start the sweep"
+        );
+    }
+
+    /// A record that cannot be written is refused at the start, and the
+    /// accounting is as it was: nothing runs, the record is gone, and the
+    /// one it replaced is back.
+    #[tokio::test]
+    async fn a_start_whose_record_cannot_be_saved_is_refused_and_rolled_back() {
+        let rig = Rig::new("save-fails");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("1")) else {
+            panic!("started without a durable record");
+        };
+        assert!(why.contains("could not be saved"), "{why}");
+        assert!(store.videos("u1").is_empty(), "the record stayed");
+        assert_eq!(store.kept_bytes(), 0, "its reservation stayed");
+        assert!(rig.server.asked().is_empty(), "a run was started");
+        let line = lines("pharos: video keep refused");
+        assert!(line[0].contains("verdict=rolled_back"), "{line:?}");
+
+        // A failed record the start replaced comes back as it was.
+        std::fs::remove_dir_all(dir.join("manifest.json.part")).unwrap();
+        rig.server.fail(SEG1, &[403]);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let failed = only(&store);
+        assert!(
+            matches!(failed.state, KeptState::Failed { .. }),
+            "{failed:?}"
+        );
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        assert!(store.start(request("1")).is_err());
+        assert_eq!(only(&store), failed, "the replaced record was lost");
+    }
+
+    /// A session end that parks a start's run while its first save is
+    /// failing does not keep the unsaved record: the start is rolled back
+    /// all the same, and nothing is left Downloading with no run.
+    #[tokio::test]
+    async fn a_rollback_still_happens_when_a_sign_out_parked_the_start() {
+        let rig = Rig::new("rollback-parked");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let s2 = store.clone();
+        set_hook(&BEFORE_START_ROLLBACK, move || s2.park_runs(Some("u1")));
+        let first = store.start(request("1"));
+        clear_hook(&BEFORE_START_ROLLBACK);
+        assert!(first.is_err(), "started without a durable record");
+        assert!(
+            store.videos("u1").is_empty(),
+            "the unsaved record stayed: {:?}",
+            store.videos("u1")
+        );
+        assert!(
+            lines("pharos: video keep refused")
+                .iter()
+                .any(|l| l.contains("verdict=rolled_back")),
+            "{:?}",
+            captured()
+        );
+    }
+
+    /// A sign-out and a sign-in that land while a start's first save is
+    /// failing start no run for the unsaved record: the sign-in waits for
+    /// the save, the rollback removes the record, and nothing is left
+    /// writing, with the reservations as they were before the start.
+    #[tokio::test]
+    async fn a_sign_in_before_a_failed_first_save_leaves_no_run() {
+        let rig = Rig::new("rollback-resumed");
+        let store = rig.open();
+        let before = (store.outstanding_bytes(), store.kept_bytes());
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let s2 = store.clone();
+        set_hook(&BEFORE_START_ROLLBACK, move || {
+            s2.park_runs(Some("u1"));
+            s2.resume_user("u1");
+        });
+        let first = store.start(request("1"));
+        clear_hook(&BEFORE_START_ROLLBACK);
+        assert!(first.is_err(), "started without a durable record");
+        assert!(
+            lock(&store.inner.state).runs.is_empty(),
+            "a run is writing for a rolled-back record"
+        );
+        store.settled().await;
+        assert!(store.videos("u1").is_empty());
+        assert_eq!(
+            (store.outstanding_bytes(), store.kept_bytes()),
+            before,
+            "the reservations did not go back"
+        );
+        assert!(
+            lines("pharos: video keep resume item=1")
+                .iter()
+                .any(|l| l.contains("verdict=deferred reason=start_not_saved")),
+            "{:?}",
+            captured()
+        );
+    }
+
+    /// The same sign-in before a first save that succeeds resumes the
+    /// download the sign-out parked: the start runs it again.
+    #[tokio::test]
+    async fn a_sign_in_before_a_saved_first_save_resumes_the_download() {
+        let rig = Rig::new("save-resumed");
+        rig.server.sign_in("u1");
+        let store = rig.open();
+        let s2 = store.clone();
+        set_hook(&BEFORE_FIRST_SAVE, move || {
+            s2.park_runs(Some("u1"));
+            s2.resume_user("u1");
+        });
+        store.start(request("1")).unwrap();
+        clear_hook(&BEFORE_FIRST_SAVE);
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        assert!(
+            lines("pharos: video keep resume item=1")
+                .iter()
+                .any(|l| l.contains("reason=signed_in_before_save")),
+            "{:?}",
+            captured()
+        );
+    }
+
+    /// A sign-in's resume deferred to a start's first save is dropped by a
+    /// sign-out before the save lands: signed out, signed in, signed out,
+    /// then the save succeeds, and no run starts after the sign-out.
+    #[tokio::test]
+    async fn a_sign_out_after_a_deferred_resume_starts_no_run_at_the_save() {
+        let rig = Rig::new("save-resume-dropped");
+        rig.server.sign_in("u1");
+        let store = rig.open();
+        let s2 = store.clone();
+        set_hook(&BEFORE_FIRST_SAVE, move || {
+            s2.park_runs(Some("u1"));
+            s2.resume_user("u1");
+            s2.park_runs(Some("u1"));
+        });
+        store.start(request("1")).unwrap();
+        clear_hook(&BEFORE_FIRST_SAVE);
+        store.settled().await;
+        assert!(
+            !lines("pharos: video keep resume item=1")
+                .iter()
+                .any(|l| l.contains("reason=signed_in_before_save")),
+            "a run started after the sign-out: {:?}",
+            captured()
+        );
+        assert_ne!(only(&store).state, KeptState::Ready);
+        assert!(
+            lines("pharos: video keep resume verdict=dropped reason=session_ended")
+                .iter()
+                .any(|l| l.contains("ended_for=u1")),
+            "{:?}",
+            captured()
+        );
+    }
+
+    /// A removal and a newer start of the same item land while a start's
+    /// failed save is about to be rolled back: the rollback is that start's
+    /// alone, and the newer record survives it.
+    #[tokio::test]
+    async fn a_rollback_leaves_a_newer_start_of_the_same_item_alone() {
+        let rig = Rig::new("rollback-newer");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let newer = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (s2, d2, n2) = (store.clone(), dir.clone(), newer.clone());
+        set_hook(&BEFORE_START_ROLLBACK, move || {
+            std::fs::remove_dir_all(d2.join("manifest.json.part")).unwrap();
+            s2.remove("u1", "1");
+            n2.set(s2.start(request("1")).is_ok());
+        });
+        let first = store.start(request("1"));
+        clear_hook(&BEFORE_START_ROLLBACK);
+        assert!(first.is_err(), "started without a durable record");
+        assert!(newer.get(), "the newer start was refused");
+        assert_eq!(
+            store.videos("u1").len(),
+            1,
+            "the rollback took the newer record"
+        );
+        assert!(
+            lines("pharos: video keep refused")
+                .iter()
+                .any(|l| l.contains("verdict=superseded_left_alone")),
+            "{:?}",
+            captured()
+        );
+        store.settled().await;
+        assert_eq!(
+            only(&store).state,
+            KeptState::Ready,
+            "the newer download did not run"
+        );
+    }
+
+    /// A change whose save fails is kept in memory and the error comes
+    /// back, so a caller can tell the record is not durable.
+    #[tokio::test]
+    async fn an_update_whose_save_fails_reports_it_and_keeps_the_change() {
+        let rig = Rig::new("update-save-fails");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        let saved = store.inner.update("u1", "1", |v| v.position_ms = 4_200);
+        assert!(saved.is_err(), "a failed save went unreported");
+        assert_eq!(only(&store).position_ms, 4_200, "the change was undone");
+        assert!(!lines("pharos: video record not saved").is_empty());
+        // Gone is not a failure.
+        assert!(matches!(
+            store.inner.update("u1", "nope", |_| {}),
+            Ok(false)
+        ));
+        // Once the disk is well again the next save writes it.
+        std::fs::remove_dir_all(dir.join("manifest.json.part")).unwrap();
+        assert!(matches!(store.inner.update("u1", "1", |_| {}), Ok(true)));
+        drop(store);
+        assert_eq!(rig.open().videos("u1")[0].position_ms, 4_200);
+    }
+
+    /// An admission made while a chunk's write is pending: the pending
+    /// bytes are not on the disk's books yet, so the first download still
+    /// owes them and a second that fits only if they were counted as
+    /// already written is refused.
+    #[tokio::test]
+    async fn an_admission_during_a_pending_write_still_counts_those_bytes_as_owed() {
+        let rig = Rig::new("pending-admission");
+        let estimate = estimate_bytes(2_000_000, 12_000);
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The first download is admitted and parked in SEG0 with 50 staged.
+        // (Everything else stored whole: a playlist's first half can also
+        // be 50 staged for an instant.)
+        let stored = (MASTER.len() + MEDIA.len() + 10 + 100) as u64;
+        let mut waited = 0;
+        loop {
+            let bytes = match store.videos("u1").first().map(|v| v.state.clone()) {
+                Some(KeptState::Downloading { bytes, .. }) => bytes,
+                _ => 0,
+            };
+            if bytes == stored && store.staged_bytes() == 50 {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "bytes={bytes} staged={}",
+                store.staged_bytes()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // From here its writes are held pending after `write_all`.
+        HOLD_ITEM.with(|h| *h.borrow_mut() = Some("1".to_owned()));
+        release.store(true, Ordering::SeqCst);
+        let mut waited = 0;
+        loop {
+            let pending = std::fs::read_dir(rig.dir.join("u1").join("1").join("files"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| {
+                    e.path().extension().is_some_and(|x| x == "part")
+                        && e.metadata().is_ok_and(|m| m.len() > 50)
+                });
+            if pending {
+                break;
+            }
+            waited += 1;
+            assert!(waited < 2_000, "no pending write");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(store.staged_bytes(), 50, "the pending bytes were staged");
+
+        // Room for a second film only if the pending bytes were not owed:
+        // one byte short with them owed.
+        // The owed figure worked out from the plan, not read from the
+        // store: whole files stored and the 50 staged, nothing pending.
+        let owed = estimate - stored - 50;
+        // The second's playlists are on disk when its plan is admitted: it
+        // needs room for the rest of its estimate.
+        let second_needs = estimate - (MASTER.len() + MEDIA.len()) as u64;
+        rig.budget
+            .free
+            .store(owed + second_needs + FREE_GUARD_BYTES - 1, Ordering::SeqCst);
+        store.start(request("2")).unwrap();
+        // The pending write stays held until the second's plan is decided.
+        let second = plan_decided(&store, "2").await;
+        HOLD_ITEM.with(|h| *h.borrow_mut() = None);
+        let KeptState::Failed { reason } = &second.state else {
+            panic!("admitted on room the pending write still owes: {second:?}");
+        };
+        assert!(reason.contains("guard"), "{reason}");
+        store.settled().await;
+    }
+
+    /// While a removed download's folder is being deleted and measured its
+    /// size is not known: an admission in that window is refused, not let
+    /// through on a reservation that is only an estimate.
+    #[tokio::test]
+    async fn an_admission_while_a_folder_is_being_removed_is_refused() {
+        let rig = Rig::new("remove-window");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (s2, seen2) = (store.clone(), seen.clone());
+        // Read inside the deletion, where no start can run (the removal
+        // holds the saves lock a start's save would wait on): the state
+        // every admission reads.
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                seen2.set(Some((
+                    s2.size_unknown(),
+                    lock(&s2.inner.state).unknown_folder(),
+                )));
+            }));
+        });
+        store.remove("u1", "1");
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        let (unknown, refusal) = seen.take().unwrap();
+        assert!(unknown, "known while the folder was being deleted");
+        assert!(
+            matches!(refusal, Some(KeepVideoRefusal::Host(_))),
+            "{refusal:?}"
+        );
+        // Once it is gone the block lifts.
+        assert!(!store.size_unknown(), "still blocked after the removal");
+    }
+
+    /// Ready is seen only once it is on disk: a `videos()` read while the
+    /// Ready record is being saved still shows the download as running.
+    #[tokio::test]
+    async fn ready_is_not_visible_until_its_record_is_saved() {
+        let rig = Rig::new("ready-after-save");
+        let store = rig.open();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (s2, seen2) = (store.clone(), seen.clone());
+        DURING_SAVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move |saving: &KeptVideo| {
+                if saving.ready() {
+                    seen2
+                        .borrow_mut()
+                        .push(s2.videos("u1").iter().any(KeptVideo::ready));
+                }
+            }));
+        });
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        DURING_SAVE.with(|d| *d.borrow_mut() = None);
+        assert_eq!(
+            *seen.borrow(),
+            vec![false],
+            "Ready seen before it was saved"
+        );
+        assert!(only(&store).ready(), "never became Ready");
+        // And the disk agrees: a reopen finds it Ready.
+        drop(store);
+        assert!(only(&rig.open()).ready());
+    }
+
+    /// A download whose terminal record cannot be saved is not reported
+    /// Ready: that would resume at the next open. It is reported failed,
+    /// with the save error as the reason, and no success is logged.
+    /// The item folder's sync after the Ready record's rename fails, and the
+    /// Failed record that should replace it cannot be written either: the
+    /// Ready record stays on disk. It is adopted as Ready at a restart, and
+    /// that is right: every file it names was synced before its rename and
+    /// the files' folder was synced before the record was written, so every
+    /// file it names is there and whole.
+    #[tokio::test]
+    async fn a_ready_record_left_by_a_failed_item_sync_serves_whole_files_after_a_restart() {
+        const EIO: i32 = 5;
+        let rig = Rig::new("ready-left-unsynced");
+        let dir = rig.dir.join("u1").join("1");
+        let store = rig.open();
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = Some(("1".to_owned(), EIO, 2)));
+        let block = dir.join("manifest.json.part");
+        let blocker = block.clone();
+        DURING_SAVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move |v: &KeptVideo| {
+                // The Failed rewrite after the failed sync cannot be written.
+                if matches!(v.state, KeptState::Failed { .. }) {
+                    let _ = std::fs::create_dir_all(&blocker);
+                }
+            }));
+        });
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        DURING_SAVE.with(|d| *d.borrow_mut() = None);
+        DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = None);
+        assert!(
+            matches!(only(&store).state, KeptState::Failed { .. }),
+            "{:?}",
+            only(&store).state
+        );
+        std::fs::remove_dir_all(&block).unwrap();
+        drop(store);
+        let reopened = rig.open();
+        let v = only(&reopened);
+        assert_eq!(
+            v.state,
+            KeptState::Ready,
+            "the Ready record on disk was not adopted"
+        );
+        let served = rig.server.files.lock().unwrap().clone();
+        for key in &v.files {
+            let stored = reopened
+                .stored_file("u1", key)
+                .expect("a named file is not served");
+            let on_disk = std::fs::read(&stored.path).unwrap();
+            assert_eq!(Some(&on_disk), served.get(key), "{key} is not whole");
+        }
+    }
+
+    /// A Ready record whose named file is a folder on disk is not taken
+    /// as Ready at a reopen: the file is not whole, so the download resumes.
+    #[tokio::test]
+    async fn a_ready_record_naming_a_folder_resumes_at_reopen() {
+        let rig = Rig::new("ready-names-folder");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        drop(store);
+        let seg = rig
+            .dir
+            .join("u1")
+            .join("1")
+            .join("files")
+            .join(file_name(SEG1));
+        std::fs::remove_file(&seg).unwrap();
+        std::fs::create_dir(&seg).unwrap();
+        std::fs::write(seg.join("inner"), b"x").unwrap();
+        let reopened = rig.open();
+        assert_ne!(
+            only(&reopened).state,
+            KeptState::Ready,
+            "a folder was taken for a whole file"
+        );
+        // The resume's own inventory does not take the folder for the
+        // segment either: with the folder still in its place, the download
+        // cannot finish.
+        reopened.settled().await;
+        assert!(seg.is_dir(), "a whole segment replaced the folder");
+        assert_ne!(
+            only(&reopened).state,
+            KeptState::Ready,
+            "the resume took the folder for a whole segment"
+        );
+    }
+
+    /// An interrupted download whose master playlist is gone resumes
+    /// under a shared cap its reservation and music already fill: the
+    /// playlist's allowance comes out of the reservation's unused share, and
+    /// the cap is asked only for any shortfall (none here).
+    #[tokio::test]
+    async fn a_resume_takes_a_missing_playlists_allowance_from_its_own_reservation() {
+        const GIB: u64 = 1 << 30;
+        let rig = Rig::new("resume-playlist-own");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let dir = rig.dir.join("u1").join("1");
+        let manifest = dir.join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 3,
+            total: 5,
+            bytes: 1,
+        };
+        v.estimated_bytes = 3 * GIB;
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::remove_file(dir.join("files").join(file_name(MASTER_KEY))).unwrap();
+        std::fs::remove_file(dir.join("files").join(file_name(SEG1))).unwrap();
+        rig.budget.cap.store(4 * GIB, Ordering::SeqCst);
+        rig.budget.other.store(GIB, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        let reserved = lines("pharos: video playlist reserved item=1");
+        assert!(
+            reserved
+                .iter()
+                .any(|l| l.contains("extended=0 from_own=256 ") && l.contains(" taken=0 ")),
+            "{reserved:?}"
+        );
+    }
+
+    /// A body that fails mid-way while the music side is checking its room:
+    /// the music check reads the video's owed bytes, then the free space,
+    /// under the shared admission lock. The failed file's deletion and its
+    /// accounting rollback wait for that check, so the check never sees the
+    /// staged bytes freed on disk while still counting them as written.
+    #[tokio::test]
+    async fn a_mid_body_failure_cleans_up_outside_a_music_check() {
+        let rig = Rig::new("mid-fail-locked");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![3; 2_000_000]);
+        rig.budget.exclusive.store(true, Ordering::SeqCst);
+        let release = rig.server.fail_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        // The other files are stored first, so only the held body moves the
+        // figures from here.
+        let start = std::time::Instant::now();
+        while [INIT, SEG1]
+            .iter()
+            .any(|k| store.indexed_file("u1", k).is_none())
+        {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "the other files never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let files = rig.dir.join("u1").join("1").join("files");
+        // The held body's own staging file.
+        let seg = file_name(SEG0);
+        let stem = Path::new(&seg)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let part = std::fs::read_dir(&files)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with(&stem) && name.ends_with(".part")
+            })
+            .expect("no staging file");
+        // The music check, on its own thread: the owed figure, then (after
+        // the failure has had time to clean up) the free-space probe.
+        let (budget, s2, p2, r2) = (
+            rig.budget.clone(),
+            store.clone(),
+            part.clone(),
+            release.clone(),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let check = std::thread::spawn(move || {
+            let guard = budget.admission_guard();
+            let owed = s2.outstanding_bytes();
+            r2.store(true, Ordering::SeqCst);
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let probe = (s2.outstanding_bytes(), p2.exists());
+            drop(guard);
+            (owed, probe)
+        });
+        rx.recv().unwrap();
+        store.settled().await;
+        let (owed, (owed_at_probe, part_at_probe)) = check.join().unwrap();
+        assert!(
+            part_at_probe,
+            "the staging file went inside the music check"
+        );
+        assert_eq!(
+            owed_at_probe, owed,
+            "the owed figure moved inside the music check"
+        );
+        assert!(!part.exists(), "the staging file was kept");
+        let dropped = lines("pharos: video keep staging dropped item=1 reason=body_failed");
+        assert!(
+            dropped.iter().any(|l| l.contains("under=admission_lock")),
+            "{dropped:?}"
+        );
+        rig.budget.exclusive.store(false, Ordering::SeqCst);
+    }
+
+    /// A run revoked mid-body stops at its next chunk, and its staging file
+    /// goes through the same locked cleanup as every other failure: the
+    /// deletion and the rollback wait for a music check that holds the
+    /// shared admission lock.
+    #[tokio::test]
+    async fn a_revoked_runs_staging_file_goes_outside_a_music_check() {
+        let rig = Rig::new("revoked-locked");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![3; 2_000_000]);
+        rig.budget.exclusive.store(true, Ordering::SeqCst);
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        // The other files are stored first, so the held body is the only
+        // fetch the revocation meets.
+        let start = std::time::Instant::now();
+        while [INIT, SEG1]
+            .iter()
+            .any(|k| store.indexed_file("u1", k).is_none())
+        {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "the other files never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let files = rig.dir.join("u1").join("1").join("files");
+        let seg = file_name(SEG0);
+        let stem = Path::new(&seg)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let part = std::fs::read_dir(&files)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                let name = p.file_name().unwrap().to_string_lossy();
+                name.starts_with(&stem) && name.ends_with(".part")
+            })
+            .expect("no staging file");
+        // The music check, on its own thread. Inside it the run is revoked
+        // and the body released: the fetch meets the ownership check at its
+        // next chunk while the check still holds the lock.
+        let (budget, s2, p2) = (rig.budget.clone(), store.clone(), part.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let check = std::thread::spawn(move || {
+            let guard = budget.admission_guard();
+            {
+                let mut st = lock(&s2.inner.state);
+                let key = ("u1".to_owned(), "1".to_owned());
+                let run = st.runs[&key];
+                st.runs.insert(key, run + 1_000);
+            }
+            release.store(true, Ordering::SeqCst);
+            tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let probe = p2.exists();
+            drop(guard);
+            probe
+        });
+        rx.recv().unwrap();
+        // Awaited, not joined: the fetch runs on this test's runtime.
+        while !check.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let part_at_probe = check.join().unwrap();
+        assert!(
+            part_at_probe,
+            "the staging file went inside the music check"
+        );
+        let start = std::time::Instant::now();
+        while part.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "the staging file was kept"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let dropped = lines("pharos: video keep staging dropped item=1 reason=revoked");
+            if dropped.iter().any(|l| l.contains("under=admission_lock")) {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "{dropped:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        rig.budget.exclusive.store(false, Ordering::SeqCst);
+    }
+
+    /// Outside diff kvd:858 (review 5995575621): a download parked by a
+    /// session end, with no run and no writer, owes no pending write: its
+    /// reservation stays kept, but it does not take free space from another
+    /// user's admission.
+    #[tokio::test]
+    async fn a_parked_download_owes_no_pending_write() {
+        let rig = Rig::new("parked-not-owed");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        assert!(
+            store.outstanding_bytes() > 0,
+            "a running download owed nothing"
+        );
+        let kept = store.kept_bytes();
+        store.park_runs(Some("u1"));
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Downloading { .. }));
+        assert_eq!(store.outstanding_bytes(), 0, "a parked download was owed");
+        assert_eq!(
+            store.kept_bytes(),
+            kept,
+            "the parked reservation left the cap"
+        );
+    }
+
+    /// A session end parks the ended user's running download (another
+    /// user's run goes on): it stops fetching, its record stays Downloading
+    /// with its files. It runs again, to Ready, when its user signs in.
+    #[tokio::test]
+    async fn a_session_end_parks_the_users_runs_and_a_sign_in_resumes_them() {
+        let rig = Rig::new("session-park");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        store.park_runs(Some("u2"));
+        assert_eq!(
+            lock(&store.inner.state).runs.len(),
+            1,
+            "parked another user's run"
+        );
+        store.park_runs(Some("u1"));
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(lock(&store.inner.state).runs.is_empty());
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Downloading { .. }), "{v:?}");
+        assert!(store.stored_file("u1", SEG0).is_none());
+        let parked = lines("pharos: video keep parked item=1");
+        assert!(
+            parked.iter().any(|l| l.contains("reason=session_ended")),
+            "{parked:?}"
+        );
+        store.resume_user("u2");
+        assert!(
+            lock(&store.inner.state).runs.is_empty(),
+            "resumed for another user"
+        );
+        store.resume_user("u1");
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let resumed = lines("pharos: video keep resume item=1");
+        assert!(
+            resumed.iter().any(|l| l.contains("reason=signed_in")),
+            "{resumed:?}"
+        );
+    }
+
+    /// A parked run stalled mid-body still has its staging file on disk
+    /// when a sign-in resumes the download at once. Until that writer has
+    /// stopped, its bytes count against the cap, and the new run writes
+    /// nothing over them: the two never hold more than one reservation.
+    #[tokio::test]
+    async fn a_resume_waits_for_a_parked_runs_writer_and_counts_its_bytes() {
+        let rig = Rig::new("park-resume-drain");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![3; 2_000_000]);
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let reserved = only(&store).estimated_bytes;
+        until_within(|| store.staged_bytes() == 1_000_000).await;
+        // The held body must be the run's only work left. A file of the run
+        // still being fetched when the park lands sees the revocation, the
+        // run stops, and the held fetch is dropped with its staging file:
+        // there is then no writer to drain, and nothing to count.
+        until_within(|| {
+            store.indexed_file("u1", INIT).is_some() && store.indexed_file("u1", SEG1).is_some()
+        })
+        .await;
+        store.park_runs(Some("u1"));
+        store.resume_user("u1");
+        let asked = rig.server.asked().len();
+        // The new run is under way while the old writer is held.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            store.kept_bytes(),
+            reserved + 1_000_000,
+            "the parked writer's staged bytes were not counted"
+        );
+        assert_eq!(
+            rig.server.asked().len(),
+            asked,
+            "the new run fetched over the parked writer's bytes"
+        );
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let waited = lines("pharos: video keep waiting item=1");
+        assert!(
+            waited
+                .iter()
+                .any(|l| l.contains("reason=revoked_writer_running")),
+            "{waited:?}"
+        );
+    }
+
+    /// A sign-in that lands right after a fetch was refused the
+    /// credentials, before the run used to mark itself parking, is kept:
+    /// the download resumes once the run has parked.
+    #[tokio::test]
+    async fn a_sign_in_right_after_the_refusal_resumes_the_download() {
+        let rig = Rig::new("sign-in-at-refusal");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        rig.server.sign_in("u2");
+        let (s1, server, once) = (
+            store.clone(),
+            rig.server.clone(),
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
+        set_hook(&BEFORE_PARK_MARK, move || {
+            if !once.replace(true) {
+                server.sign_in("u1");
+                s1.resume_user("u1");
+            }
+        });
+        later.store(true, Ordering::SeqCst);
+        until_within(|| !lines("pharos: video keep parked item=1").is_empty()).await;
+        store.settled().await;
+        clear_hook(&BEFORE_PARK_MARK);
+        until_within(|| only(&store).state == KeptState::Ready).await;
+    }
+
+    /// Review 5987746170 (kept_video_disk.rs:2137): a run that lost its item
+    /// between the refusal and the parking mark (removed meanwhile) marks
+    /// nothing parking: it stops as gone, and no stale mark is left.
+    #[tokio::test]
+    async fn a_run_that_lost_its_item_before_the_park_mark_marks_nothing() {
+        let rig = Rig::new("park-mark-gone");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        rig.server.sign_in("u2");
+        let (s1, once) = (store.clone(), std::rc::Rc::new(std::cell::Cell::new(false)));
+        set_hook(&BEFORE_PARK_MARK, move || {
+            if !once.replace(true) {
+                s1.remove("u1", "1");
+            }
+        });
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        clear_hook(&BEFORE_PARK_MARK);
+        assert!(
+            !lock(&store.inner.state)
+                .parking
+                .contains_key(&("u1".to_owned(), "1".to_owned())),
+            "a run that no longer owns the item marked it parking"
+        );
+        assert!(!lines("pharos: video keep park verdict=gone item=1").is_empty());
+    }
+
+    /// The same for a refusal at promotion: a segment fetched whole under
+    /// its owner's token, then refused by `check_owner` because another
+    /// user's token went on file meanwhile, parks; a sign-in after that
+    /// refusal and before the run exits is kept, and the download resumes.
+    #[tokio::test]
+    async fn a_sign_in_after_a_promotion_refusal_resumes_the_download() {
+        let rig = Rig::new("sign-in-at-promotion-refusal");
+        rig.server.sign_in("u1");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        rig.server.sign_in("u2");
+        let (s1, server, once) = (
+            store.clone(),
+            rig.server.clone(),
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
+        set_hook(&BEFORE_PARK_MARK, move || {
+            if !once.replace(true) {
+                server.sign_in("u1");
+                s1.resume_user("u1");
+            }
+        });
+        mid.store(true, Ordering::SeqCst);
+        until_within(|| !lines("pharos: video keep parked item=1").is_empty()).await;
+        store.settled().await;
+        clear_hook(&BEFORE_PARK_MARK);
+        let refused = lines("pharos: video keep promote verdict=refused item=1");
+        assert!(
+            !refused.is_empty(),
+            "the refusal did not come from promotion: {:?}",
+            lines("pharos: video keep fetch verdict=refused item=1")
+        );
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let pending = lines("pharos: video keep resume item=1");
+        assert!(
+            pending.iter().any(|l| l.contains("verdict=pending")),
+            "{pending:?}"
+        );
+    }
+
+    /// A run that parks before its plan gives back the playlist allowance it
+    /// did not use: with room for two allowances only, a download refused
+    /// the credentials at its media playlist resumes and reserves that
+    /// playlist again, rather than being refused over the first run's
+    /// unused share.
+    #[tokio::test]
+    async fn a_run_parked_before_its_plan_gives_back_unused_playlist_allowances() {
+        let rig = Rig::new("park-releases-allowance");
+        rig.server.sign_in("u1");
+        rig.budget
+            .cap
+            .store(2 * PLAYLIST_MAX_BYTES + 120, Ordering::SeqCst);
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        rig.server.sign_in("u2");
+        later.store(true, Ordering::SeqCst);
+        until_within(|| !lines("pharos: video keep parked item=1").is_empty()).await;
+        store.settled().await;
+        let after_park = only(&store).estimated_bytes;
+        assert!(
+            after_park < 2 * PLAYLIST_MAX_BYTES,
+            "the unused allowance stayed reserved: {after_park}"
+        );
+        rig.server.sign_in("u1");
+        store.resume_user("u1");
+        store.settled().await;
+        let reserved = lines("pharos: video playlist reserved item=1");
+        assert!(
+            reserved.iter().filter(|l| l.contains("main.m3u8")).count() >= 2,
+            "the media playlist was not reserved again: {reserved:?} {:?}",
+            captured()
+        );
+    }
+
+    /// A stale run that ends before its plan gives allowances back only on
+    /// the record it took them from: after a removal and a new start that
+    /// went on to Ready, its exit leaves the replacement's reservation
+    /// alone.
+    #[tokio::test]
+    async fn a_stale_run_leaves_a_replacement_records_reservation_alone() {
+        let rig = Rig::new("park-replacement-allowance");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        store.park_runs(Some("u1"));
+        store.remove("u1", "1");
+        store.start(request("1")).unwrap();
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let before = only(&store).estimated_bytes;
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(
+            only(&store).estimated_bytes,
+            before,
+            "the stale run changed the replacement's reservation: {:?}",
+            captured()
+        );
+    }
+
+    /// A stale run gives allowances back only while no other run has taken
+    /// its record since: after a sign-out and a resume of the same record
+    /// that went on to Ready, the old run's late exit leaves the Ready
+    /// record's reservation alone.
+    #[tokio::test]
+    async fn a_stale_run_leaves_a_resumed_records_reservation_alone() {
+        let rig = Rig::new("park-resume-allowance");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        store.park_runs(Some("u1"));
+        store.resume_user("u1");
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let before = only(&store).estimated_bytes;
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(
+            only(&store).estimated_bytes,
+            before,
+            "the stale run changed the resumed record's reservation: {:?}",
+            captured()
+        );
+    }
+
+    /// Outside-diff item kept_video_disk.rs:2478: a playlist renamed into
+    /// place before the plan is counted as landed, not staged, in the same
+    /// hold as the rename. A reader between the rename and the staging
+    /// guard's drop (a park and resume settling the run's allowance) sees
+    /// its bytes once, as landed.
+    #[tokio::test]
+    async fn a_promoted_playlist_is_landed_in_the_hold_that_renames_it() {
+        let rig = Rig::new("promote-landed");
+        let seen: std::rc::Rc<RefCell<Option<(u64, u64, u64)>>> = std::rc::Rc::default();
+        let s2 = seen.clone();
+        AFTER_PROMOTE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |st, who, len| {
+                *s2.borrow_mut() = Some((
+                    st.playlists_landed.get(who).copied().unwrap_or(0),
+                    st.staged.get(who).copied().unwrap_or(0),
+                    len,
+                ));
+            }));
+        });
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let (landed, staged, len) = seen.borrow().expect("no file was promoted");
+        assert_eq!(
+            (landed, staged),
+            (len, 0),
+            "counted as staged after its rename"
+        );
+    }
+
+    /// A sign-in that resumes a record whose parked run still holds playlist
+    /// allowances settles them before it claims the record: the record is
+    /// back to its reservation before them plus the playlists that landed,
+    /// and the parked run's late exit has nothing left to release.
+    #[tokio::test]
+    async fn a_resume_settles_a_parked_runs_playlist_allowances_before_its_claim() {
+        let rig = Rig::new("resume-settles-allowance");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        let old = lock(&store.inner.state)
+            .runs
+            .get(&("u1".to_owned(), "1".to_owned()))
+            .copied()
+            .unwrap();
+        let who = ("u1".to_owned(), "1".to_owned(), old);
+        let (base, landed) = {
+            let st = lock(&store.inner.state);
+            (
+                st.playlists_base
+                    .get(&who)
+                    .map(|b| b.0)
+                    .expect("no allowance taken"),
+                st.playlists_landed.get(&who).copied().unwrap_or(0),
+            )
+        };
+        let inflated = only(&store).estimated_bytes;
+        assert!(
+            inflated > base.saturating_add(landed),
+            "no allowance outstanding"
+        );
+        store.park_runs(Some("u1"));
+        store.resume_user("u1");
+        {
+            let st = lock(&store.inner.state);
+            assert!(
+                !st.playlists_taken.contains_key(&who),
+                "the parked run kept its allowance"
+            );
+            assert!(!st.playlists_base.contains_key(&who));
+        }
+        assert_eq!(
+            only(&store).estimated_bytes,
+            base.saturating_add(landed).min(inflated),
+            "the parked run's allowance still counts after the claim"
+        );
+        assert!(!lines("pharos: video playlist allowance released item=1").is_empty());
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// CR outside-diff kept_video_disk.rs:5165: a parked run whose
+    /// playlist writer is still going keeps its allowance through the
+    /// claim, since the write may still land in it. With no writer it is
+    /// released at once (the test above).
+    #[tokio::test]
+    async fn a_parked_runs_allowance_stays_reserved_while_its_writer_runs() {
+        let rig = Rig::new("resume-keeps-writer-allowance");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        let old = lock(&store.inner.state)
+            .runs
+            .get(&("u1".to_owned(), "1".to_owned()))
+            .copied()
+            .unwrap();
+        let who = ("u1".to_owned(), "1".to_owned(), old);
+        let inflated = only(&store).estimated_bytes;
+        // A playlist write of the old run, still pending.
+        *lock(&store.inner.state)
+            .writers
+            .entry(who.clone())
+            .or_default() += 1;
+        store.park_runs(Some("u1"));
+        store.resume_user("u1");
+        assert_eq!(
+            only(&store).estimated_bytes,
+            inflated,
+            "a running writer's allowance was released"
+        );
+        assert!(lock(&store.inner.state).playlists_taken.contains_key(&who));
+        assert!(
+            lines("pharos: video playlist allowance kept item=1 run=")
+                .iter()
+                .any(|l| l.contains("reason=writer_running")),
+            "the kept allowance was not logged"
+        );
+        lock(&store.inner.state).writers.remove(&who);
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// Outside diff kvd:726-733 (review 5995575621): a parked run's
+    /// allowance kept for its running writer is handed to the new run's
+    /// record by the claim. Once that writer stops and the parked run
+    /// ends, before the new run reserves a playlist, what it did not use
+    /// is given back on that record. The control: a new run that has
+    /// reserved one keeps the record as it is.
+    #[tokio::test]
+    async fn a_handed_over_allowance_is_released_once_its_writer_stops() {
+        for reserved in [false, true] {
+            let rig = Rig::new(if reserved {
+                "handover-replacement-reserved"
+            } else {
+                "handover-release"
+            });
+            rig.server.sign_in("u1");
+            let later = rig.server.slow_first_open(MEDIA_KEY);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            rig.server.asked_times(MEDIA_KEY, 1).await;
+            let key = ("u1".to_owned(), "1".to_owned());
+            let old = lock(&store.inner.state).runs.get(&key).copied().unwrap();
+            let who = ("u1".to_owned(), "1".to_owned(), old);
+            let base = lock(&store.inner.state).playlists_base.get(&who).unwrap().0;
+            let inflated = only(&store).estimated_bytes;
+            assert!(inflated > base, "the old run took no allowance");
+            *lock(&store.inner.state)
+                .writers
+                .entry(who.clone())
+                .or_default() += 1;
+            store.park_runs(Some("u1"));
+            // The claim a sign-in's resume makes, without starting the run.
+            let new = lock(&store.inner.state).claim_parked("u1", "1");
+            assert_eq!(only(&store).estimated_bytes, inflated);
+            if reserved {
+                lock(&store.inner.state)
+                    .playlists_taken
+                    .insert(("u1".to_owned(), "1".to_owned(), new), (0, 1));
+            }
+            lock(&store.inner.state).writers.remove(&who);
+            later.store(true, Ordering::SeqCst);
+            store.settled().await;
+            let now = only(&store).estimated_bytes;
+            if reserved {
+                assert_eq!(now, inflated, "the replacement's reservation was cut");
+                assert!(lines("pharos: video playlist allowance kept item=1")
+                    .iter()
+                    .any(|l| l.contains("reason=replacement_reserved")));
+            } else {
+                assert!(now < inflated, "the handed-over allowance stayed reserved");
+                assert!(now >= base);
+                assert!(lines("pharos: video playlist allowance released item=1")
+                    .iter()
+                    .any(|l| l.contains("reason=writer_stopped_after_handover")));
+            }
+        }
+    }
+
+    /// Outside diff kept_video_disk.rs:4204-4209 (review 5997638687): the
+    /// parked run A is held (its writer still running, as in a retry's
+    /// backoff) while the run it handed its allowance to admits its plan
+    /// and is Ready. A's exit then leaves the new reservation as it is.
+    #[tokio::test]
+    async fn a_handover_ends_once_the_replacement_admits_its_plan() {
+        let rig = Rig::new("handover-admitted");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        let key = ("u1".to_owned(), "1".to_owned());
+        let old = lock(&store.inner.state).runs.get(&key).copied().unwrap();
+        let who = ("u1".to_owned(), "1".to_owned(), old);
+        *lock(&store.inner.state)
+            .writers
+            .entry(who.clone())
+            .or_default() += 1;
+        store.park_runs(Some("u1"));
+        let new = lock(&store.inner.state).claim_parked("u1", "1");
+        // The replacement admits its plan while A is held.
+        let full = only(&store).estimated_bytes.saturating_mul(4);
+        let plan = Plan {
+            files: Vec::new(),
+            estimate: full,
+            total: 0,
+            stored: 0,
+            stale: 0,
+        };
+        let check = Check::Resume {
+            other: 0,
+            cap: u64::MAX,
+            ready: true,
+            unknown: false,
+        };
+        assert!(store.inner.admit("u1", "1", new, &plan, check, 0).is_ok());
+        assert_eq!(only(&store).estimated_bytes, full);
+        assert!(
+            lines("pharos: video playlist allowance handover verdict=invalidated item=1")
+                .iter()
+                .any(|l| l.contains("reason=replacement_admitted"))
+        );
+        lock(&store.inner.state).writers.remove(&who);
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            !lock(&store.inner.state).playlists_base.contains_key(&who),
+            "the held run never exited"
+        );
+        assert_eq!(
+            only(&store).estimated_bytes,
+            full,
+            "the exiting run cut the replacement's reservation"
+        );
+    }
+
+    /// A download removed and started again between a sign-in's pick and
+    /// its start keeps its new run: the resume's claim was revoked by the
+    /// removal, so the stale resume never overwrites the replacement's id.
+    #[tokio::test]
+    async fn a_restart_after_a_resumes_pick_keeps_its_own_run() {
+        let rig = Rig::new("resume-pick-race");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        store.park_runs(Some("u1"));
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(lock(&store.inner.state).runs.is_empty());
+        let key = ("u1".to_owned(), "1".to_owned());
+        let (s1, k1) = (store.clone(), key.clone());
+        let replaced: std::rc::Rc<std::cell::Cell<Option<u64>>> = std::rc::Rc::default();
+        let r1 = replaced.clone();
+        set_hook(&AFTER_RESUME_PICK, move || {
+            if r1.get().is_none() {
+                s1.remove("u1", "1");
+                s1.start(request("1")).unwrap();
+                r1.set(lock(&s1.inner.state).runs.get(&k1).copied());
+            }
+        });
+        store.resume_user("u1");
+        clear_hook(&AFTER_RESUME_PICK);
+        let replacement = replaced.get().expect("the restart claimed no run");
+        assert_eq!(
+            lock(&store.inner.state).runs.get(&key).copied(),
+            Some(replacement),
+            "the stale resume took the replacement's download"
+        );
+        store.settled().await;
+        until_within(|| only(&store).state == KeptState::Ready).await;
+    }
+
+    /// A sign-in that lands after a fetch was refused the credentials, but
+    /// before the refused run has given up its id, is not lost: the run
+    /// starts the new one as it leaves, and the download completes.
+    #[tokio::test]
+    async fn a_sign_in_while_a_run_is_parking_resumes_it() {
+        let rig = Rig::new("sign-in-while-parking");
+        rig.server.sign_in("u1");
+        let later = rig.server.slow_first_open(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        rig.server.sign_in("u2");
+        let (s1, server, once) = (
+            store.clone(),
+            rig.server.clone(),
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
+        set_hook(&BEFORE_RUN_EXIT, move || {
+            if !once.replace(true) {
+                server.sign_in("u1");
+                s1.resume_user("u1");
+            }
+        });
+        later.store(true, Ordering::SeqCst);
+        until_within(|| !lines("pharos: video keep parked item=1").is_empty()).await;
+        store.settled().await;
+        clear_hook(&BEFORE_RUN_EXIT);
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        let pending = lines("pharos: video keep resume item=1");
+        assert!(
+            pending
+                .iter()
+                .any(|l| l.contains("verdict=pending reason=run_parking")),
+            "{pending:?}"
+        );
+    }
+
+    /// A remeasure whose folder changed while it walked (a retry started
+    /// and wrote) does not lift the block with the old walk, and a second
+    /// sweep meanwhile leaves the claimed folder alone. Once nothing
+    /// changes under a walk, the folder recovers.
+    #[tokio::test]
+    async fn a_remeasure_overtaken_by_a_change_keeps_the_block() {
+        let rig = Rig::new("remeasure-stale");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        let dir = rig.dir.join("u1").join("1");
+        {
+            let mut st = lock(&store.inner.state);
+            st.remeasure.push(dir.clone());
+            st.unmeasured.push((dir.clone(), "test".to_owned()));
+        }
+        let (s1, d1, once) = (
+            store.clone(),
+            dir.clone(),
+            std::rc::Rc::new(std::cell::Cell::new(false)),
+        );
+        set_hook(&BEFORE_REMEASURE_APPLY, move || {
+            if !once.replace(true) {
+                s1.inner.sweep_remeasure();
+                lock(&s1.inner.state).bump(&d1);
+            }
+        });
+        store.inner.sweep_remeasure();
+        clear_hook(&BEFORE_REMEASURE_APPLY);
+        let shown = dir.display().to_string();
+        let ours = |prefix: &str| {
+            lines(prefix)
+                .into_iter()
+                .filter(|l| l.contains(&format!("dir={shown} ")))
+                .count()
+        };
+        assert_eq!(
+            ours("pharos: video folder remeasured"),
+            0,
+            "a stale walk was applied"
+        );
+        assert!(
+            lock(&store.inner.state).unknown_folder().is_some(),
+            "the block was lifted by a walk the folder had changed under"
+        );
+        assert_eq!(ours("pharos: video folder remeasure verdict=stale"), 1);
+        store.inner.sweep_remeasure();
+        assert_eq!(ours("pharos: video folder remeasured"), 1);
+        assert!(lock(&store.inner.state).unknown_folder().is_none());
+    }
+
+    /// Discarding the held folders removes one whose record reads but names
+    /// another folder: the folder is gone, and admission is open again.
+    #[tokio::test]
+    async fn a_discard_removes_a_folder_whose_record_names_another() {
+        let rig = Rig::new("discard-elsewhere");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            assert_eq!(only(&store).state, KeptState::Ready);
+        }
+        let (from, to) = (rig.dir.join("u1").join("1"), rig.dir.join("u1").join("2"));
+        copy_tree(&from, &to);
+        let store = rig.open();
+        store.settled().await;
+        assert!(lock(&store.inner.state).unknown_folder().is_some());
+        let freed = store.discard_unreadable();
+        assert!(freed.is_ok(), "{freed:?}");
+        assert!(!to.exists(), "the discard left the folder on disk");
+        assert!(
+            lock(&store.inner.state).unknown_folder().is_none(),
+            "admission is still blocked"
+        );
+        assert!(freed.unwrap() > 0, "the freed bytes were not counted");
+        assert_eq!(only(&store).item, "1");
+    }
+
+    /// A playlist promoted before the plan is on disk: while the next
+    /// playlist is held, the run owes its allowance less what the first
+    /// one wrote, not both allowances whole.
+    #[tokio::test]
+    async fn a_promoted_playlist_is_not_still_owed() {
+        let rig = Rig::new("playlist-landed");
+        let later = rig.server.slow_first_open(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        let estimate = only(&store).estimated_bytes;
+        let master = u64::try_from(MASTER.len()).unwrap();
+        assert_eq!(
+            store.outstanding_bytes(),
+            estimate - master,
+            "the promoted playlist is still counted as owed"
+        );
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+    }
+
+    /// A folder where a planned playlist goes is not read as text: the run
+    /// fails with a reason that says to remove the download.
+    #[tokio::test]
+    async fn a_folder_at_a_playlists_path_fails_with_a_reason_to_remove_it() {
+        let rig = Rig::new("playlist-folder");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            assert_eq!(only(&store).state, KeptState::Ready);
+        }
+        let files = rig.dir.join("u1").join("1").join("files");
+        let master = files.join(file_name(MASTER_KEY));
+        std::fs::remove_file(&master).unwrap();
+        std::fs::create_dir(&master).unwrap();
+        let store = rig.open();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("not failed: {:?}", only(&store).state);
+        };
+        assert!(reason.contains("remove this download"), "{reason}");
+        let damaged = lines("pharos: video keep playlist verdict=damaged item=1");
+        assert!(
+            damaged.iter().any(|l| l.contains("kind=folder")),
+            "{damaged:?}"
+        );
+    }
+
+    /// An interrupted download whose folder could not be walked whole at
+    /// open recovers once the folder reads again: its own run measures the
+    /// folder before it plans, and the download completes.
+    #[tokio::test]
+    async fn a_recovered_run_measures_its_short_folder_before_it_plans() {
+        let (rig, dir) = resume_missing_its_master("short-adoption", 4 * GIB).await;
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        let later = rig.server.slow_first_open(MASTER_KEY);
+        let store = rig.open();
+        // The open's walk fell short: the folder is unknown.
+        assert!(lock(&store.inner.state).unknown_folder().is_some());
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let by = lines("pharos: video folder remeasured");
+        assert!(by.iter().any(|l| l.contains("by=own_run")), "{by:?}");
+    }
+
+    /// A whole record copied into another item's folder is not adopted
+    /// there: removal looks only where the record's ids point, so the copy
+    /// would outlive it. The copy stays held, and the original is the one
+    /// download listed.
+    #[tokio::test]
+    async fn a_record_in_a_folder_it_does_not_name_stays_held() {
+        let rig = Rig::new("record-elsewhere");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            assert_eq!(only(&store).state, KeptState::Ready);
+        }
+        let (from, to) = (rig.dir.join("u1").join("1"), rig.dir.join("u1").join("2"));
+        copy_tree(&from, &to);
+        let store = rig.open();
+        store.settled().await;
+        let listed = lock(&store.inner.state).list.len();
+        assert_eq!(listed, 1, "the copy was adopted as a second download");
+        assert!(
+            lock(&store.inner.state).held.iter().any(|(d, _)| *d == to),
+            "the copy is not held"
+        );
+        let held = lines("pharos: video folder held");
+        assert!(
+            held.iter()
+                .any(|l| l.contains("record names another folder")),
+            "{held:?}"
+        );
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let target = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&e.path(), &target);
+            } else {
+                std::fs::copy(e.path(), target).unwrap();
+            }
+        }
+    }
+
+    /// A request a test waits for that never comes fails the wait, naming
+    /// what was asked, instead of hanging the test.
+    #[tokio::test]
+    #[should_panic(expected = "was not asked 1 times; asked: []")]
+    async fn a_request_that_never_comes_fails_the_wait() {
+        let server = FakeServer::with_stream();
+        server
+            .asked_times_within(SEG0, 1, std::time::Duration::from_millis(50))
+            .await;
+    }
+
+    /// Waits, on the test's runtime, until `done` holds; at most 10 s.
+    async fn until_within(done: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !done() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "never happened"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// User u1's run outlives a switch to u2 and starts that run's next
+    /// request after it: the request is not sent (no u2 token goes out for
+    /// u1's run) and the run parks, its record left Downloading for u1.
+    #[tokio::test]
+    async fn another_users_token_never_goes_out_for_a_run() {
+        let rig = Rig::new("token-switch-open");
+        rig.server.sign_in("u1");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let later = rig.server.slow_first_open(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        rig.server.asked_times(SEG1, 1).await;
+        rig.server.sign_in("u2");
+        later.store(true, Ordering::SeqCst);
+        // Bounded: with the guard gone the request goes out and the run
+        // waits on the held body.
+        until_within(|| {
+            !lines("pharos: video keep parked item=1").is_empty()
+                || rig.server.sent().iter().any(|(k, _)| k == SEG1)
+        })
+        .await;
+        mid.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let sent = rig.server.sent();
+        assert!(
+            sent.iter().all(|(_, t)| t.as_deref() == Some("tok-u1")),
+            "{sent:?}"
+        );
+        assert!(
+            !sent.iter().any(|(k, _)| k == SEG1),
+            "sent after the switch: {sent:?}"
+        );
+        assert!(store.stored_file("u1", SEG0).is_none());
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Downloading { .. }), "{v:?}");
+        let refused = lines("pharos: video keep fetch verdict=refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("reason=token_owner_mismatch owner=u1 token_user=u2")),
+            "{refused:?}"
+        );
+        let parked = lines("pharos: video keep parked item=1");
+        assert!(
+            parked.iter().any(|l| l.contains("token_owner_mismatch")),
+            "{parked:?}"
+        );
+    }
+
+    /// A body fetched with u1's token while the token on file became u2's
+    /// is not promoted into u1's record: its staged bytes are discarded and
+    /// the run parks.
+    #[tokio::test]
+    async fn a_body_fetched_across_a_user_switch_is_not_promoted() {
+        let rig = Rig::new("token-switch-promote");
+        rig.server.sign_in("u1");
+        let mid = rig.server.hold_mid_body(SEG0);
+        let later = rig.server.slow_first_open(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        rig.server.sign_in("u2");
+        mid.store(true, Ordering::SeqCst);
+        // Bounded: with the guard gone the body is promoted and the run
+        // goes on to the held request.
+        until_within(|| {
+            store.stored_file("u1", SEG0).is_some()
+                || !lines("pharos: video keep parked item=1").is_empty()
+        })
+        .await;
+        later.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            store.stored_file("u1", SEG0).is_none(),
+            "a body fetched across the switch was promoted"
+        );
+        let files = rig.dir.join("u1").join("1").join("files");
+        let parts: Vec<_> = std::fs::read_dir(&files)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(parts.is_empty(), "{parts:?}");
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Downloading { .. }), "{v:?}");
+        let refused = lines("pharos: video keep promote verdict=refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("reason=token_owner_mismatch owner=u1 token_user=u2")),
+            "{refused:?}"
+        );
+        let dropped =
+            lines("pharos: video keep staging dropped item=1 reason=token_owner_mismatch");
+        assert!(!dropped.is_empty());
+    }
+
+    /// A cold start with u2's token on file and u1's download interrupted:
+    /// the resumed run sends nothing, and parks.
+    #[tokio::test]
+    async fn a_cold_start_sends_nothing_for_another_users_interrupted_download() {
+        let (rig, _dir) = resume_missing_its_master("token-cold", 4 * GIB).await;
+        rig.server.sent.lock().unwrap().clear();
+        rig.server.sign_in("u2");
+        let store = rig.open();
+        store.settled().await;
+        let sent = rig.server.sent();
+        assert!(sent.is_empty(), "{sent:?}");
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Downloading { .. }), "{v:?}");
+        let refused = lines("pharos: video keep fetch verdict=refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("reason=token_owner_mismatch owner=u1 token_user=u2")),
+            "{refused:?}"
+        );
+    }
+
+    /// A folder at a planned segment's path is not a stored file, and the
+    /// prune keeps it (its name is planned): its bytes still count in the
+    /// reservation the resume is admitted with, for as long as it runs.
+    #[tokio::test]
+    async fn a_folder_at_a_planned_path_counts_in_the_resumes_reservation() {
+        let rig = Rig::new("planned-folder");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            assert_eq!(only(&store).state, KeptState::Ready);
+        }
+        let files = rig.dir.join("u1").join("1").join("files");
+        let seg = files.join(file_name(SEG1));
+        std::fs::remove_file(&seg).unwrap();
+        std::fs::create_dir(&seg).unwrap();
+        let big = 20_000_000u64;
+        std::fs::write(seg.join("inner"), vec![1u8; usize::try_from(big).unwrap()]).unwrap();
+        let media = on_disk(&files) - big;
+        let release = rig.server.hold_mid_body(SEG1);
+        let store = rig.open();
+        rig.server.reached_mid_body(SEG1).await;
+        let held = reserved(&only(&store));
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            held >= media + big,
+            "the running resume reserves {held}, less than the folder's {big} and the media's {media}"
+        );
+        let kept = lines("pharos: video keep inventory item=1 verdict=not_stored");
+        assert!(
+            kept.iter()
+                .any(|l| l.contains("reason=not_a_regular_file")
+                    && l.contains(&format!("bytes={big}"))),
+            "{kept:?}"
+        );
+    }
+
+    /// An interrupted download with a 3 GiB reservation whose master
+    /// playlist is gone, reopened under `cap`.
+    async fn resume_missing_its_master(name: &str, cap: u64) -> (Rig, PathBuf) {
+        let rig = Rig::new(name);
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let dir = rig.dir.join("u1").join("1");
+        let manifest = dir.join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 3,
+            total: 5,
+            bytes: 1,
+        };
+        v.estimated_bytes = 3 * GIB;
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::remove_file(dir.join("files").join(file_name(MASTER_KEY))).unwrap();
+        rig.budget.cap.store(cap, Ordering::SeqCst);
+        rig.server.asked.lock().unwrap().clear();
+        (rig, dir)
+    }
+
+    /// A resume whose folder cannot be measured whole when its playlist is
+    /// reserved does not take a short walk for what the folder holds: the
+    /// reservation could look unused while the folder fills it. The folder
+    /// is unknown and the fetch is refused.
+    #[tokio::test]
+    async fn a_short_measure_at_a_playlists_reservation_refuses_the_fetch() {
+        let (rig, dir) = resume_missing_its_master("playlist-short-measure", 4 * GIB).await;
+        rig.budget.other.store(GIB, Ordering::SeqCst);
+        let store = rig.open();
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        store.settled().await;
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        let v = only(&store);
+        let KeptState::Failed { reason } = &v.state else {
+            panic!("a resume went on over a short measure: {v:?}");
+        };
+        assert!(
+            rig.server.asked().is_empty(),
+            "fetched {:?}",
+            rig.server.asked()
+        );
+        assert!(reason.contains("not measured whole"), "{reason}");
+        let refused = lines("pharos: video keep refused item=1");
+        assert!(
+            refused.iter().any(|l| l.contains("step=playlist")),
+            "{refused:?}"
+        );
+    }
+
+    /// A resume whose reservation covers its playlist's allowance still
+    /// needs the disk to hold every byte the playlist can write: with free
+    /// space exactly at the guard, the fetch is refused.
+    #[tokio::test]
+    async fn a_resume_at_the_free_space_guard_fetches_no_playlist() {
+        let (rig, _dir) = resume_missing_its_master("playlist-low-space", 100 * GIB).await;
+        rig.budget.free.store(FREE_GUARD_BYTES, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let v = only(&store);
+        let KeptState::Failed { reason } = &v.state else {
+            panic!("a resume at the guard went on: {v:?}");
+        };
+        assert!(
+            rig.server.asked().is_empty(),
+            "fetched {:?}",
+            rig.server.asked()
+        );
+        assert!(reason.contains("free"), "{reason}");
+        let refused = lines("pharos: video keep refused item=1");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("step=playlist") && l.contains("extended=0 ")),
+            "{refused:?}"
+        );
+    }
+
+    /// A retry whose inventory of the folder comes back short (after a
+    /// prune that read it whole) is not admitted: what the folder holds is
+    /// unknown, so its reservation is kept, not replaced by a plan that
+    /// counts nothing stored.
+    #[tokio::test]
+    async fn a_short_inventory_while_planning_admits_nothing_and_keeps_the_reservation() {
+        let rig = Rig::new("plan-inventory-short");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let held = only(&store).estimated_bytes;
+        assert!(held > 0, "no reservation to keep");
+        rig.server.fail(SEG1, &[]);
+        ADMITTED.with(|a| a.set(None));
+        set_hook(&AFTER_PRUNE, || FAIL_ENTRY_READ.with(|f| f.set(true)));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        clear_hook(&AFTER_PRUNE);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        assert_eq!(ADMITTED.with(std::cell::Cell::get), None, "admitted");
+        let v = only(&store);
+        assert!(matches!(v.state, KeptState::Failed { .. }), "{:?}", v.state);
+        assert!(
+            v.estimated_bytes >= held,
+            "the reservation shrank to {} from {held}",
+            v.estimated_bytes
+        );
+        let refused = lines("pharos: video keep refused item=1 reason=inventory_short");
+        assert!(
+            refused.iter().any(|l| l.contains("step=plan")),
+            "{refused:?}"
+        );
+    }
+
+    /// Review 5987746170 (kept_video_disk.rs:2582): a media file renamed to
+    /// its final name stays counted as on disk until the progress publish
+    /// that records it, and that publish moves it into the record's figure
+    /// without counting it again: the run's owed figure is the same either
+    /// side of every publish.
+    #[tokio::test]
+    async fn a_promoted_segment_is_counted_once_until_progress_records_it() {
+        let rig = Rig::new("promoted-counted-once");
+        let store = rig.open();
+        PUBLISHED.with(|p| p.borrow_mut().clear());
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let published = PUBLISHED.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        assert!(published.len() > 1, "{published:?}");
+        for (before, after) in &published {
+            assert!(before.is_some(), "{published:?}");
+            assert_eq!(
+                before, after,
+                "a publish moved the owed figure: {published:?}"
+            );
+        }
+    }
+
+    /// Review 5987746170 (kept_video_disk.rs:3357): a run whose inventory
+    /// comes back short after it lost its item (another run took it over)
+    /// leaves the folder's figure alone: it stops as gone, and marks nothing
+    /// unknown that a replacement's admission would then refuse on.
+    #[tokio::test]
+    async fn a_run_that_lost_its_item_before_a_short_inventory_marks_nothing_unknown() {
+        let rig = Rig::new("plan-inventory-short-gone");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        rig.server.fail(SEG1, &[]);
+        // Another run takes the item over between the prune and the
+        // inventory, with the folder's files still on disk.
+        let s1 = store.clone();
+        set_hook(&AFTER_PRUNE, move || {
+            if let Some(owner) = lock(&s1.inner.state)
+                .runs
+                .get_mut(&("u1".to_owned(), "1".to_owned()))
+            {
+                *owner = owner.wrapping_add(1);
+            }
+            FAIL_ENTRY_READ.with(|f| f.set(true));
+        });
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        clear_hook(&AFTER_PRUNE);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        // A sweep clears a mark soon after, so the run's own verdict is
+        // what shows it: gone, not a short inventory marked unknown.
+        assert!(
+            lines("pharos: video keep refused item=1 reason=inventory_short").is_empty(),
+            "a run that no longer owns the item marked its folder unknown"
+        );
+        assert!(!lines("pharos: video keep inventory verdict=gone item=1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_completion_whose_record_cannot_be_saved_is_not_reported_ready() {
+        let rig = Rig::new("complete-save-fails");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let mut waited = 0;
+        while store.staged_bytes() != 50 {
+            waited += 1;
+            assert!(waited < 2_000, "staged={}", store.staged_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        // The disk goes bad while the download is mid-file.
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("reported {:?}", only(&store).state);
+        };
+        assert!(reason.contains("could not be saved"), "{reason}");
+        assert!(
+            lines("pharos: video keep ready").is_empty(),
+            "success logged"
+        );
+        let failed = lines("pharos: video keep failed");
+        assert!(
+            failed.len() == 1 && failed[0].contains("could not be saved"),
+            "{failed:?}"
+        );
+        // The disk disagrees with nothing: it holds no Ready record.
+        std::fs::remove_dir_all(dir.join("manifest.json.part")).unwrap();
+        drop(store);
+        let reopened = rig.open();
+        assert_ne!(only(&reopened).state, KeptState::Ready);
+    }
+
+    /// The Failed record a failed completion save leaves still reserves what
+    /// the folder holds, when that is more than was planned.
+    #[tokio::test]
+    async fn a_failed_completion_save_keeps_what_the_folder_holds() {
+        let rig = Rig::new("complete-save-fails-bytes");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let mut waited = 0;
+        while store.staged_bytes() != 50 {
+            waited += 1;
+            assert!(waited < 2_000, "staged={}", store.staged_bytes());
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let dir = rig.dir.join("u1").join("1");
+        let big = estimate_bytes(2_000_000, 12_000) * 3;
+        let stray = std::fs::File::create(dir.join("files").join("stray")).unwrap();
+        stray.set_len(big).unwrap();
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert!(
+            store.kept_bytes() >= big,
+            "reserves {} of the {big} the folder holds",
+            store.kept_bytes()
+        );
+    }
+
+    /// A plan whose record cannot be saved at admission stops the download
+    /// with the save error, before any file is fetched.
+    #[tokio::test]
+    async fn a_plan_whose_record_cannot_be_saved_stops_the_download() {
+        let rig = Rig::new("plan-save-fails");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The run has not begun: the disk goes bad between start and plan.
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("manifest.json.part")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("reported {:?}", only(&store).state);
+        };
+        assert!(
+            reason.contains("plan's record could not be saved"),
+            "{reason}"
+        );
+        assert!(
+            !rig.server.asked().iter().any(|k| k == SEG0),
+            "fetched on after the plan was lost"
+        );
+    }
+
+    /// A refused plan's cleanup deletes only while its run owns the item: a
+    /// replacement run's file at the same path stays.
+    #[tokio::test]
+    async fn a_stale_runs_refusal_cleanup_leaves_the_replacements_files() {
+        let rig = Rig::new("refused-cleanup");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let key = SEG0.to_owned();
+        let path = store.stored_file("u1", &key).unwrap().path;
+        let owner = lock(&store.inner.state)
+            .runs
+            .get(&("u1".to_owned(), "1".to_owned()))
+            .copied();
+        // The run that finished no longer owns the item (its entry is gone),
+        // as after a removal and restart: nothing is deleted.
+        assert!(owner.is_none());
+        drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
+        assert!(path.exists(), "a stale run deleted the replacement's file");
+        assert!(store.stored_file("u1", &key).is_some(), "and forgot it");
+        // The owning run deletes and forgets.
+        lock(&store.inner.state)
+            .runs
+            .insert(("u1".to_owned(), "1".to_owned()), 999);
+        drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
+        assert!(!path.exists());
+        assert!(store.stored_file("u1", &key).is_none());
+    }
+
+    /// Downloads are served to the user who kept them: another account
+    /// making the same request gets no stored answer, and neither does
+    /// nobody; the files stay for their owner.
+    #[tokio::test]
+    async fn a_stored_file_is_served_only_to_its_own_user() {
+        let rig = Rig::new("scoped-lookup");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(store.stored_file("u1", SEG0).is_some(), "the owner");
+        assert!(store.stored_file("u2", SEG0).is_none(), "another account");
+        assert!(store.stored_file("", SEG0).is_none(), "nobody");
+        // It survives a reopen for its owner, and still not for others.
+        drop(store);
+        let store = rig.open();
+        assert!(store.stored_file("u1", SEG0).is_some());
+        assert!(store.stored_file("u2", SEG0).is_none());
+    }
+
+    /// A damaged manifest is held the same way.
+    #[tokio::test]
+    async fn a_damaged_manifest_folder_counts_and_blocks_admission() {
+        let rig = Rig::new("manifest-damaged");
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), b"{ not json").unwrap();
+        let store = rig.open();
+        assert_eq!(store.kept_bytes(), 10);
+        assert!(matches!(
+            store.start(request("2")),
+            Err(KeepVideoRefusal::Host(_))
+        ));
+    }
+
+    /// A finished download of item 1 whose manifest is then damaged and the
+    /// store reopened over it: the folder is held and blocks admission.
+    /// Returns the rig, the store, the manifest's good bytes and its path.
+    async fn held_download(name: &str) -> (Rig, Arc<DiskVideoStore>, Vec<u8>, PathBuf) {
+        let rig = Rig::new(name);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        let manifest = rig.dir.join("u1").join("1").join("manifest.json");
+        let good = std::fs::read(&manifest).unwrap();
+        std::fs::write(&manifest, b"{ not json").unwrap();
+        let store = rig.open();
+        assert!(store.size_unknown(), "the damaged manifest did not block");
+        assert_eq!(store.unreadable_count(), 1);
+        (rig, store, good, manifest)
+    }
+
+    /// CR 4642574435: the readiness poll answers from memory and runs the
+    /// held folders' recovery on the blocking pool. The poll that starts it
+    /// does not see its result; a later one sees the download Ready.
+    #[tokio::test]
+    async fn a_readiness_poll_recovers_held_folders_off_the_ui_thread() {
+        let (_rig, store, good, manifest) = held_download("ready-poll").await;
+        std::fs::write(&manifest, good).unwrap();
+        assert!(
+            store.ready_videos("u1").is_empty(),
+            "the poll swept the held folders on its own thread"
+        );
+        store.settled().await;
+        let ready = store.ready_videos("u1");
+        assert_eq!(ready.len(), 1, "the recovery off the UI thread did not run");
+        assert!(!store.size_unknown());
+        store.settled().await;
+    }
+
+    /// A manifest that reads again (a schema a newer build wrote, back on a
+    /// build that parses it) is released by a sweep: the download is listed,
+    /// nothing is blocked, and its bytes count once, as the record's.
+    #[tokio::test]
+    async fn a_held_folder_whose_manifest_becomes_readable_is_released_by_a_sweep() {
+        let (_rig, store, good, manifest) = held_download("held-readable").await;
+        assert!(store.videos("u1").is_empty());
+        let still_held = store.kept_bytes();
+        assert!(still_held > 0);
+        std::fs::write(&manifest, good).unwrap();
+        let listed = store.videos("u1");
+        assert_eq!(listed.len(), 1, "the download is not back");
+        assert!(listed[0].ready(), "{:?}", listed[0].state);
+        assert!(!store.size_unknown(), "still blocked after the release");
+        assert_eq!(store.unreadable_count(), 0);
+        assert!(store.stored_file("u1", SEG0).is_some(), "files not served");
+        assert_eq!(store.kept_bytes(), reserved(&listed[0]), "counted twice");
+        assert!(!lines("pharos: video held folder verdict=released").is_empty());
+        store.start(request("2")).unwrap();
+        store.settled().await;
+    }
+
+    /// A held folder deleted by hand is dropped; one left with no record is
+    /// a removed download and is deleted by the sweep that follows.
+    #[tokio::test]
+    async fn a_held_folder_that_is_gone_or_has_no_record_stops_blocking() {
+        let (_rig, store, _good, manifest) = held_download("held-gone").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(store.videos("u1").is_empty());
+        assert!(!store.size_unknown());
+        assert_eq!(store.unreadable_count(), 0);
+        assert_eq!(store.kept_bytes(), 0);
+        assert!(!lines("pharos: video held folder verdict=dropped").is_empty());
+
+        let (_rig, store, _good, manifest) = held_download("held-no-record").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        std::fs::remove_file(&manifest).unwrap();
+        store.videos("u1");
+        assert_eq!(store.unreadable_count(), 0);
+        assert!(!store.size_unknown(), "measured whole, so known");
+        assert!(store.kept_bytes() > 0, "counted until it is deleted");
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        assert!(!dir.exists(), "the removed download's folder stayed");
+        assert!(!store.size_unknown());
+        assert!(!lines("pharos: video held folder verdict=tombstoned").is_empty());
+    }
+
+    /// The hook asks the size check first: it may sweep and adopt, and the
+    /// held figure it reports is the one that sweep left. A cap lowered
+    /// while an unlisted folder is recovered trims music for that folder's
+    /// bytes, not for a figure read before it was found.
+    #[test]
+    fn a_cap_lowered_as_a_folder_is_recovered_trims_for_its_bytes() {
+        let _music = capture_music_log();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _enter = rt.enter();
+        let rig = Rig::new("hook-order");
+        let user = rig.dir.join("u1");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            rt.block_on(store.settled());
+        }
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        let audio = rig.dir.join("audio");
+        std::fs::create_dir_all(&audio).unwrap();
+        for i in 1..=4 {
+            std::fs::write(audio.join(format!("t{i}.audio")), [7u8; 100]).unwrap();
+        }
+        let base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        let lib = pharos_content::Library::connect_with(
+            &base,
+            &rig.dir.join("token"),
+            pharos_content::Timeouts {
+                command: std::time::Duration::from_secs(3),
+                code: std::time::Duration::from_millis(800),
+            },
+        )
+        .unwrap();
+        lib.enable_cache(&audio, 1 << 20).unwrap();
+        let hooked = store.clone();
+        lib.set_outside_used(Arc::new(move || {
+            crate::native::ports::outside_bytes(Some(&*hooked))
+        }));
+        assert_eq!(store.kept_bytes(), 0, "the unlisted folder was found early");
+        // The folder reads again; the next check sweeps.
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        *store.inner.last_sweep.lock().unwrap() = None;
+        // Music alone fits this cap; with the video's bytes nothing does.
+        lib.set_cache_cap(400).unwrap();
+        let held = store.kept_bytes();
+        assert!(held > 400, "the recovered folder holds {held}");
+        let left = (1..=4)
+            .filter(|i| audio.join(format!("t{i}.audio")).exists())
+            .count();
+        assert_eq!(left, 0, "trimmed for a held figure read before the sweep");
+    }
+
+    /// A process that never lists the downloads (the car's) still recovers:
+    /// the music cache's size check through the hook sweeps the held
+    /// folders, at most once per interval, with no `videos()` call.
+    #[tokio::test]
+    async fn the_music_size_check_sweeps_the_held_folders_without_listing() {
+        let (_rig, store, good, manifest) = held_download("held-hook").await;
+        let hook = || crate::native::ports::outside_bytes(Some(&*store));
+        assert!(hook().unknown, "not blocked while the manifest is bad");
+        // Readable again; the sweep ran just now, so it is not due.
+        std::fs::write(&manifest, &good).unwrap();
+        assert!(hook().unknown, "swept again inside the interval");
+        // Due: the check alone releases the folder.
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let outside = hook();
+        assert!(!outside.unknown, "the hook still reports unknown");
+        assert!(outside.held > 0, "the released download is not counted");
+        assert_eq!(store.unreadable_count(), 0);
+        assert!(!lines("pharos: video unknown-size sweep from=host_size_check").is_empty());
+    }
+
+    /// Discarding deletes the folders whose record is still unreadable and
+    /// clears the block, so admission and the music cache resume.
+    #[tokio::test]
+    async fn discarding_the_unreadable_clears_the_block() {
+        let (_rig, store, _good, manifest) = held_download("held-discard").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        let freed = store.discard_unreadable();
+        assert!(matches!(freed, Ok(b) if b > 0), "{freed:?}");
+        assert!(!dir.exists(), "the folder stayed");
+        assert!(!store.size_unknown(), "still blocked");
+        assert_eq!(store.unreadable_count(), 0);
+        assert_eq!(store.kept_bytes(), 0);
+        assert!(!lines("pharos: video held folder verdict=discarded").is_empty());
+        store.start(request("2")).unwrap();
+        store.settled().await;
+    }
+
+    /// A folder that will not delete is counted and swept as a removed
+    /// download's, and the discard says so.
+    #[tokio::test]
+    async fn a_discard_that_cannot_delete_keeps_the_folder_counted() {
+        let (_rig, store, _good, manifest) = held_download("held-discard-fails").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        FAIL_REMOVE.with(|f| f.set(true));
+        let outcome = store.discard_unreadable();
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(dir.exists());
+        assert!(store.kept_bytes() > 0, "counted for nothing");
+        assert!(!lines("pharos: video held folder verdict=discard_failed").is_empty());
+        // No longer unreadable, but still there: Downloads still offers to
+        // remove it.
+        assert_eq!(store.unreadable_count(), 0);
+        assert_eq!(store.leftover_count(), 1, "the folder left is not offered");
+        // Outside diff kept_video_disk.rs:5041-5044 (review 5997638687): a
+        // second cleanup that cannot delete it either says so; the folder
+        // is no longer held, but its tombstone is the retry's.
+        FAIL_REMOVE.with(|f| f.set(true));
+        let again = store.discard_unreadable();
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(
+            again.is_err(),
+            "a repeated failure reported success: {again:?}"
+        );
+        assert!(dir.exists());
+        assert!(!lines("pharos: video held discard retry verdict=included").is_empty());
+        // The next sweep deletes it and the block lifts.
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        assert!(!dir.exists());
+        assert!(!store.size_unknown());
+        assert_eq!(store.leftover_count(), 0, "cleanup done but still offered");
+    }
+
+    /// A folder that will not delete at first but goes on the retry is
+    /// reported freed, with its bytes: the Downloads page gets the final
+    /// outcome, not the first attempt's.
+    #[tokio::test]
+    async fn a_discard_whose_retry_deletes_the_folder_reports_it_freed() {
+        let (_rig, store, _good, manifest) = held_download("held-discard-retry").await;
+        let dir = manifest.parent().unwrap().to_path_buf();
+        let held = store.kept_bytes();
+        assert!(held > 0);
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let c2 = calls.clone();
+        FAIL_REMOVE.with(|f| f.set(true));
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                c2.set(c2.get() + 1);
+                if c2.get() > 1 {
+                    FAIL_REMOVE.with(|f| f.set(false));
+                }
+            }));
+        });
+        let outcome = store.discard_unreadable();
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert_eq!(calls.get(), 2, "no retry ran");
+        assert!(!dir.exists(), "the retry left the folder");
+        assert_eq!(outcome, Ok(held), "not the final outcome");
+        assert_eq!(store.leftover_count(), 0);
+        assert!(!lines(&format!(
+            "pharos: video held discard verdict=done freed={held} remaining=0"
+        ))
+        .is_empty());
+    }
+
+    /// A discard never deletes a download whose manifest reads: it is
+    /// released instead.
+    #[tokio::test]
+    async fn a_discard_leaves_a_download_whose_record_reads_again() {
+        let (_rig, store, good, manifest) = held_download("held-discard-readable").await;
+        std::fs::write(&manifest, good).unwrap();
+        assert_eq!(store.discard_unreadable(), Ok(0));
+        assert!(manifest.exists(), "a readable download was deleted");
+        assert_eq!(store.videos("u1").len(), 1);
+        assert!(!store.size_unknown());
+    }
+
+    /// The manifest of a finished item-1 download with `estimated_bytes`
+    /// removed (as one written before the field existed), and the bytes its
+    /// folder holds. The rig's store is dropped.
+    async fn manifest_without_an_estimate(name: &str, interrupted: bool) -> (Rig, u64) {
+        let rig = Rig::new(name);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        let dir = rig.dir.join("u1").join("1");
+        let manifest = dir.join("manifest.json");
+        let mut j: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let o = j.as_object_mut().unwrap();
+        assert!(o.remove("estimated_bytes").is_some());
+        if interrupted {
+            o.insert(
+                "state".to_owned(),
+                serde_json::json!({"state": "downloading", "done": 0, "total": 3, "bytes": 0}),
+            );
+        }
+        std::fs::write(&manifest, serde_json::to_vec(&j).unwrap()).unwrap();
+        let held = on_disk(&dir);
+        assert!(held > 0);
+        (rig, held)
+    }
+
+    /// A manifest lacking the estimate never counts as 0: its folder's bytes
+    /// are its floor, for a finished download and for an interrupted one.
+    #[tokio::test]
+    async fn an_adopted_manifest_without_an_estimate_counts_its_folder() {
+        for interrupted in [false, true] {
+            let (rig, held) = manifest_without_an_estimate("no-estimate", interrupted).await;
+            let store = rig.open();
+            let listed = store.videos("u1");
+            assert_eq!(listed.len(), 1);
+            assert!(
+                listed[0].estimated_bytes >= held,
+                "interrupted={interrupted}: estimate {} under the {held} on disk",
+                listed[0].estimated_bytes
+            );
+            assert!(
+                store.kept_bytes() >= held,
+                "interrupted={interrupted}: counted {} of {held}",
+                store.kept_bytes()
+            );
+            store.settled().await;
+        }
+    }
+
+    /// An interrupted manifest with no estimate (an older build's: the flag
+    /// is missing too) and a segment still to fetch was never reserved for
+    /// that segment. Its resume plans again and passes the shared cap as a
+    /// fresh download: with only the folder's bytes left under the cap it is
+    /// refused, and nothing beyond what is on disk is written.
+    #[tokio::test]
+    async fn a_resume_whose_estimate_came_from_adoption_passes_the_shared_cap() {
+        let (rig, _) = manifest_without_an_estimate("adopted-resume", true).await;
+        let dir = rig.dir.join("u1").join("1");
+        let manifest = dir.join("manifest.json");
+        let mut j: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        j.as_object_mut().unwrap().remove("estimate_from_adoption");
+        std::fs::write(&manifest, serde_json::to_vec(&j).unwrap()).unwrap();
+        let seg = dir.join("files").join(file_name(SEG1));
+        std::fs::remove_file(&seg).unwrap();
+        let held = on_disk(&dir);
+        let media = on_disk(&dir.join("files"));
+        // Music holds the rest of the cap: only the folder's bytes fit.
+        let cap = rig.budget.cap.load(Ordering::SeqCst);
+        rig.budget.other.store(cap - held, Ordering::SeqCst);
+        let store = rig.open();
+        store.settled().await;
+        let refused = lines("pharos: video keep refused item=1 reason=");
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("resume=true") && l.contains("cap=")),
+            "the resume skipped the shared cap: {refused:?}"
+        );
+        assert!(!seg.exists(), "the missing segment was fetched");
+        // Only the record is saved again (its verdict); no media is.
+        assert_eq!(
+            on_disk(&dir.join("files")),
+            media,
+            "media written beyond what was on disk"
+        );
+        let v = only(&store);
+        assert!(
+            v.estimated_bytes >= media,
+            "{} under {media}",
+            v.estimated_bytes
+        );
+        assert!(
+            v.estimate_from_adoption,
+            "a refused plan was marked admitted"
+        );
+        assert!(
+            !lines("pharos: video resume replanned item=1 reason=estimate_from_adoption")
+                .is_empty()
+        );
+    }
+
+    /// If the folder cannot be walked whole when the manifest is adopted,
+    /// it stays unknown, and a sweep that can walk it takes the floor.
+    #[tokio::test]
+    async fn an_adopted_folder_not_walked_whole_stays_unknown_until_it_is() {
+        let (rig, held) = manifest_without_an_estimate("no-estimate-inexact", false).await;
+        let dir = rig.dir.join("u1").join("1");
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        let store = rig.open();
+        assert!(
+            store.size_unknown(),
+            "admitted beside a folder not measured"
+        );
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        let listed = store.videos("u1");
+        assert!(!store.size_unknown(), "still blocked once it can be walked");
+        assert!(
+            listed[0].estimated_bytes >= held,
+            "{}",
+            listed[0].estimated_bytes
+        );
+        assert!(store.kept_bytes() >= held);
+    }
+
+    /// A root or user folder that cannot be listed at open blocks admission
+    /// and is listed again by a sweep: what turns up is counted, and the
+    /// block lifts only once the listing succeeds.
+    #[tokio::test]
+    async fn a_listing_that_failed_at_open_is_retried_and_what_it_hides_is_counted() {
+        for at_root in [true, false] {
+            let rig = Rig::new("relist");
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            drop(store);
+            let failing = if at_root {
+                rig.dir.clone()
+            } else {
+                rig.dir.join("u1")
+            };
+            UNREADABLE.with(|u| u.borrow_mut().push(failing.clone()));
+            let store = rig.open();
+            assert!(store.size_unknown(), "at_root={at_root}: not blocked");
+            assert!(store.videos("u1").is_empty());
+            assert!(matches!(
+                store.start(request("2")),
+                Err(KeepVideoRefusal::Host(_))
+            ));
+            // Still failing: a sweep keeps the block.
+            store.videos("u1");
+            assert!(
+                store.size_unknown(),
+                "lifted with the listing still failing"
+            );
+            UNREADABLE.with(|u| u.borrow_mut().clear());
+            let listed = store.videos("u1");
+            assert_eq!(listed.len(), 1, "at_root={at_root}: the download is hidden");
+            assert!(!store.size_unknown(), "at_root={at_root}: still blocked");
+            assert!(store.kept_bytes() > 0, "the found download is not counted");
+            assert!(store.stored_file("u1", SEG0).is_some());
+            store.start(request("2")).unwrap();
+            store.settled().await;
+        }
+    }
+
+    /// Two sweeps that overlap on a folder listed again: the second, which
+    /// picked the folder before the first adopted what it hides, must not
+    /// scan it after that adoption, or its own adopt deletes the staging
+    /// files written in between. The folder is claimed by one sweep.
+    #[tokio::test]
+    async fn overlapping_sweeps_relist_a_folder_once_and_keep_its_staging_files() {
+        let rig = Rig::new("relist-overlap");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        drop(store);
+        let user = rig.dir.join("u1");
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        let staging = user.join("1").join("files").join("x.7.part");
+
+        let (at_check, wait_check) = std::sync::mpsc::channel::<()>();
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let wait_go = Mutex::new(wait_go);
+        let checks = AtomicUsize::new(0);
+        let adoptions = Arc::new(AtomicUsize::new(0));
+        let hook = {
+            let (staging, adoptions) = (staging.clone(), adoptions.clone());
+            Arc::new(move |step: &'static str| match step {
+                // The first sweep to reach a folder's scan waits there.
+                "checked" if checks.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    at_check.send(()).unwrap();
+                    wait_go.lock().unwrap().recv().unwrap();
+                }
+                // The first adoption is followed by a run's staging file.
+                "adopted" if adoptions.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    std::fs::write(&staging, b"half a segment").unwrap();
+                }
+                _ => {}
+            })
+        };
+        *store.inner.relist_hook.lock().unwrap() = Some(hook);
+
+        let slow = {
+            let inner = store.inner.clone();
+            std::thread::spawn(move || inner.sweep_relist(Sweep::Ordinary))
+        };
+        // Bounded: a sweep that skipped its scan never sends it.
+        wait_check
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|e| panic!("the first sweep never reached its \"checked\" step: {e}"));
+        // A second sweep while the first is between its check and its scan.
+        store.inner.sweep_relist(Sweep::Ordinary);
+        go.send(()).unwrap();
+        slow.join().unwrap();
+        *store.inner.relist_hook.lock().unwrap() = None;
+
+        assert!(staging.exists(), "a second adopt deleted the staging file");
+        assert_eq!(store.videos("u1").len(), 1);
+        assert!(!lines("pharos: video folder relist skipped").is_empty());
+    }
+
+    /// A restart while a removed download's folder will not delete and
+    /// cannot be fully read: the figure from before the restart is gone, so
+    /// nothing is admitted until a sweep deletes it.
+    #[tokio::test]
+    async fn a_restart_over_a_folder_that_will_not_delete_and_is_unreadable_blocks_admission() {
+        let rig = Rig::new("reopen-unreadable");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        drop(store);
+
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        let store = rig.open();
+        let line = lines("pharos: video keep tombstone dir=");
+        assert!(line.iter().any(|l| l.contains("exact=false")), "{line:?}");
+        let Err(KeepVideoRefusal::Host(why)) = store.start(request("2")) else {
+            panic!("admitted beside a folder of unknown size");
+        };
+        assert!(why.contains("unknown"), "{why}");
+        assert!(store.size_unknown(), "the host is not told");
+
+        // Once the folder can be deleted, the sweep clears the block.
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        FAIL_REMOVE.with(|f| f.set(false));
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        assert!(!dir.exists(), "the sweep deleted it");
+        assert_eq!(store.videos("u1")[0].state, KeptState::Ready);
+        assert!(!store.size_unknown(), "still blocked");
+    }
+
+    /// A manifest that cannot be unlinked would bring the download back at
+    /// the next open: the removal is reported as not done and the record
+    /// stays.
+    #[tokio::test]
+    async fn a_failed_manifest_unlink_leaves_the_record_in_place() {
+        let rig = Rig::new("unlink-fails");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        // Unlinking a non-empty directory fails with something other than
+        // "not found".
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+
+        store.remove("u1", "1");
+        assert_eq!(store.videos("u1").len(), 1, "the record went");
+        assert!(store.stored_file("u1", SEG0).is_some(), "its files went");
+        assert!(dir.join("files").exists(), "the folder went");
+        let line = lines("pharos: video keep remove");
+        assert!(line[0].contains("verdict=not_removed"), "{line:?}");
+    }
+
+    /// A sweep that runs while a removal is deleting its folder leaves the
+    /// folder, its tombstone and its mark alone: the mark clears only when
+    /// the removal itself is done.
+    #[tokio::test]
+    async fn a_sweep_during_a_removal_leaves_its_folder_and_mark() {
+        let rig = Rig::new("sweep-during-remove");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (s2, seen2, dir2) = (store.clone(), seen.clone(), dir.clone());
+        let entered = std::cell::Cell::new(false);
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                if entered.replace(true) {
+                    return;
+                }
+                s2.inner.sweep_tombstones();
+                seen2.set(Some((
+                    s2.size_unknown(),
+                    s2.kept_bytes(),
+                    dir2.join("files").exists(),
+                )));
+            }));
+        });
+        store.remove("u1", "1");
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        let (unknown, kept, exists) = seen.take().unwrap();
+        assert!(unknown, "a sweep cleared the mark mid-removal");
+        assert!(kept > 0, "a sweep dropped the tombstone mid-removal");
+        assert!(exists, "a sweep deleted the folder mid-removal");
+        assert!(!store.size_unknown(), "still blocked after the removal");
+    }
+
+    /// When the manifest unlink fails, the tombstone and the mark stay until
+    /// the record is back: no moment in between where an admission sees
+    /// neither.
+    #[tokio::test]
+    async fn a_failed_unlink_restores_the_record_and_drops_the_tombstone_together() {
+        let rig = Rig::new("unlink-fails-gap");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = store.kept_bytes();
+        assert!(kept > 0);
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let (s2, seen2) = (store.clone(), seen.clone());
+        AT_UNLINK_FAILURE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                seen2.set(Some((s2.kept_bytes(), s2.size_unknown())));
+            }));
+        });
+        store.remove("u1", "1");
+        AT_UNLINK_FAILURE.with(|d| *d.borrow_mut() = None);
+        let (during, unknown) = seen.take().unwrap();
+        assert_eq!(
+            during, kept,
+            "counted for nothing before the record is back"
+        );
+        assert!(unknown, "no mark before the record is back");
+        assert_eq!(store.videos("u1").len(), 1, "the record did not come back");
+        assert_eq!(store.kept_bytes(), kept, "counted twice or not at all");
+        assert!(!store.size_unknown(), "the mark outlived the restore");
+    }
+
+    /// A Ready download brought back by a failed unlink over an inventory
+    /// that came back short is not left Ready with files missing from its
+    /// index: it comes back Failed, to be kept again, and says why.
+    #[tokio::test]
+    async fn a_failed_unlink_over_a_short_inventory_does_not_stay_ready() {
+        let rig = Rig::new("unlink-fails-short");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        let kept = store.kept_bytes();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        FAIL_ENTRY_READ.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        let back = only(&store);
+        assert!(
+            matches!(back.state, KeptState::Failed { .. }),
+            "Ready over a short index: {:?}",
+            back.state
+        );
+        assert!(store.kept_bytes() >= kept, "its bytes dropped out");
+        assert!(
+            !lines("pharos: video keep remove item=1 verdict=not_removed index=short").is_empty()
+        );
+    }
+
+    /// CR 4640624134: a failed removal whose folder walk falls short puts
+    /// the record back with the folder unknown, in the same hold, so no
+    /// admission counts it known; the reservation floor stays. A whole
+    /// remeasure lifts the block.
+    #[tokio::test]
+    async fn a_failed_unlink_over_a_short_measure_keeps_admission_blocked() {
+        let rig = Rig::new("unlink-short-unknown");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(!store.size_unknown());
+        let kept = store.kept_bytes();
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        FAIL_ENTRY_READ.with(|f| f.set(true));
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        store.remove("u1", "1");
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        // What admission reads, before any sweep can measure the folder.
+        assert!(
+            lock(&store.inner.state).unknown_folder().is_some(),
+            "a short measure was counted as known"
+        );
+        assert!(store.size_unknown(), "the folder still reads short");
+        assert!(store.kept_bytes() >= kept, "the reservation floor dropped");
+        assert!(!lines("pharos: video keep remove item=1 measure=short").is_empty());
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        store.inner.sweep_remeasure();
+        assert!(!store.size_unknown(), "a whole remeasure kept the block");
+    }
+
+    /// Outside-diff item on kept_video_disk.rs:2887: a Downloading record
+    /// found at reopen takes its progress from the planned files on disk,
+    /// not the counts its last save kept; its admitted reservation stays.
+    #[tokio::test]
+    async fn a_reopened_download_rebuilds_its_progress_from_the_files_on_disk() {
+        let rig = Rig::new("reopen-progress");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let mut record = only(&store);
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(store.inner.file_path("u1", "1", SEG0)).unwrap();
+        let planned = record.files.len();
+        let on_disk: u64 = record
+            .files
+            .iter()
+            .filter_map(|k| std::fs::metadata(store.inner.file_path("u1", "1", k)).ok())
+            .map(|m| m.len())
+            .sum();
+        record.state = KeptState::Downloading {
+            done: 0,
+            total: 99,
+            bytes: 1,
+        };
+        let reserved = record.estimated_bytes;
+        let adopted = adopt(&dir, record, Sweep::HostCheck);
+        assert_eq!(
+            adopted.record.state,
+            KeptState::Downloading {
+                done: u32::try_from(planned - 1).unwrap(),
+                total: u32::try_from(planned).unwrap(),
+                bytes: on_disk,
+            }
+        );
+        assert!(
+            adopted.record.estimated_bytes >= reserved,
+            "the reservation dropped"
+        );
+        assert!(adopted.exact);
+        assert!(!lines("pharos: video record progress item=1 verdict=rebuilt").is_empty());
+    }
+
+    /// The control: a whole inventory keeps a restored Ready download Ready.
+    #[tokio::test]
+    async fn a_failed_unlink_over_a_whole_inventory_stays_ready() {
+        let rig = Rig::new("unlink-fails-whole");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.remove("u1", "1");
+        assert!(only(&store).ready());
+        assert!(store.stored_file("u1", SEG0).is_some());
+    }
+
+    /// The phone's allowance picker sets the one cap music and video share:
+    /// the store hands it to its budget, and reads the same cap back. A
+    /// refusal leaves the cap as it was and says why.
+    #[tokio::test]
+    async fn setting_the_cap_sets_the_shared_cap_and_reads_it_back() {
+        let rig = Rig::new("set-cap");
+        let store = rig.open();
+        assert_eq!(store.cap_bytes(), 4 * GIB);
+        assert_eq!(store.set_cap_bytes(8 * GIB), Ok(()));
+        assert_eq!(store.cap_bytes(), 8 * GIB, "the cap did not change");
+        assert!(!lines("pharos: video cap verdict=set bytes=8589934592").is_empty());
+        let refused = store.set_cap_bytes(0);
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(store.cap_bytes(), 8 * GIB);
+        assert!(!lines(
+            "pharos: video cap verdict=refused bytes=0 error=the music cache refused 0"
+        )
+        .is_empty());
+    }
+
+    /// A whole inventory that lacks one of a Ready download's files does not
+    /// bring it back Ready: the proxy would 404 the missing file.
+    #[tokio::test]
+    async fn a_failed_unlink_over_an_inventory_missing_a_file_does_not_stay_ready() {
+        let rig = Rig::new("unlink-fails-missing");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(store.inner.file_path("u1", "1", SEG0)).unwrap();
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.remove("u1", "1");
+        let back = only(&store);
+        assert!(
+            matches!(back.state, KeptState::Failed { .. }),
+            "Ready with a file missing: {:?}",
+            back.state
+        );
+        assert!(store.stored_file("u1", SEG0).is_none());
+        assert!(
+            !lines("pharos: video keep remove item=1 verdict=not_removed index=missing").is_empty()
+        );
+    }
+
+    /// A run that a removal has revoked cannot recreate its folder or its
+    /// staging file.
+    #[tokio::test]
+    async fn a_revoked_run_cannot_recreate_its_folder() {
+        let rig = Rig::new("revoked-create");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        store.remove("u1", "1");
+        let dir = rig.dir.join("u1").join("1");
+        let path = store.inner.file_path("u1", "1", SEG0);
+        let out = fetch_once(&store.inner, "u1", "1", 1, SEG0, &path, None).await;
+        assert!(matches!(out, Err(FetchOnce::Gone)), "{}", out.is_ok());
+        assert!(!dir.exists(), "a revoked run brought the folder back");
+    }
+
+    /// A removal whose folder will not delete, while the revoked run's
+    /// staging file is still open: the folder's size is not bounded until
+    /// the writer stops, so it stays unknown and is measured (here deleted)
+    /// only then.
+    #[tokio::test]
+    async fn a_folder_with_a_running_writer_stays_unknown_until_the_writer_stops() {
+        let rig = Rig::new("writer-running");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let mut waited = 0;
+        while store.staged_bytes() == 0 {
+            waited += 1;
+            assert!(waited < 2_000, "the write never started");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(
+            store.size_unknown(),
+            "measured while a writer could still grow the folder"
+        );
+        // The writer is let go, sees it is revoked and stops; the sweep at
+        // its end deletes the folder and the block lifts.
+        release.store(true, Ordering::SeqCst);
+        let mut waited = 0;
+        while store.size_unknown() || store.kept_bytes() > 0 {
+            waited += 1;
+            assert!(
+                waited < 2_000,
+                "unknown={} kept={}",
+                store.size_unknown(),
+                store.kept_bytes()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !rig.dir.join("u1").join("1").exists(),
+            "the folder was not deleted once the writer stopped"
+        );
+    }
+
+    /// With the music cache not up, the shared cap cannot be checked: a new
+    /// download is refused, and starts again once it is.
+    #[tokio::test]
+    async fn a_start_is_refused_until_the_shared_accounting_is_ready() {
+        let rig = Rig::new("accounting-not-ready");
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        let store = rig.open();
+        let refusal = store.start(request("1")).unwrap_err();
+        assert!(matches!(refusal, KeepVideoRefusal::Host(_)), "{refusal:?}");
+        assert!(store.videos("u1").is_empty());
+        assert!(rig.server.asked().is_empty());
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+    }
+
+    /// Waits, bounded, until the run has logged that it waits for the
+    /// accounting and slept at least once.
+    async fn until_waiting(rig: &Rig, item: &str) {
+        for _ in 0..2000 {
+            if !lines(&format!("pharos: video keep waiting item={item}")).is_empty()
+                && !rig.slept.lock().unwrap().is_empty()
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        panic!("the run of {item} never waited for the accounting");
+    }
+
+    /// A download that restarts with no plan and none of its files is fresh:
+    /// it plans only once the shared accounting is ready, or it would be
+    /// admitted against the default cap and no music. It waits for it,
+    /// admitting nothing meanwhile, and does not end Failed.
+    #[tokio::test]
+    async fn a_restarted_download_with_no_plan_waits_for_the_shared_accounting() {
+        let rig = Rig::new("fresh-not-ready");
+        // The music cache is not up when the run would plan.
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        let store = rig.open();
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.start(request("1")).unwrap();
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        until_waiting(&rig, "1").await;
+        assert!(matches!(only(&store).state, KeptState::Downloading { .. }));
+        assert_eq!(store.kept_bytes(), 0, "admitted without the accounting");
+        assert!(
+            rig.server.asked().is_empty(),
+            "planned without the accounting"
+        );
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(only(&store).ready());
+    }
+
+    /// The music library is published while a run waits for it: the plan
+    /// is checked against the library's real cap, never the default cap and
+    /// no music it saw before.
+    #[tokio::test]
+    async fn a_library_published_during_admission_does_not_pass_a_stale_check() {
+        let rig = Rig::new("publish-during-run");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        until_waiting(&rig, "1").await;
+        // The library goes up, with the real (tiny) cap.
+        rig.budget.cap.store(1, Ordering::SeqCst);
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("the plan was admitted against the default cap");
+        };
+        assert!(!reason.contains("music cache is not up"), "{reason}");
+    }
+
+    /// The same for a start.
+    #[tokio::test]
+    async fn a_library_published_during_a_start_does_not_pass_a_stale_check() {
+        let rig = Rig::new("publish-during-start");
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        let store = rig.open();
+        let b = rig.budget.clone();
+        *rig.budget.on_free.lock().unwrap() = Some(Box::new(move || {
+            b.cap.store(1, Ordering::SeqCst);
+            b.ready.store(true, Ordering::SeqCst);
+        }));
+        let refusal = store.start(request("1")).unwrap_err();
+        *rig.budget.on_free.lock().unwrap() = None;
+        assert!(matches!(refusal, KeepVideoRefusal::Host(_)), "{refusal:?}");
+        assert!(store.videos("u1").is_empty());
+    }
+
+    /// An interrupted download reopened with no plan and none of its files
+    /// is fresh: reopened with the accounting not up, it waits for it, and
+    /// downloads once it is.
+    #[tokio::test]
+    async fn a_reopened_interrupted_download_with_no_plan_waits_for_the_accounting() {
+        let rig = Rig::new("reopen-no-plan");
+        let first = rig.open();
+        first.start(request("1")).unwrap();
+        // Closed before the run planned anything.
+        for t in first.inner.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
+        drop(first);
+        rig.budget.ready.store(false, Ordering::SeqCst);
+        rig.slept.lock().unwrap().clear();
+        let store = rig.open();
+        until_waiting(&rig, "1").await;
+        assert!(
+            matches!(only(&store).state, KeptState::Downloading { .. }),
+            "the restarted download was admitted without the accounting"
+        );
+        rig.budget.ready.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(only(&store).ready());
+    }
+
+    /// A walk of the folder that comes back short (a transient EMFILE) must
+    /// not persist as an empty folder: the record keeps its figure, and the
+    /// folder is unknown until a sweep measures it whole.
+    #[tokio::test]
+    async fn a_short_walk_of_the_folder_does_not_record_it_as_empty() {
+        let rig = Rig::new("short-walk");
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        // The sweep's measure is unreadable too, so the fact stays.
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        FAIL_DISK_WALK.with(|f| f.set(true));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_DISK_WALK.with(|f| f.set(false));
+        assert!(only(&store).ready());
+        assert!(
+            store.kept_bytes() > 0,
+            "the record fell to {} after a short walk",
+            store.kept_bytes()
+        );
+        assert!(store.size_unknown(), "a short walk left the folder known");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+    }
+
+    /// CR review 5995575621 (kept_video_disk.rs:3957-3964): a run that a
+    /// replacement took over before its short terminal walk does not mark
+    /// the folder unknown: the replacement's admission is not refused over
+    /// an old run's walk.
+    #[tokio::test]
+    async fn a_superseded_runs_short_walk_leaves_the_folder_known() {
+        let rig = Rig::new("short-walk-superseded");
+        let dir = rig.dir.join("u1").join("1");
+        let release = rig.server.hold_mid_body(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        {
+            let mut st = lock(&store.inner.state);
+            let key = ("u1".to_owned(), "1".to_owned());
+            let run = st.runs[&key];
+            st.runs.insert(key, run + 1_000);
+        }
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        FAIL_DISK_WALK.with(|f| f.set(true));
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        FAIL_DISK_WALK.with(|f| f.set(false));
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        assert!(
+            !lock(&store.inner.state).leftover.contains(&dir),
+            "the superseded run's short walk left the folder unknown"
+        );
+        assert!(
+            !lines("pharos: video folder short walk not marked item=1").is_empty(),
+            "no verdict logged"
+        );
+    }
+
+    /// A download bigger than its estimate, finished while the walk of its
+    /// folder falls short: the record keeps what it downloaded (not its
+    /// estimate), the folder is unknown before the record is published, and
+    /// the figure survives a reopen.
+    #[tokio::test]
+    async fn a_download_above_its_estimate_keeps_its_bytes_after_a_short_walk() {
+        let rig = Rig::new("short-walk-big");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![2; 20_000_000]);
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        FAIL_DISK_WALK.with(|f| f.set(true));
+        let (s2, d2) = (store.clone(), dir.clone());
+        let unknown_first = std::rc::Rc::new(std::cell::Cell::new(None));
+        let u2 = unknown_first.clone();
+        DURING_SAVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move |v: &KeptVideo| {
+                if v.ready() {
+                    u2.set(Some(lock(&s2.inner.state).leftover.contains(&d2)));
+                }
+            }));
+        });
+        let mut req = request("1");
+        req.runtime_ms = 1_000;
+        store.start(req).unwrap();
+        store.settled().await;
+        FAIL_DISK_WALK.with(|f| f.set(false));
+        DURING_SAVE.with(|d| *d.borrow_mut() = None);
+        assert!(only(&store).ready());
+        assert_eq!(
+            unknown_first.get(),
+            Some(true),
+            "the record was published before the folder was marked unknown"
+        );
+        assert!(
+            store.kept_bytes() >= 20_000_000,
+            "the record fell to {}",
+            store.kept_bytes()
+        );
+        drop(store);
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        let reopened = rig.open();
+        assert!(
+            reopened.kept_bytes() >= 20_000_000,
+            "the figure did not survive a reopen: {}",
+            reopened.kept_bytes()
+        );
+    }
+
+    /// A staging file that cannot be deleted does not drop out of the
+    /// accounting: with the manifest unlink failing too, the folder stays
+    /// unknown after the writer has stopped, until a later sweep deletes the
+    /// file and the folder is measured whole.
+    #[tokio::test]
+    async fn a_staging_file_that_will_not_delete_keeps_the_folder_unknown_until_a_sweep() {
+        let rig = Rig::new("part-stays");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).ok();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        assert_eq!(store.videos("u1").len(), 1, "the record did not come back");
+        // The revoked run's file grows after the record was put back.
+        let big = estimate_bytes(2_000_000, 12_000) * 3;
+        for e in std::fs::read_dir(dir.join("files")).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "part") {
+                let f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(e.path())
+                    .unwrap();
+                f.set_len(big).unwrap();
+            }
+        }
+        release.store(true, Ordering::SeqCst);
+        // The writer stops; its file will not go.
+        let mut waited = 0;
+        while lock(&store.inner.state).writing(&dir) {
+            waited += 1;
+            assert!(waited < 2_000, "the writer never stopped");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        store.settled().await;
+        let parts = || {
+            std::fs::read_dir(dir.join("files"))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "part"))
+                .count()
+        };
+        assert!(parts() > 0, "the file was deleted anyway");
+        // Counted or unknown, never uncounted: what the file holds is in the
+        // figure once the folder has been read whole.
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= big,
+            "the leftover file went uncounted: kept {}",
+            store.kept_bytes()
+        );
+        // Later the file goes and the record can be written again, and a
+        // sweep resolves the folder.
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        std::fs::remove_dir_all(dir.join("manifest.json")).unwrap();
+        store.inner.sweep_tombstones();
+        assert!(!store.size_unknown(), "the sweep did not resolve it");
+        // The sweep deleted the file and measured the folder whole: the
+        // terminal record is charged that measure, so the file's bytes go
+        // back to the budget (outside-diff item kept_video_disk.rs:1155).
+        assert_eq!(parts(), 0, "the sweep kept the staging file");
+        assert!(
+            store.kept_bytes() < big,
+            "the deleted file stayed charged: kept {}",
+            store.kept_bytes()
+        );
+    }
+
+    /// Outside-diff item kept_video_disk.rs:1155: a terminal record with
+    /// no run, whose folder a sweep measures whole after deleting its
+    /// staging files, is charged what was measured, so the deleted bytes go
+    /// back to the budget. A larger saved charge does not stay.
+    #[tokio::test]
+    async fn a_terminal_records_charge_follows_a_whole_measure() {
+        let rig = Rig::new("terminal-charge");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let stale = dir.join("files").join("stale.9.part");
+        std::fs::write(&stale, vec![0u8; 50_000]).unwrap();
+        {
+            let mut st = lock(&store.inner.state);
+            let v = st.list.iter_mut().find(|v| v.item == "1").unwrap();
+            v.state = KeptState::Failed {
+                reason: "test".to_owned(),
+            };
+            // As an earlier measure that counted the staging file left it.
+            v.estimated_bytes = v.estimated_bytes.saturating_add(50_000);
+            st.leftover.push(dir.clone());
+        }
+        store.inner.sweep_tombstones();
+        assert!(!stale.exists(), "the sweep kept the staging file");
+        // The sweep's measure (the manifest it saves after may differ by a
+        // few bytes).
+        let charged = only(&store).estimated_bytes;
+        let measured = dir_size(&dir).whole().unwrap();
+        assert!(
+            charged < 50_000 && charged.abs_diff(measured) < 100,
+            "the deleted staging bytes stayed charged: {charged} (measured {measured})"
+        );
+    }
+
+    /// An interrupted plan (a Downloading record with no run) keeps its
+    /// reservation through the same sweep: it will fetch the rest.
+    #[tokio::test]
+    async fn an_interrupted_plans_charge_survives_a_whole_measure() {
+        let rig = Rig::new("interrupted-charge");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let before = {
+            let mut st = lock(&store.inner.state);
+            let v = st.list.iter_mut().find(|v| v.item == "1").unwrap();
+            v.state = KeptState::Downloading {
+                done: 1,
+                total: 5,
+                bytes: 10,
+            };
+            v.estimated_bytes = 90_000;
+            st.leftover.push(dir.clone());
+            90_000
+        };
+        store.inner.sweep_tombstones();
+        assert_eq!(only(&store).estimated_bytes, before);
+    }
+
+    /// A tombstoned folder with a leftover and a big file in it, for the
+    /// settlement tests; returns the store and the folder.
+    async fn tomb_with_leftover(name: &str) -> (Rig, Arc<DiskVideoStore>, PathBuf) {
+        let rig = Rig::new(name);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        let dir = rig.dir.join("u1").join("1");
+        lock(&store.inner.state).leftover.push(dir.clone());
+        (rig, store, dir)
+    }
+
+    /// The host's check runs under the music cache's locks, so it deletes
+    /// nothing. A user folder unlisted at open that hides an orphan (a
+    /// removed download's folder, no record) and a download with a stale
+    /// staging file is recovered through the hook alone: both are counted
+    /// and stay on disk. The next ordinary sweep deletes them.
+    #[tokio::test]
+    async fn the_host_check_counts_an_orphan_and_stale_parts_and_deletes_neither() {
+        let rig = Rig::new("host-no-delete");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let user = rig.dir.join("u1");
+        let orphan = user.join("9");
+        std::fs::create_dir_all(orphan.join("files")).unwrap();
+        std::fs::write(orphan.join("files").join("a"), [1u8; 300]).unwrap();
+        let part = user.join("1").join("files").join("x.7.part");
+        std::fs::write(&part, [2u8; 40]).unwrap();
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        let hook = || crate::native::ports::outside_bytes(Some(&*store));
+        assert!(hook().unknown, "not blocked while the folder is unlisted");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let outside = hook();
+        assert!(!outside.unknown, "the hook did not recover the folder");
+        assert!(orphan.exists(), "the host check deleted the orphan");
+        assert!(part.exists(), "the host check deleted a staging file");
+        let tomb = lock(&store.inner.state)
+            .tombstones
+            .iter()
+            .find(|(d, _)| *d == orphan)
+            .map(|(_, b)| *b);
+        assert!(
+            tomb.is_some_and(|b| b >= 300),
+            "the orphan is not counted: {tomb:?}"
+        );
+        assert!(outside.held >= 300 + 40, "held {}", outside.held);
+
+        // An ordinary sweep deletes them.
+        store.inner.sweep_tombstones();
+        assert!(!orphan.exists(), "the ordinary sweep left the orphan");
+        assert!(!part.exists(), "the ordinary sweep left the staging file");
+        assert!(!store.size_unknown());
+    }
+
+    /// A segment fails while a parallel fetch has a large staging file in
+    /// flight. The cancelled fetch's file goes before the Failed record's
+    /// smaller figure is published; when it will not go, the folder is
+    /// unknown first, so an admission planned right then is refused.
+    #[tokio::test]
+    async fn a_failed_download_drops_or_counts_its_cancelled_parts_before_its_figure_falls() {
+        for stuck in [false, true] {
+            let rig = Rig::new(if stuck {
+                "failed-parts-stuck"
+            } else {
+                "failed-parts"
+            });
+            let _gate = rig.server.hold_mid_body(SEG0);
+            let fail = rig.server.hold_first(SEG1);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            let files = rig.dir.join("u1").join("1").join("files");
+            // The held segment's staging file: one a playlist staged while
+            // planning is renamed into place before the failure.
+            let seg0 = file_name(SEG0);
+            let part = || {
+                std::fs::read_dir(&files).ok().and_then(|r| {
+                    r.flatten().map(|e| e.path()).find(|p| {
+                        p.extension().is_some_and(|x| x == "part")
+                            && p.file_name()
+                                .is_some_and(|n| n.to_string_lossy().starts_with(&seg0))
+                    })
+                })
+            };
+            let mut waited = 0;
+            let part = loop {
+                if let Some(p) = part() {
+                    break p;
+                }
+                waited += 1;
+                assert!(waited < 2_000, "no fetch staged a file");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            };
+            // Larger than the plan's whole estimate.
+            let big = 20_000_000;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&part)
+                .unwrap()
+                .set_len(big)
+                .unwrap();
+            FAIL_PART_DELETE.with(|f| f.set(stuck));
+            let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
+            let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
+            set_hook(&AFTER_FAILED_SAVE, move || {
+                let on_disk = on_disk(&files2);
+                // What an admission planned now would find: `admit` refuses
+                // while any folder is unknown. (Read from the state: the
+                // host's check behind `size_unknown` would settle it.)
+                let refused = lock(&s2.inner.state).unknown_folder().is_some();
+                *seen2.borrow_mut() = Some((refused, s2.kept_bytes(), on_disk));
+            });
+            fail.store(true, Ordering::SeqCst);
+            store.settled().await;
+            clear_hook(&AFTER_FAILED_SAVE);
+            FAIL_PART_DELETE.with(|f| f.set(false));
+            let (refused, kept, on_disk) = (*seen.borrow()).expect("the download did not fail");
+            assert!(
+                refused || kept >= on_disk,
+                "stuck={stuck}: the figure fell to {kept} with {on_disk} on disk"
+            );
+            if stuck {
+                assert!(refused, "admissible while the stuck file was uncounted");
+            } else {
+                assert!(!part.exists(), "the cancelled fetch's file stayed");
+            }
+        }
+    }
+
+    /// A failed download whose cancelled staging file will not go marks its
+    /// folder unknown, then publishes its Failed figure, which counts no
+    /// staging file. A sweep landing between the two must not measure the
+    /// file, clear the mark and have the smaller figure replace its
+    /// measure: the folder stays unknown until the figure is out.
+    #[tokio::test]
+    async fn a_sweep_between_a_failure_and_its_figure_leaves_the_folder_unknown() {
+        let rig = Rig::new("failed-parts-sweep");
+        let _gate = rig.server.hold_mid_body(SEG0);
+        let fail = rig.server.hold_first(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let files = rig.dir.join("u1").join("1").join("files");
+        // The held segment's staging file: one a playlist staged while
+        // planning is renamed into place before the failure.
+        let seg0 = file_name(SEG0);
+        let part = || {
+            std::fs::read_dir(&files).ok().and_then(|r| {
+                r.flatten().map(|e| e.path()).find(|p| {
+                    p.extension().is_some_and(|x| x == "part")
+                        && p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with(&seg0))
+                })
+            })
+        };
+        let mut waited = 0;
+        let part = loop {
+            if let Some(p) = part() {
+                break p;
+            }
+            waited += 1;
+            assert!(waited < 2_000, "the held segment staged no file");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        };
+        // Larger than the plan's whole estimate.
+        let big = 20_000_000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .unwrap()
+            .set_len(big)
+            .unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let s1 = store.clone();
+        set_hook(&BEFORE_FAILED_UPDATE, move || {
+            s1.inner.settle_leftovers(Sweep::Ordinary);
+        });
+        let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
+        let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
+        set_hook(&AFTER_FAILED_SAVE, move || {
+            let on_disk = on_disk(&files2);
+            let refused = lock(&s2.inner.state).unknown_folder().is_some();
+            *seen2.borrow_mut() = Some((refused, s2.kept_bytes(), on_disk));
+        });
+        fail.store(true, Ordering::SeqCst);
+        store.settled().await;
+        clear_hook(&BEFORE_FAILED_UPDATE);
+        clear_hook(&AFTER_FAILED_SAVE);
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        let (refused, kept, on_disk) = (*seen.borrow()).expect("the download did not fail");
+        assert!(
+            refused || kept >= on_disk,
+            "the sweep cleared the mark and the figure fell to {kept} with {on_disk} on disk"
+        );
+        assert!(
+            lock(&store.inner.state).terminating.is_empty(),
+            "the terminal mark outlived the run"
+        );
+    }
+
+    /// An interrupted download (a segment missing) with an old run's
+    /// staging file of `big` bytes, in a user folder the store could not
+    /// list at open, recovered by the host's check alone. Returns the store
+    /// (its resume running), the item folder and the staging file.
+    async fn host_recovers_an_interrupted_download_with_an_old_part(
+        rig: &Rig,
+        big: u64,
+    ) -> (Arc<DiskVideoStore>, PathBuf, PathBuf) {
+        host_recovers_an_interrupted_download_with_a_part(rig, big, "x.99.part").await
+    }
+
+    /// [`host_recovers_an_interrupted_download_with_an_old_part`] with the
+    /// staging file named `name`; a name ending in `/` is a folder holding
+    /// a file of `big` bytes.
+    async fn host_recovers_an_interrupted_download_with_a_part(
+        rig: &Rig,
+        big: u64,
+        name: &str,
+    ) -> (Arc<DiskVideoStore>, PathBuf, PathBuf) {
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let user = rig.dir.join("u1");
+        let dir = user.join("1");
+        let manifest = dir.join("manifest.json");
+        let mut v: KeptVideo = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        v.state = KeptState::Downloading {
+            done: 4,
+            total: 5,
+            bytes: 1,
+        };
+        std::fs::write(&manifest, serde_json::to_vec(&v).unwrap()).unwrap();
+        std::fs::remove_file(dir.join("files").join(file_name(SEG1))).unwrap();
+        let part = dir.join("files").join(name.trim_end_matches('/'));
+        if name.ends_with('/') {
+            std::fs::create_dir_all(&part).unwrap();
+            std::fs::File::create(part.join("inner"))
+                .unwrap()
+                .set_len(big)
+                .unwrap();
+        } else {
+            std::fs::File::create(&part).unwrap().set_len(big).unwrap();
+        }
+        UNREADABLE.with(|u| u.borrow_mut().push(user.clone()));
+        let store = rig.open();
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let outside = crate::native::ports::outside_bytes(Some(&*store));
+        assert!(!outside.unknown, "the hook did not recover the folder");
+        assert!(outside.held >= big, "the host check left it uncounted");
+        (store, dir, part)
+    }
+
+    /// The media files and every staging file in `dir`: what a download's
+    /// figure must cover (its own manifest is not part of it).
+    fn media_on_disk(dir: &Path) -> u64 {
+        on_disk(&dir.join("files"))
+    }
+
+    /// The host's check recovers an interrupted download with an old run's
+    /// staging file and resumes it. The resume is not on the host's path:
+    /// it deletes the old file before its plan is admitted, so every byte in
+    /// the folder is counted after admission and after completion, with no
+    /// ordinary sweep between.
+    #[tokio::test]
+    async fn a_resume_after_the_host_check_drops_the_old_runs_staging_file() {
+        let rig = Rig::new("host-resume-part");
+        // Larger than the plan's whole estimate, so an admission that
+        // replaces the floor cannot cover it by chance.
+        let big = 20_000_000;
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+
+        // The resume is spawned, not yet run (one thread): held from here.
+        let release = rig.server.hold_mid_body(SEG1);
+        // Admitted, the segment still in flight.
+        let admitted = plan_decided(&store, "1").await;
+        assert!(
+            !matches!(admitted.state, KeptState::Failed { .. }),
+            "{admitted:?}"
+        );
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "after admission: kept {} of {on_disk} on disk (old part there: {})",
+            store.kept_bytes(),
+            part.exists()
+        );
+        assert!(
+            !lock(&store.inner.state).deferred_parts.contains(&dir),
+            "the resume left the folder's parts deferred"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "after completion: kept {} of {on_disk} on disk (old part there: {})",
+            store.kept_bytes(),
+            part.exists()
+        );
+    }
+
+    /// An earlier process's staging file named for run 1, the id a new
+    /// open used to give its first run: inherited, so foreign, and dropped
+    /// before the resume's plan is admitted, never taken for the new run's
+    /// own and left uncounted.
+    #[tokio::test]
+    async fn an_inherited_part_named_for_run_one_is_not_the_new_runs_own() {
+        let rig = Rig::new("host-resume-run-one");
+        let big = 20_000_000;
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_a_part(&rig, big, "x.1.part").await;
+        let release = rig.server.hold_mid_body(SEG1);
+        let admitted = plan_decided(&store, "1").await;
+        assert!(
+            !matches!(admitted.state, KeptState::Failed { .. }),
+            "{admitted:?}"
+        );
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "after admission: kept {} of {on_disk} on disk (inherited part there: {})",
+            store.kept_bytes(),
+            part.exists()
+        );
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(
+            !part.exists(),
+            "the inherited part was taken for the run's own"
+        );
+    }
+
+    /// An open whose first run id is exactly the one an inherited staging
+    /// file is named for: the file is still no live writer's, so it goes
+    /// before the run stages anything and never sits uncounted beside the
+    /// run. `RUN_BASE` sets the base directly and skips `open_run_base`, so
+    /// both bases here (0 included) are seeded by the test, not by a clock.
+    /// A real clock cannot give 0: one that reads before the epoch gives a
+    /// base of at least 2^32 past the last one (the first run in a process
+    /// is 4294967297).
+    #[tokio::test]
+    async fn an_inherited_part_with_the_new_runs_own_id_is_dropped_before_it_writes() {
+        for base in [1_000u64, 0] {
+            let rig = Rig::new(&format!("host-resume-same-id-{base}"));
+            RUN_BASE.with(|b| b.set(Some(base)));
+            let big = 20_000_000;
+            // Each open's first run is base + 1.
+            let name = format!("x.{}.part", base + 1);
+            let (store, dir, part) =
+                host_recovers_an_interrupted_download_with_a_part(&rig, big, &name).await;
+            let release = rig.server.hold_mid_body(SEG1);
+            let admitted = plan_decided(&store, "1").await;
+            RUN_BASE.with(|b| b.set(None));
+            let run = lock(&store.inner.state)
+                .runs
+                .get(&("u1".to_owned(), "1".to_owned()))
+                .copied();
+            assert_eq!(run, Some(base + 1), "the fixture's id is not the run's");
+            assert!(
+                !matches!(admitted.state, KeptState::Failed { .. }),
+                "{admitted:?}"
+            );
+            let on_disk = media_on_disk(&dir);
+            assert!(
+                store.size_unknown() || store.kept_bytes() >= on_disk,
+                "base={base}: after admission: kept {} of {on_disk} on disk (inherited part there: {})",
+                store.kept_bytes(),
+                part.exists()
+            );
+            release.store(true, Ordering::SeqCst);
+            store.settled().await;
+            assert!(
+                !part.exists(),
+                "base={base}: the inherited part was taken for the run's own"
+            );
+        }
+    }
+
+    /// The same resume with the old staging file refusing to go: the folder
+    /// is a leftover (unknown), the plan is refused, and the file's bytes
+    /// never drop out of the accounting.
+    #[tokio::test]
+    async fn a_resume_whose_old_staging_file_will_not_go_is_refused_and_keeps_it_counted() {
+        let rig = Rig::new("host-resume-part-stuck");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+        let decided = plan_decided(&store, "1").await;
+        store.settled().await;
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        assert!(
+            matches!(decided.state, KeptState::Failed { .. }),
+            "admitted with the old file's bytes unaccounted: {decided:?}"
+        );
+        assert!(part.exists());
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "kept {} of {on_disk} on disk",
+            store.kept_bytes()
+        );
+    }
+
+    /// The same, with the music hook settling the folder before the plan is
+    /// admitted (the run owns it, no writer is in it): the staging file
+    /// that would not go stays counted through the admitted plan, never
+    /// replaced by an inventory that leaves it out.
+    #[tokio::test]
+    async fn a_settled_staging_file_stays_reserved_through_the_plan() {
+        let rig = Rig::new("host-resume-part-settled");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+        let s2 = store.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PLAN_ADMIT, move || {
+            if !once.replace(true) {
+                s2.inner.settle_leftovers(Sweep::HostCheck);
+            }
+        });
+        let decided = plan_decided(&store, "1").await;
+        clear_hook(&BEFORE_PLAN_ADMIT);
+        assert!(part.exists());
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "the plan replaced the staging file's floor: kept {} of {on_disk} on disk ({decided:?})",
+            store.kept_bytes()
+        );
+        store.settled().await;
+        // After the run ends too: its terminal figure still counts the
+        // staging file that would not go.
+        assert!(part.exists());
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "the finished run dropped the staging file's bytes: kept {} of {on_disk} on disk ({:?})",
+            store.kept_bytes(),
+            only(&store).state
+        );
+        FAIL_PART_DELETE.with(|f| f.set(false));
+    }
+
+    /// A `.part` entry that is a folder (it would not delete) counts by
+    /// everything under it, the same at admission and at the run's exit:
+    /// never by the folder's own small length, which would let the plan and
+    /// the terminal figure drop the bytes inside it.
+    #[tokio::test]
+    async fn a_staging_folder_counts_by_what_it_holds() {
+        let rig = Rig::new("host-resume-part-dir");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, dir, part) =
+            host_recovers_an_interrupted_download_with_a_part(&rig, big, "x.99.part/").await;
+        assert!(
+            parts_bytes(&dir).counted(0) >= big,
+            "{:?}",
+            parts_bytes(&dir)
+        );
+        assert!(parts_bytes_except(&dir, 7).counted(0) >= big);
+        let s2 = store.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PLAN_ADMIT, move || {
+            if !once.replace(true) {
+                s2.inner.settle_leftovers(Sweep::HostCheck);
+            }
+        });
+        let decided = plan_decided(&store, "1").await;
+        clear_hook(&BEFORE_PLAN_ADMIT);
+        assert!(part.is_dir());
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "the plan took the staging folder at its own length: kept {} of {on_disk} ({decided:?})",
+            store.kept_bytes()
+        );
+        store.settled().await;
+        let on_disk = media_on_disk(&dir);
+        assert!(
+            store.size_unknown() || store.kept_bytes() >= on_disk,
+            "the finished run dropped the staging folder's bytes: kept {} of {on_disk}",
+            store.kept_bytes()
+        );
+        FAIL_PART_DELETE.with(|f| f.set(false));
+    }
+
+    /// A staging file listing that could not be read whole leaves the
+    /// folder unknown: the settlement keeps the leftover, never a floor of
+    /// zero retained bytes.
+    #[tokio::test]
+    async fn a_short_staging_listing_keeps_the_folder_unknown() {
+        let rig = Rig::new("host-resume-part-short");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, dir, _part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+        let s2 = store.clone();
+        let d2 = dir.clone();
+        let kept = std::rc::Rc::new(std::cell::Cell::new(None));
+        let k2 = kept.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PLAN_ADMIT, move || {
+            if !once.replace(true) {
+                FAIL_ENTRY_READ.with(|f| f.set(true));
+                s2.inner.settle_leftovers(Sweep::HostCheck);
+                FAIL_ENTRY_READ.with(|f| f.set(false));
+                k2.set(Some(lock(&s2.inner.state).leftover.contains(&d2)));
+            }
+        });
+        let _ = plan_decided(&store, "1").await;
+        clear_hook(&BEFORE_PLAN_ADMIT);
+        store.settled().await;
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        assert_eq!(
+            kept.get(),
+            Some(true),
+            "a short staging listing settled the folder: {:?}",
+            captured()
+        );
+        assert!(
+            !lines("pharos: video keep leftover verdict=kept reason=staging_files_unmeasured")
+                .is_empty()
+        );
+    }
+
+    /// A resume whose plan the kept staging file widens past its
+    /// reservation is checked against the shared cap, not only the free
+    /// space: here the widened plan does not fit the cap, and is refused.
+    /// Review 5987746170 (kept_video_disk.rs:1219): what a settlement keeps
+    /// for a folder's staging files is measured after its deletion, owned
+    /// or not: a file that would not go stays reserved, and a folder with
+    /// none left drops an earlier figure.
+    #[tokio::test]
+    async fn a_settlement_keeps_what_its_staging_files_hold_after_deletion() {
+        let rig = Rig::new("settle-retained");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let part = dir.join("files").join("x.9.part");
+        std::fs::File::create(&part).unwrap().set_len(500).unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        lock(&store.inner.state).leftover.push(dir.clone());
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        assert!(part.exists());
+        assert_eq!(
+            lock(&store.inner.state).retained_parts.get(&dir).copied(),
+            Some(500),
+            "a staging file that would not delete was not kept reserved"
+        );
+        // Gone now: the next settlement drops the figure.
+        std::fs::remove_file(&part).unwrap();
+        lock(&store.inner.state).leftover.push(dir.clone());
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        assert_eq!(
+            lock(&store.inner.state).retained_parts.get(&dir).copied(),
+            None,
+            "a stale figure stayed"
+        );
+    }
+
+    /// CR outside-diff kept_video_disk.rs:4231-4233: a retry that deletes
+    /// a staging file a settlement had kept reserved drops that figure, so
+    /// the next plan is not charged for bytes no longer on disk.
+    #[tokio::test]
+    async fn a_cleanup_that_deletes_a_kept_staging_file_drops_its_charge() {
+        let rig = Rig::new("cleanup-retained");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        let part = dir.join("files").join("x.9.part");
+        std::fs::File::create(&part).unwrap().set_len(500).unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        lock(&store.inner.state).leftover.push(dir.clone());
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        assert_eq!(
+            lock(&store.inner.state).retained_parts.get(&dir).copied(),
+            Some(500)
+        );
+        // A retry's run deletes it.
+        lock(&store.inner.state)
+            .runs
+            .insert(("u1".to_owned(), "1".to_owned()), 42);
+        drop_old_runs_parts(&store.inner, "u1", "1", 42);
+        assert!(!part.exists());
+        assert_eq!(
+            lock(&store.inner.state).retained_parts.get(&dir).copied(),
+            None,
+            "a deleted staging file stayed charged"
+        );
+        assert!(lines("pharos: video keep old parts item=1 run=42")
+            .iter()
+            .any(|l| l.contains("retained_cleared=500") && l.contains("verdict=settled")));
+        lock(&store.inner.state)
+            .runs
+            .remove(&("u1".to_owned(), "1".to_owned()));
+    }
+
+    /// Outside diff kept_video_disk.rs:1868 (review 5997638687): a resume
+    /// whose plan is over the reservation it holds now, with no staging
+    /// file kept, is checked against the shared cap as a fresh download:
+    /// the other kinds took the cap, so it is refused. The control: a plan
+    /// within its reservation resumes on free space alone.
+    #[tokio::test]
+    async fn a_resume_over_its_live_reservation_is_checked_against_the_cap() {
+        let rig = Rig::new("resume-over-reservation");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let key = ("u1".to_owned(), "1".to_owned());
+        for over in [true, false] {
+            lock(&store.inner.state).runs.insert(key.clone(), 42);
+            let held = 12_000_000u64;
+            if let Some(v) = lock(&store.inner.state)
+                .list
+                .iter_mut()
+                .find(|v| v.item == "1")
+            {
+                v.estimated_bytes = held;
+            }
+            let plan = Plan {
+                files: Vec::new(),
+                estimate: if over { 15_000_000 } else { held },
+                total: 0,
+                stored: 0,
+                stale: 0,
+            };
+            // The other kinds hold all of the cap.
+            let check = Check::Resume {
+                other: 100_000_000,
+                cap: 100_000_000,
+                ready: true,
+                unknown: false,
+            };
+            let verdict = store.inner.admit("u1", "1", 42, &plan, check, 0);
+            lock(&store.inner.state).runs.remove(&key);
+            if over {
+                assert!(
+                    matches!(verdict, Err(Admission::Refused { .. })),
+                    "a resume over its reservation passed on free space alone"
+                );
+                assert!(lines("pharos: video resume replanned item=1 run=42")
+                    .iter()
+                    .any(|l| l.contains("reason=plan_exceeds_reservation")));
+            } else {
+                assert!(
+                    verdict.is_ok(),
+                    "a resume within its reservation was refused"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resume_widened_by_a_kept_staging_file_is_checked_against_the_cap() {
+        let rig = Rig::new("host-resume-part-cap");
+        let big = 20_000_000;
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let (store, _dir, _part) =
+            host_recovers_an_interrupted_download_with_an_old_part(&rig, big).await;
+        rig.budget.cap.store(big + 1_000_000, Ordering::SeqCst);
+        let s2 = store.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PLAN_ADMIT, move || {
+            if !once.replace(true) {
+                s2.inner.settle_leftovers(Sweep::HostCheck);
+            }
+        });
+        let decided = plan_decided(&store, "1").await;
+        clear_hook(&BEFORE_PLAN_ADMIT);
+        store.settled().await;
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        let log = captured();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("reason=retained_parts_raised_estimate")),
+            "{log:?}"
+        );
+        assert!(
+            matches!(decided.state, KeptState::Failed { .. })
+                || log
+                    .iter()
+                    .any(|l| l.contains("pharos: video keep refused item=1")),
+            "a widened resume passed on free space alone: {decided:?} {log:?}"
+        );
+    }
+
+    /// A car-only process: a removed download's folder that would not
+    /// delete and could not be read, with a staging file that would not go,
+    /// recovers through the music hook alone once the folder reads again.
+    /// The tombstone is measured, not deleted (the hook runs under the
+    /// music cache's locks), and the leftover settles.
+    #[tokio::test]
+    async fn the_music_size_check_recovers_tombstones_and_leftovers() {
+        let (_rig, store, dir) = tomb_with_leftover("hook-tomb").await;
+        lock(&store.inner.state).bump(&dir);
+        UNREADABLE.with(|u| u.borrow_mut().push(dir.clone()));
+        let hook = || crate::native::ports::outside_bytes(Some(&*store));
+        assert!(hook().unknown, "not blocked while the folder is unreadable");
+        UNREADABLE.with(|u| u.borrow_mut().clear());
+        *store.inner.last_sweep.lock().unwrap() = None;
+        let outside = hook();
+        assert!(!outside.unknown, "the hook did not recover the folder");
+        assert!(outside.held > 0, "the tombstone stopped counting");
+        assert!(dir.exists(), "the hook deleted a folder");
+        let st = lock(&store.inner.state);
+        assert!(st.leftover.is_empty(), "the leftover did not settle");
+        assert_eq!(st.tombstones.len(), 1);
+        drop(st);
+        assert!(!lines("pharos: video keep tombstone measured").is_empty());
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    type Hook = std::thread::LocalKey<RefCell<Option<Box<dyn Fn()>>>>;
+
+    fn set_hook(hook: &'static Hook, f: impl Fn() + 'static) {
+        hook.with(|d| *d.borrow_mut() = Some(Box::new(f)));
+    }
+
+    fn clear_hook(hook: &'static Hook) {
+        hook.with(|d| *d.borrow_mut() = None);
+    }
+
+    /// A walk that a writer's start and stop overtook is not taken: the
+    /// leftover stays until a walk made after the last change.
+    #[tokio::test]
+    async fn a_settlement_overtaken_by_a_change_applies_nothing() {
+        let (_rig, store, dir) = tomb_with_leftover("settle-stale").await;
+        let s2 = store.clone();
+        let d2 = dir.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&DURING_MEASURE, move || {
+            if !once.replace(true) {
+                lock(&s2.inner.state).bump(&d2);
+            }
+        });
+        let before = store.kept_bytes();
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        clear_hook(&DURING_MEASURE);
+        assert!(
+            lock(&store.inner.state).leftover.contains(&dir),
+            "a stale walk cleared the leftover"
+        );
+        assert_eq!(
+            store.kept_bytes(),
+            before,
+            "a stale walk changed the figure"
+        );
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        assert!(
+            !lock(&store.inner.state).leftover.contains(&dir),
+            "a walk made after the change did not settle it"
+        );
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// While one sweep settles a folder, a second sweep does not, and a
+    /// start in it is refused: the first sweep's view cannot go stale under
+    /// a settlement and a retry.
+    #[tokio::test]
+    async fn one_settlement_per_folder_and_a_start_waits_for_it() {
+        let (_rig, store, dir) = tomb_with_leftover("settle-once").await;
+        let s2 = store.clone();
+        let d2 = dir.clone();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen2 = seen.clone();
+        set_hook(&BEFORE_SETTLE_DROP, move || {
+            s2.inner.settle_leftovers(Sweep::Ordinary);
+            seen2
+                .borrow_mut()
+                .push(lock(&s2.inner.state).leftover.contains(&d2));
+            seen2.borrow_mut().push(s2.start(request("1")).is_err());
+        });
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        clear_hook(&BEFORE_SETTLE_DROP);
+        assert_eq!(
+            *seen.borrow(),
+            vec![true, true],
+            "the nested sweep settled the folder, or the start got in"
+        );
+        assert!(lock(&store.inner.state).settling.is_empty());
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// A staging file that appears after a settlement began (a retry's) is
+    /// not deleted by it: ownership and the epoch are checked again before
+    /// each file goes.
+    #[tokio::test]
+    async fn a_settlement_never_deletes_a_file_made_after_it_began() {
+        let (_rig, store, dir) = tomb_with_leftover("settle-drop").await;
+        let (s2, d2) = (store.clone(), dir.clone());
+        let fresh = dir.join("files").join("new.9.part");
+        let f2 = fresh.clone();
+        set_hook(&BEFORE_SETTLE_DROP, move || {
+            std::fs::create_dir_all(d2.join("files")).unwrap();
+            std::fs::write(&f2, b"retry").unwrap();
+            lock(&s2.inner.state).bump(&d2);
+        });
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        clear_hook(&BEFORE_SETTLE_DROP);
+        assert!(fresh.exists(), "the retry's staging file was deleted");
+        assert!(lock(&store.inner.state).leftover.contains(&dir));
+        FAIL_REMOVE.with(|f| f.set(false));
+    }
+
+    /// The larger reservation is saved before the fact clears; a failed
+    /// save keeps the leftover.
+    #[tokio::test]
+    async fn a_leftover_clears_only_once_the_reservation_is_saved() {
+        let rig = Rig::new("settle-save");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        let big = estimate_bytes(2_000_000, 12_000) * 3;
+        std::fs::write(
+            dir.join("big.bin"),
+            vec![0u8; usize::try_from(big).unwrap()],
+        )
+        .unwrap();
+        lock(&store.inner.state).leftover.push(dir.clone());
+        // The manifest cannot be replaced.
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        assert!(
+            lock(&store.inner.state).leftover.contains(&dir),
+            "the leftover cleared with the save failing"
+        );
+        std::fs::remove_dir_all(dir.join("manifest.json")).unwrap();
+        store.inner.settle_leftovers(Sweep::Ordinary);
+        assert!(!lock(&store.inner.state).leftover.contains(&dir));
+        let on_disk: KeptVideo =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert!(
+            on_disk.estimated_bytes >= big,
+            "the new reservation is not on disk"
+        );
+    }
+
+    /// At open, a staging file that will not go keeps the folder unknown.
+    #[tokio::test]
+    async fn a_reopen_with_an_undeletable_staging_file_keeps_the_folder_unknown() {
+        let rig = Rig::new("reopen-part");
+        {
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+        }
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files").join("a.part"), b"x").unwrap();
+        FAIL_PART_DELETE.with(|f| f.set(true));
+        let store = rig.open();
+        // Read as the open left it: the host's size check would settle it
+        // (it measures the folder whole, the staging file included).
+        assert!(
+            lock(&store.inner.state).unknown_folder().is_some(),
+            "the folder was read as known"
+        );
+        FAIL_PART_DELETE.with(|f| f.set(false));
+        store.inner.sweep_tombstones();
+        assert!(!store.size_unknown(), "the sweep did not resolve it");
+    }
+
+    /// A directory entry that cannot be read may be a staging file: the
+    /// clean-up is not clean.
+    #[test]
+    fn an_unreadable_entry_makes_the_clean_up_not_clean() {
+        // A folder of its own, gone when the test ends, a failure included.
+        let scope = super::super::test_dir::TmpDir::new("kvd-entry");
+        let dir = scope.path();
+        std::fs::create_dir_all(dir.join("files")).unwrap();
+        std::fs::write(dir.join("files").join("a.part"), b"x").unwrap();
+        FAIL_ENTRY_READ.with(|f| f.set(true));
+        let clean = drop_parts_of(dir, None);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        assert!(!clean, "an entry read error counted as clean");
+    }
+
+    /// A same-item retry takes over a folder that would not delete: the
+    /// record absorbs the tombstone, so the retry's writes do not leave the
+    /// folder "unknown" for every other admission, and its floor is kept.
+    #[tokio::test]
+    async fn a_retry_over_an_undeletable_folder_absorbs_it_and_blocks_nothing() {
+        let rig = Rig::new("takeover");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        let floor = store.kept_bytes();
+        assert!(floor > 0, "no tombstone");
+        assert!(!store.size_unknown(), "the folder was not measured");
+        // The delete keeps failing and part of what was there is gone, so
+        // the retry has files to fetch again: it takes the folder over and
+        // writes (a writer starting and stopping moves the folder's epoch).
+        let dir = rig.dir.join("u1").join("1");
+        for e in std::fs::read_dir(dir.join("files")).unwrap().flatten() {
+            std::fs::remove_file(e.path()).unwrap();
+        }
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+        assert!(
+            !store.size_unknown(),
+            "the folder a record owns is still unknown"
+        );
+        assert!(
+            store.kept_bytes() >= floor.min(disk_bytes(&dir).whole().unwrap()),
+            "the folder's bytes are not counted"
+        );
+        // Another item is admitted.
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert_eq!(store.videos("u1").len(), 2);
+    }
+
+    /// A listing that comes back short at the prune never shrinks the
+    /// record's reservation, and leaves the folder unknown.
+    #[tokio::test]
+    async fn a_short_listing_at_the_prune_keeps_the_reservation_and_marks_the_folder() {
+        let rig = Rig::new("prune-short");
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let held = only(&store).estimated_bytes;
+        assert!(held > 0, "no reservation to keep");
+        rig.server.fail(SEG1, &[]);
+        set_hook(&BEFORE_PRUNE, || FAIL_ENTRY_READ.with(|f| f.set(true)));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        clear_hook(&BEFORE_PRUNE);
+        FAIL_ENTRY_READ.with(|f| f.set(false));
+        let (stale, unknown) = PRUNED.with(|p| p.borrow_mut().take()).unwrap();
+        assert!(
+            stale >= held,
+            "the reservation shrank to {stale} from {held}"
+        );
+        assert!(unknown, "the folder was not marked unknown");
+    }
+
+    /// A removal and restart that land between a plan being wanted and its
+    /// prune: the old run deletes nothing, because it no longer owns the
+    /// item.
+    #[tokio::test]
+    async fn a_removal_and_restart_before_the_prune_leave_the_replacements_files() {
+        let rig = Rig::new("prune-gap");
+        // The same stream under a second session id, for the replacement.
+        {
+            let mut files = rig.server.files.lock().unwrap();
+            let renamed: Vec<(String, Vec<u8>)> = files
+                .iter()
+                .map(|(k, v)| {
+                    let body = match String::from_utf8(v.clone()) {
+                        Ok(text) if text.starts_with("#EXTM3U") => text
+                            .replace("PlaySessionId=p", "PlaySessionId=q")
+                            .into_bytes(),
+                        _ => v.clone(),
+                    };
+                    (k.replace("PlaySessionId=p", "PlaySessionId=q"), body)
+                })
+                .collect();
+            files.extend(renamed);
+        }
+        let store = rig.open();
+        let dir = rig.dir.join("u1").join("1");
+        let (s2, d2) = (store.clone(), dir.clone());
+        // A file of the replacement's plan, which the old plan does not name.
+        let fresh = dir.join("files").join(file_name(
+            &SEG0.replace("PlaySessionId=p", "PlaySessionId=q"),
+        ));
+        let f2 = fresh.clone();
+        let once = std::cell::Cell::new(false);
+        set_hook(&BEFORE_PRUNE, move || {
+            if once.replace(true) {
+                return;
+            }
+            s2.remove("u1", "1");
+            let mut req = request("1");
+            req.master_url = MASTER_KEY.replace("PlaySessionId=p", "PlaySessionId=q");
+            s2.start(req).unwrap();
+            // The replacement has stored a file of its own plan.
+            std::fs::create_dir_all(d2.join("files")).unwrap();
+            std::fs::write(&f2, b"replacement").unwrap();
+        });
+        store.start(request("1")).unwrap();
+        // The old run is the first task; the replacement's is the second.
+        let first = store.inner.tasks.lock().unwrap().remove(0);
+        let _ = first.await;
+        assert!(fresh.exists(), "the old run deleted the replacement's file");
+        clear_hook(&BEFORE_PRUNE);
+        store.settled().await;
+    }
+
+    /// A download removed while it plans answers nothing afterwards: the
+    /// master playlist, indexed before the plan was admitted and so not in
+    /// the record's files, is dropped with everything else under the folder.
+    #[tokio::test]
+    async fn a_download_removed_while_planning_serves_no_playlist() {
+        let rig = Rig::new("remove-index");
+        let hold = rig.server.hold_first(MEDIA_KEY);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        // The master playlist is stored; the media playlist is held.
+        rig.server.asked_times(MEDIA_KEY, 1).await;
+        assert!(store.indexed_file("u1", MASTER_KEY).is_some(), "not stored");
+        store.remove("u1", "1");
+        assert!(
+            store.indexed_file("u1", MASTER_KEY).is_none(),
+            "the master playlist still answers after the removal"
+        );
+        hold.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert!(store.indexed_file("u1", MASTER_KEY).is_none());
+    }
+
+    /// The retry is a new play session: every file is named afresh, the old
+    /// session's files are still on disk when it starts, and they are
+    /// counted until the plan prunes them. Nothing is refused forever.
+    #[tokio::test]
+    async fn a_retry_in_a_new_session_over_an_undeletable_folder_counts_the_old_files() {
+        let rig = Rig::new("takeover-new-session");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        let dir = rig.dir.join("u1").join("1");
+        let old = disk_bytes(&dir).whole().unwrap();
+        assert!(old > 0, "no old files");
+        // The same stream under a new session id.
+        {
+            let mut files = rig.server.files.lock().unwrap();
+            let renamed: Vec<(String, Vec<u8>)> = files
+                .iter()
+                .map(|(k, v)| {
+                    let body = match String::from_utf8(v.clone()) {
+                        Ok(text) if text.starts_with("#EXTM3U") => text
+                            .replace("PlaySessionId=p", "PlaySessionId=q")
+                            .into_bytes(),
+                        _ => v.clone(),
+                    };
+                    (k.replace("PlaySessionId=p", "PlaySessionId=q"), body)
+                })
+                .collect();
+            files.extend(renamed);
+        }
+        let mut req = request("1");
+        req.master_url = MASTER_KEY.replace("PlaySessionId=p", "PlaySessionId=q");
+        store.start(req).unwrap();
+        // Before the run plans anything, the old files are in the figure.
+        assert!(
+            store.kept_bytes() >= old,
+            "the old files dropped out at the start: {}",
+            store.kept_bytes()
+        );
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
+        assert!(
+            store.kept_bytes() >= disk_bytes(&dir).whole().unwrap(),
+            "the folder's bytes are not counted"
+        );
+        assert!(!store.size_unknown(), "the folder stayed unknown");
+        // Another item is admitted.
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert_eq!(store.videos("u1").len(), 2);
+        let second = store
+            .videos("u1")
+            .into_iter()
+            .find(|v| v.item == "2")
+            .unwrap();
+        assert!(second.ready(), "item 2 did not finish: {:?}", second.state);
+    }
+
+    /// A download restarted between a sweep's choosing a folder and its
+    /// deleting it is refused, so the new files are not deleted from under it.
+    #[tokio::test]
+    async fn a_restart_between_a_sweeps_pick_and_its_delete_is_refused() {
+        let rig = Rig::new("sweep-restart");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        assert!(store.kept_bytes() > 0, "no tombstone to sweep");
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (s2, seen2, entered) = (store.clone(), seen.clone(), std::cell::Cell::new(false));
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                if !entered.replace(true) {
+                    *seen2.borrow_mut() = Some(s2.start(request("1")));
+                }
+            }));
+        });
+        store.inner.sweep_tombstones();
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        let during = seen.take().expect("the sweep did not delete");
+        assert!(
+            matches!(during, Err(KeepVideoRefusal::Host(_))),
+            "a restart in the gap was admitted: {during:?}"
+        );
+        assert!(!rig.dir.join("u1").join("1").exists(), "the folder stayed");
+        // Once the sweep is over the item starts again.
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(only(&store).ready());
+    }
+
+    /// Parks a download's SEG0 body mid-way, with its staging file open.
+    async fn park_writer(rig: &Rig, store: &Arc<DiskVideoStore>) -> Arc<AtomicBool> {
+        let release = rig.server.hold_mid_body(SEG0);
+        store.start(request("1")).unwrap();
+        rig.server.reached_mid_body(SEG0).await;
+        let mut waited = 0;
+        while store.staged_bytes() == 0 {
+            waited += 1;
+            assert!(waited < 2_000, "the write never started");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        release
+    }
+
+    /// What the revoked writer's end does to the books, done by hand where a
+    /// test cannot let the task run: it unregisters (moving the folder's
+    /// epoch) and the run's end sweeps.
+    fn end_writer(store: &Arc<DiskVideoStore>) {
+        {
+            let mut st = lock(&store.inner.state);
+            let dir = st.dir_of("u1", "1");
+            st.writers.clear();
+            st.bump(&dir);
+        }
+        store.inner.sweep_tombstones();
+    }
+
+    /// A removal whose manifest will not unlink puts the record back; a
+    /// revoked run's writer still in its folder keeps the folder unknown
+    /// (its staging file is not counted) until the writer has stopped.
+    #[tokio::test]
+    async fn a_restored_record_with_a_revoked_writer_running_stays_unknown() {
+        let rig = Rig::new("restore-writer");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).ok();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.remove("u1", "1");
+        assert_eq!(store.videos("u1").len(), 1, "the record did not come back");
+        assert!(
+            store.size_unknown(),
+            "the mark cleared with a writer still in the folder"
+        );
+        release.store(true, Ordering::SeqCst);
+        let mut waited = 0;
+        while store.size_unknown() {
+            waited += 1;
+            assert!(waited < 2_000, "still unknown after the writer stopped");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let parts = std::fs::read_dir(dir.join("files"))
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "part"))
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(parts, 0, "the revoked run's staging file was left");
+    }
+
+    /// The writer stops while the removal is still deleting (the sweep its
+    /// run's end makes finds the folder in removal and leaves it): the
+    /// removal measures at its end, so the mark does not stick.
+    #[tokio::test]
+    async fn a_writer_that_stops_during_the_removal_does_not_leave_the_folder_unknown() {
+        let rig = Rig::new("writer-during-removal");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        let (s2, entered) = (store.clone(), std::cell::Cell::new(false));
+        DURING_REMOVE.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                if !entered.replace(true) {
+                    end_writer(&s2);
+                }
+            }));
+        });
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        assert!(
+            !store.size_unknown(),
+            "the mark stuck after the writer stopped mid-removal"
+        );
+        release.store(true, Ordering::SeqCst);
+    }
+
+    /// The writer stops just after the removal has left its folder and
+    /// before it is measured: whichever of the two measures last, the folder
+    /// ends up known.
+    #[tokio::test]
+    async fn a_writer_that_stops_between_the_removal_and_its_measurement_is_measured() {
+        let rig = Rig::new("writer-after-removal");
+        let store = rig.open();
+        let release = park_writer(&rig, &store).await;
+        let (s2, entered) = (store.clone(), std::cell::Cell::new(false));
+        AFTER_UNMARKED.with(|d| {
+            *d.borrow_mut() = Some(Box::new(move || {
+                if !entered.replace(true) {
+                    end_writer(&s2);
+                }
+            }));
+        });
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        AFTER_UNMARKED.with(|d| *d.borrow_mut() = None);
+        assert!(!store.size_unknown(), "the mark stuck");
+        release.store(true, Ordering::SeqCst);
+    }
+
+    /// A running download put back after a failed unlink becomes a Failed
+    /// record, whose bytes are its estimate: it must not reserve less than
+    /// it did when it had written more than it planned.
+    #[tokio::test]
+    async fn a_restored_download_keeps_what_it_reserved() {
+        let rig = Rig::new("unlink-fails-reserve");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let big = 50 * GIB;
+        {
+            let mut st = lock(&store.inner.state);
+            let v = st.list.first_mut().unwrap();
+            v.state = KeptState::Downloading {
+                done: 0,
+                total: 1,
+                bytes: big,
+            };
+        }
+        assert_eq!(store.kept_bytes(), big);
+        let dir = rig.dir.join("u1").join("1");
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::create_dir(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json").join("x"), b"x").unwrap();
+        store.remove("u1", "1");
+        assert!(matches!(only(&store).state, KeptState::Failed { .. }));
+        assert_eq!(store.kept_bytes(), big, "the reservation shrank");
+    }
+
+    /// While a removed download's folder is being deleted its bytes still
+    /// count: the record is gone from the list but not from the cap.
+    #[tokio::test]
+    async fn a_folder_being_deleted_still_counts_against_the_cap() {
+        let rig = Rig::new("count-while-removing");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = store.kept_bytes();
+        assert!(kept > 0);
+        let seen = std::rc::Rc::new(std::cell::Cell::new(u64::MAX));
+        let (s2, seen2) = (store.clone(), seen.clone());
+        DURING_REMOVE
+            .with(|d| *d.borrow_mut() = Some(Box::new(move || seen2.set(s2.kept_bytes()))));
+        store.remove("u1", "1");
+        DURING_REMOVE.with(|d| *d.borrow_mut() = None);
+        assert_eq!(seen.get(), kept, "counted for nothing mid-delete");
+        assert_eq!(store.kept_bytes(), 0, "and for nothing once it is gone");
+    }
+
+    /// A folder that will not delete keeps counting against the cap, does not
+    /// bring the download back, and is deleted by a later sweep.
+    #[tokio::test]
+    async fn a_folder_that_will_not_delete_stays_counted_until_a_sweep_deletes_it() {
+        let rig = Rig::new("tombstone");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        // What stays once the record's manifest is gone: the files.
+        let left = on_disk(&dir.join("files"));
+        assert!(left > 0);
+
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        assert!(store.videos("u1").is_empty());
+        assert!(dir.exists(), "the folder would not go");
+        assert_eq!(store.kept_bytes(), left, "its bytes still count");
+        assert!(
+            lines("pharos: video keep remove")[0].contains("kept_on_disk bytes="),
+            "{:?}",
+            lines("pharos: video keep remove")
+        );
+
+        // Not back after a restart, and still counted while it will not go.
+        drop(store);
+        let store = rig.open();
+        assert!(
+            store.videos("u1").is_empty(),
+            "the removed download is back"
+        );
+        assert_eq!(store.kept_bytes(), left);
+
+        // Once the folder can go, the next start sweeps it.
+        FAIL_REMOVE.with(|f| f.set(false));
+        store.start(request("2")).unwrap();
+        store.settled().await;
+        assert!(!dir.exists(), "the sweep deleted it");
+        let kept = store.videos("u1")[0].bytes();
+        assert_eq!(store.kept_bytes(), kept, "only the new download counts");
+        assert_eq!(lines("pharos: video keep tombstone cleared").len(), 1);
+    }
+
+    /// A restart finds a removed download's folder without its record and
+    /// deletes it when it can.
+    #[tokio::test]
+    async fn a_restart_deletes_a_removed_downloads_leftover_folder() {
+        let rig = Rig::new("tombstone-open");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let dir = rig.dir.join("u1").join("1");
+        FAIL_REMOVE.with(|f| f.set(true));
+        store.remove("u1", "1");
+        FAIL_REMOVE.with(|f| f.set(false));
+        drop(store);
+        assert!(dir.exists());
+        let store = rig.open();
+        assert!(!dir.exists(), "the open deleted it");
+        assert_eq!(store.kept_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_download_removed_while_running_stops_without_failing() {
+        let rig = Rig::new("gone");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.remove("u1", "1");
+        store.settled().await;
+        assert!(store.videos("u1").is_empty());
+        assert!(lines("pharos: video keep failed").is_empty());
+        assert!(!rig.dir.join("u1").join("1").join("manifest.json").exists());
+    }
+
+    /// A download that was removed and started again has a new run; the
+    /// old run's late failure must not overwrite the new one's record.
+    #[tokio::test]
+    async fn a_removed_runs_late_failure_does_not_touch_the_restarted_download() {
+        let rig = Rig::new("stale-failure");
+        let release = rig.server.hold_first(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        store.remove("u1", "1");
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 2).await;
+        // Let the new run finish, then the old run fail.
+        until_within(|| only(&store).state == KeptState::Ready).await;
+        release.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(lines("pharos: video keep failed").is_empty());
+    }
+
+    /// Two runs of one item never share a staging file, and a run that
+    /// lost the item cannot put its bytes in the finished file: the old
+    /// run reaches its fetch only after the new one has begun staging.
+    #[tokio::test]
+    async fn a_removed_run_cannot_write_into_the_restarted_downloads_file() {
+        let rig = Rig::new("stale-part");
+        let old_open = rig.server.slow_first_open(SEG0);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 1).await;
+        store.remove("u1", "1");
+        // The new run's body for SEG0 stops half way, staging in the file.
+        let new_body = rig.server.hold_mid_body(SEG0);
+        store.start(request("1")).unwrap();
+        rig.server.asked_times(SEG0, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The old run now gets a different answer and stages it too.
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![7; 100]);
+        old_open.store(true, Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(SEG0.into(), vec![2; 100]);
+        new_body.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let file = store.stored_file("u1", SEG0).unwrap();
+        let bytes = std::fs::read(file.path).unwrap();
+        assert!(
+            bytes.len() == 100 && bytes.iter().all(|b| *b != 7),
+            "the old run's bytes are not in the file: {bytes:?}"
+        );
+        let dir = rig.dir.join("u1").join("1").join("files");
+        assert!(
+            std::fs::read_dir(dir).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".part")),
+            "no staging file is left"
+        );
+    }
+
+    /// Position saves racing a removal must not bring the folder back, and
+    /// racing each other must leave one whole manifest and no temp file.
+    #[tokio::test]
+    async fn saves_racing_a_removal_do_not_recreate_the_item() {
+        let rig = Rig::new("save-race");
+        let store = rig.open();
+        for round in 0..25u64 {
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let spammers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (store, stop) = (store.clone(), stop.clone());
+                    std::thread::spawn(move || {
+                        let mut at = 0;
+                        while !stop.load(Ordering::SeqCst) {
+                            at += 1;
+                            store.save_position("u1", "1", at);
+                        }
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let item_dir = rig.dir.join("u1").join("1");
+            let bytes = std::fs::read(item_dir.join("manifest.json")).unwrap();
+            assert!(
+                serde_json::from_slice::<KeptVideo>(&bytes).is_ok(),
+                "round {round}: the manifest is whole while saves race"
+            );
+            store.remove("u1", "1");
+            stop.store(true, Ordering::SeqCst);
+            for t in spammers {
+                t.join().unwrap();
+            }
+            assert!(
+                !item_dir.exists(),
+                "round {round}: a late save brought the removed item back"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn downloads_are_listed_per_user_and_remember_a_position() {
+        let rig = Rig::new("users");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert!(store.videos("u2").is_empty());
+        store.save_position("u1", "1", 61_000);
+        drop(store);
+        assert_eq!(only(&rig.open()).position_ms, 61_000);
+    }
+
+    /// A short tail whose write fails is skipped, but its staging file
+    /// can stay. It goes before the Ready figure (which counts no staging
+    /// file) is published, and one that will not go leaves the folder
+    /// unknown first; the tail is still skipped and the download Ready.
+    #[tokio::test]
+    async fn a_skipped_tail_that_failed_mid_write_is_cleaned_before_ready() {
+        for stuck in [false, true] {
+            let rig = Rig::new(if stuck {
+                "tail-part-stuck"
+            } else {
+                "tail-part"
+            });
+            let media = MEDIA.replace("#EXTINF:6.0,\n1.m4s", "#EXTINF:0.042,\n1.m4s");
+            {
+                let mut f = rig.server.files.lock().unwrap();
+                f.insert(MEDIA_KEY.into(), media.into_bytes());
+                f.insert(SEG1.into(), vec![1; 200_000]);
+            }
+            FAIL_FLUSH_OF.with(|f| *f.borrow_mut() = Some(file_name(SEG1)));
+            FAIL_PART_DELETE.with(|f| f.set(stuck));
+            let store = rig.open();
+            let files = rig.dir.join("u1").join("1").join("files");
+            let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
+            let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
+            DURING_SAVE.with(|d| {
+                *d.borrow_mut() = Some(Box::new(move |v: &KeptVideo| {
+                    if v.ready() {
+                        let unknown = lock(&s2.inner.state).unknown_folder().is_some();
+                        *seen2.borrow_mut() = Some((unknown, v.estimated_bytes, on_disk(&files2)));
+                    }
+                }));
+            });
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            DURING_SAVE.with(|d| *d.borrow_mut() = None);
+            FAIL_FLUSH_OF.with(|f| *f.borrow_mut() = None);
+            FAIL_PART_DELETE.with(|f| f.set(false));
+            assert_eq!(only(&store).state, KeptState::Ready, "stuck={stuck}");
+            let (unknown, figure, on_disk) = (*seen.borrow()).expect("no Ready record was saved");
+            assert!(
+                unknown || figure >= on_disk,
+                "stuck={stuck}: Ready published at {figure} with {on_disk} on disk"
+            );
+            if stuck {
+                assert!(unknown, "the stuck staging file was uncounted at Ready");
+            }
+        }
+    }
+
+    /// A folder sync before Ready that keeps failing with an I/O error
+    /// fails the download (its files kept, its figure counting them); one
+    /// that fails once is tried again and the download is Ready; one the
+    /// filesystem does not support (EINVAL) counts as done, logged. For both
+    /// sync points: the files' folder and the item's folder.
+    #[tokio::test]
+    async fn a_folder_sync_that_fails_before_ready_is_retried_then_sorted() {
+        const EIO: i32 = 5;
+        const EINVAL: i32 = 22;
+        for (folder, what) in [("files", "files_dir"), ("1", "item_dir")] {
+            for (code, times, ready) in [(EIO, 2, false), (EIO, 1, true), (EINVAL, 2, true)] {
+                let rig = Rig::new(&format!("dir-sync-{what}-{code}-{times}"));
+                let store = rig.open();
+                DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = Some((folder.to_owned(), code, times)));
+                store.start(request("1")).unwrap();
+                store.settled().await;
+                DIR_SYNC_FAULT.with(|f| *f.borrow_mut() = None);
+                let v = only(&store);
+                let case = format!("{what} errno={code} times={times}");
+                if ready {
+                    assert_eq!(v.state, KeptState::Ready, "{case}");
+                } else {
+                    let KeptState::Failed { reason } = &v.state else {
+                        panic!("{case}: published Ready over a failed sync: {v:?}");
+                    };
+                    assert!(reason.contains("os error 5"), "{case}: {reason}");
+                    let on_disk = on_disk(&rig.dir.join("u1").join("1").join("files"));
+                    assert!(store.kept_bytes() >= on_disk, "{case}: files uncounted");
+                    assert!(
+                        store.indexed_file("u1", SEG0).is_some(),
+                        "{case}: files dropped"
+                    );
+                }
+                if code == EINVAL {
+                    assert!(
+                        lines("pharos: video keep sync verdict=unsupported")
+                            .iter()
+                            .any(|l| l.contains(&format!("what={what}"))),
+                        "{case}: no unsupported line"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A download is durable before it is Ready: each file's contents are
+    /// synced before its rename, the files' folder once after the last
+    /// rename, and the Ready record's contents, its rename and its folder,
+    /// in that order, before Ready is published.
+    #[tokio::test]
+    async fn a_ready_download_is_synced_in_order_before_it_is_published() {
+        let rig = Rig::new("sync-order");
+        let store = rig.open();
+        SYNC_STEPS.with(|s| *s.borrow_mut() = Some(Vec::new()));
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let steps = SYNC_STEPS
+            .with(|s| s.borrow_mut().take())
+            .unwrap_or_default();
+        assert_eq!(only(&store).state, KeptState::Ready);
+        let at = |step: &str| {
+            steps
+                .iter()
+                .position(|s| s == step)
+                .unwrap_or_else(|| panic!("no step {step:?} in {steps:?}"))
+        };
+        let mut last_rename = 0;
+        for key in [MASTER_KEY, MEDIA_KEY, INIT, SEG0, SEG1] {
+            let name = file_name(key);
+            let rename = at(&format!("rename {name}"));
+            assert!(
+                at(&format!("file {name}")) < rename,
+                "{key} renamed before its contents were synced: {steps:?}"
+            );
+            last_rename = last_rename.max(rename);
+        }
+        let files_dir = at("dir files");
+        // A first download on a new store makes the user's folder and the
+        // store's: each is an entry in its parent, synced before Ready too.
+        let store_dir = rig.dir.file_name().unwrap().to_string_lossy().into_owned();
+        let parent_dir = rig
+            .dir
+            .parent()
+            .and_then(Path::file_name)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let order = [
+            files_dir,
+            at("manifest file"),
+            at("rename manifest"),
+            at("dir 1"),
+            at("dir u1"),
+            at(&format!("dir {store_dir}")),
+            at(&format!("dir {parent_dir}")),
+            at("ready"),
+        ];
+        assert!(last_rename < files_dir, "{steps:?}");
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{steps:?}");
+    }
+
+    /// CR 4646280204: a short tail of one playlist that another planned
+    /// playlist lists too is needed whole: its failed fetch fails the
+    /// download. The control is the test below.
+    #[tokio::test]
+    async fn a_short_tail_another_playlist_lists_is_not_skipped() {
+        const AUDIO_KEY: &str = "/videos/1/h264cmaf/audio.m3u8?PlaySessionId=p";
+        let rig = Rig::new("tail-shared");
+        let master = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"Main\",DEFAULT=YES,URI=\"/videos/1/h264cmaf/audio.m3u8?PlaySessionId=p\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\",AUDIO=\"a\"\n\
+            /videos/1/h264cmaf/main.m3u8?PlaySessionId=p\n";
+        let audio = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n\
+            #EXT-X-PLAYLIST-TYPE:VOD\n#EXTINF:6.0,\n1.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n";
+        let media = MEDIA.replace("#EXTINF:6.0,\n1.m4s", "#EXTINF:0.042,\n1.m4s");
+        {
+            let mut files = rig.server.files.lock().unwrap();
+            files.insert(MASTER_KEY.into(), master.as_bytes().to_vec());
+            files.insert(AUDIO_KEY.into(), audio.as_bytes().to_vec());
+            files.insert(MEDIA_KEY.into(), media.into_bytes());
+        }
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_ne!(
+            only(&store).state,
+            KeptState::Ready,
+            "a needed file was skipped"
+        );
+        assert!(lines("pharos: video keep skipped short tail").is_empty());
+        assert!(
+            lines("pharos: video keep short tail verdict=not_excused item=1")
+                .iter()
+                .any(|l| l.contains("reason=listed_elsewhere listed=2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_short_last_segment_may_be_skipped() {
+        let rig = Rig::new("tail");
+        let media = MEDIA.replace("#EXTINF:6.0,\n1.m4s", "#EXTINF:0.042,\n1.m4s");
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(MEDIA_KEY.into(), media.into_bytes());
+        rig.server.fail(SEG1, &[403]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(store.stored_file("u1", SEG1).is_none());
+        assert_eq!(lines("pharos: video keep skipped short tail").len(), 1);
+        assert!(!only(&store).files.contains(&SEG1.to_owned()));
+
+        // A reopen leaves it Ready: the skipped file is not "missing".
+        drop(store);
+        rig.server.asked.lock().unwrap().clear();
+        let store = rig.open();
+        assert!(
+            lines("pharos: video keep resume").is_empty(),
+            "{:?}",
+            lines("pharos: video keep resume")
+        );
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(rig.server.asked().is_empty(), "{:?}", rig.server.asked());
+    }
+
+    /// Only a Ready download is served: while one runs, the files it has
+    /// stored are not answered offline and the player is not pointed at the
+    /// local origin; once it is Ready, both are.
+    #[tokio::test]
+    async fn a_running_download_serves_nothing_until_it_is_ready() {
+        let rig = Rig::new("ready-only");
+        let slow = rig.server.slow_first_open(SEG1);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        let mut waited = 0;
+        while store.indexed_file("u1", SEG0).is_none() {
+            waited += 1;
+            assert!(waited < 5_000, "the first segment was not stored");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        crate::native::offline_video::remember_user("u1");
+        let master = only(&store).master_url;
+        let dyn_store: Arc<dyn VideoStore> = store.clone();
+        assert!(
+            store.stored_file("u1", SEG0).is_none(),
+            "a running download's file was served"
+        );
+        assert!(
+            crate::native::offline_video::hls_local_source(Some(&*dyn_store), &master).is_none(),
+            "a running download was given the local origin"
+        );
+        assert!(!lines(
+            "pharos: video request verdict=not_served_offline reason=download_not_ready"
+        )
+        .is_empty());
+        slow.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).state, KeptState::Ready);
+        assert!(store.stored_file("u1", SEG0).is_some());
+        assert!(
+            crate::native::offline_video::hls_local_source(Some(&*dyn_store), &master).is_some()
+        );
+    }
+
+    /// The proxy asks with the path and query the WebView sent; a stored
+    /// file is found by that, and a different play session is a miss.
+    #[tokio::test]
+    async fn a_proxy_request_hits_by_path_and_query_and_misses_otherwise() {
+        let rig = Rig::new("lookup");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let hit = |url: &str| store.stored_file("u1", &request_key(url));
+        assert!(hit("/videos/1/h264cmaf/0.m4s?PlaySessionId=p").is_some());
+        assert!(hit("http://localhost:8096/videos/1/h264cmaf/0.m4s?PlaySessionId=p").is_some());
+        assert!(hit("/videos/1/h264cmaf/0.m4s?PlaySessionId=other").is_none());
+        assert!(hit("/videos/1/h264cmaf/0.m4s").is_none());
+        assert!(hit("/videos/1/h264cmaf/9.m4s?PlaySessionId=p").is_none());
+        assert!(hit("/Items/1/Images/Primary").is_none());
+    }
+
+    /// A kept video plays with no network: hls.js is given the stored
+    /// master on the page's own origin (never the server's URL), and that
+    /// master and the first playlist it names are answered from disk, with
+    /// no request to the server.
+    #[tokio::test]
+    async fn a_kept_videos_master_and_first_playlist_are_served_locally() {
+        let rig = Rig::new("hls-local");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        assert_eq!(kept.state, KeptState::Ready);
+        crate::native::offline_video::remember_user("u1");
+        let asked = rig.server.asked.lock().unwrap().len();
+        let store: Arc<dyn VideoStore> = store;
+        let source =
+            crate::native::offline_video::hls_local_source(Some(&*store), &kept.master_url);
+        assert_eq!(
+            source.as_deref(),
+            Some(request_key(&kept.master_url).as_str()),
+            "the stored master was not given a local source"
+        );
+        let local = |key: &str| {
+            crate::native::offline_video::offline_file_for(Some(&*store), key)
+                .and_then(|f| std::fs::read(&f.path).ok())
+        };
+        let master = local(&source.unwrap()).expect("the master was not served locally");
+        let text = String::from_utf8(master).unwrap();
+        let first = text
+            .lines()
+            .find(|l| !l.is_empty() && !l.starts_with('#'))
+            .expect("the master names no playlist");
+        let first = crate::native::kept_video::absolute_url(
+            "http://local",
+            &resolve_against(&kept.master_url, first),
+        );
+        assert!(
+            local(&first).is_some(),
+            "the first playlist {first} was not served locally"
+        );
+        assert_eq!(
+            rig.server.asked.lock().unwrap().len(),
+            asked,
+            "playing the download asked the server"
+        );
+        // Not kept: straight from the server.
+        assert_eq!(
+            crate::native::offline_video::hls_local_source(
+                Some(&*store),
+                "/videos/2/master.m3u8?PlaySessionId=p"
+            ),
+            None
+        );
+        crate::native::offline_video::forget_user();
+    }
+
+    /// CR 4637279590: a master the server redirects into another folder
+    /// still downloads and plays. Its relative references name files in the
+    /// folder it was answered from, so the stored playlists name them by
+    /// absolute path: the copy is Ready, and with the server gone the
+    /// master, its playlist and its first segment are answered from disk
+    /// by exactly the keys the playlists name.
+    /// Review 5987746170 (offline_video.rs:1149): a master the server moves
+    /// under a path the offline proxy has no handler for (`/delivery/`)
+    /// would store keys nothing serves. The download is refused before it
+    /// reaches Ready, naming the key and the reason.
+    #[tokio::test]
+    async fn a_key_the_proxy_does_not_serve_is_refused_before_ready() {
+        let rig = Rig::new("unservable-key");
+        {
+            let moved_master = "/delivery/1/master.m3u8?PlaySessionId=p";
+            let mut f = rig.server.files.lock().unwrap();
+            f.clear();
+            f.insert(
+                moved_master.into(),
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\nmain.m3u8?PlaySessionId=p\n".to_vec(),
+            );
+            f.insert(
+                "/delivery/1/main.m3u8?PlaySessionId=p".into(),
+                MEDIA.as_bytes().to_vec(),
+            );
+            f.insert("/delivery/1/init.mp4?PlaySessionId=p".into(), vec![1; 10]);
+            f.insert("/delivery/1/0.m4s?PlaySessionId=p".into(), vec![2; 100]);
+            f.insert("/delivery/1/1.m4s?PlaySessionId=p".into(), vec![3; 100]);
+            drop(f);
+            rig.server
+                .redirects
+                .lock()
+                .unwrap()
+                .insert(MASTER_KEY.into(), moved_master.into());
+        }
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        let KeptState::Failed { reason } = &kept.state else {
+            panic!("reached {:?} with keys nothing serves", kept.state);
+        };
+        assert!(reason.contains("key_not_servable"), "{reason}");
+        assert!(
+            !lines("pharos: video keep refused item=1 reason=key_not_servable url_path=/delivery/1/main.m3u8").is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_master_redirected_into_another_folder_downloads_and_plays_offline() {
+        let rig = Rig::new("redirected-master");
+        {
+            let moved_master = "/videos/1/hls/master.m3u8?PlaySessionId=p";
+            let mut f = rig.server.files.lock().unwrap();
+            f.clear();
+            f.insert(
+                moved_master.into(),
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\nmain.m3u8?PlaySessionId=p\n".to_vec(),
+            );
+            f.insert(
+                "/videos/1/hls/main.m3u8?PlaySessionId=p".into(),
+                MEDIA.as_bytes().to_vec(),
+            );
+            f.insert("/videos/1/hls/init.mp4?PlaySessionId=p".into(), vec![1; 10]);
+            f.insert("/videos/1/hls/0.m4s?PlaySessionId=p".into(), vec![2; 100]);
+            f.insert("/videos/1/hls/1.m4s?PlaySessionId=p".into(), vec![3; 100]);
+            drop(f);
+            rig.server
+                .redirects
+                .lock()
+                .unwrap()
+                .insert(MASTER_KEY.into(), moved_master.into());
+        }
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        assert_eq!(
+            kept.state,
+            KeptState::Ready,
+            "{kept:?} asked {:?}",
+            rig.server.asked()
+        );
+        assert!(
+            !lines("pharos: video keep playlist verdict=rebased").is_empty(),
+            "the rebasing was not logged"
+        );
+        // The network is gone.
+        rig.server.files.lock().unwrap().clear();
+        let asked = rig.server.asked().len();
+        crate::native::offline_video::remember_user("u1");
+        let store: Arc<dyn VideoStore> = store;
+        let local = |key: &str| {
+            crate::native::offline_video::offline_file_for(Some(&*store), key)
+                .and_then(|f| std::fs::read(&f.path).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        let first_ref = |text: &str| {
+            text.lines()
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_owned)
+                .expect("the playlist names no file")
+        };
+        let source =
+            crate::native::offline_video::hls_local_source(Some(&*store), &kept.master_url)
+                .expect("the stored master was not given a local source");
+        let master = local(&source).expect("the master was not served locally");
+        let playlist = resolve_against(&source, &first_ref(&master));
+        assert_eq!(playlist, "/videos/1/hls/main.m3u8?PlaySessionId=p");
+        // Asked for by the key it was answered from, it was not rebased:
+        // its references resolve against that key as they are.
+        let media = local(&playlist).expect("the playlist was not served locally");
+        let segment = resolve_against(&playlist, &first_ref(&media));
+        assert_eq!(segment, "/videos/1/hls/0.m4s?PlaySessionId=p");
+        assert_eq!(
+            local(&segment).map(|s| s.into_bytes()),
+            Some(vec![2; 100]),
+            "the first segment was not served locally"
+        );
+        assert_eq!(
+            rig.server.asked().len(),
+            asked,
+            "playing the download asked the server"
+        );
+        crate::native::offline_video::forget_user();
+    }
+
+    /// Outside-diff items kept_video_disk.rs:3191 and :2344: a server
+    /// mounted under `/jf` names its files by absolute path and absolute
+    /// URL, base path included. Each is asked for by its key (the fetcher
+    /// puts the base path back once, never twice), and the stored playlists
+    /// name those keys, so the copy plays offline.
+    /// CR 4639073839: with no redirect, a relative reference that climbs out
+    /// of the server's base path (`/jf`) is refused, as it is after one:
+    /// it is resolved against the URL fetched, not the key that lost the
+    /// base path, so it is never fetched as a file under `/jf`.
+    #[tokio::test]
+    async fn an_escaping_reference_under_a_base_path_is_refused_without_a_redirect() {
+        let rig = Rig::new("base-path-escape");
+        *rig.server.base.lock().unwrap() = Some("https://h/jf".to_owned());
+        rig.server.files.lock().unwrap().insert(
+            MASTER_KEY.into(),
+            b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\n/jf/videos/1/h264cmaf/main.m3u8?PlaySessionId=p\n".to_vec(),
+        );
+        rig.server.files.lock().unwrap().insert(
+            MEDIA_KEY.into(),
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"init.mp4?PlaySessionId=p\"\n#EXTINF:6.0,\n../../../../videos/1/h264cmaf/0.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n".to_vec(),
+        );
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        let KeptState::Failed { reason } = &kept.state else {
+            panic!("an escaping reference was kept: {:?}", kept.state);
+        };
+        assert!(reason.contains("reference_not_local"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_server_under_a_base_path_downloads_and_plays_offline() {
+        let rig = Rig::new("base-path");
+        *rig.server.base.lock().unwrap() = Some("https://h/jf".to_owned());
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            f.insert(
+                MASTER_KEY.into(),
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\n/jf/videos/1/h264cmaf/main.m3u8?PlaySessionId=p\n".to_vec(),
+            );
+            f.insert(
+                MEDIA_KEY.into(),
+                b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"https://h/jf/videos/1/h264cmaf/init.mp4?PlaySessionId=p\"\n#EXTINF:6.0,\nhttps://h/jf/videos/1/h264cmaf/0.m4s?PlaySessionId=p\n#EXTINF:6.0,\n1.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n".to_vec(),
+            );
+        }
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        assert_eq!(
+            kept.state,
+            KeptState::Ready,
+            "{kept:?} asked {:?}",
+            rig.server.asked()
+        );
+        assert!(
+            rig.server.asked().iter().all(|k| !k.starts_with("/jf")),
+            "a key kept the base path: {:?}",
+            rig.server.asked()
+        );
+        rig.server.files.lock().unwrap().clear();
+        let asked = rig.server.asked().len();
+        crate::native::offline_video::remember_user("u1");
+        let store: Arc<dyn VideoStore> = store;
+        let local = |key: &str| {
+            crate::native::offline_video::offline_file_for(Some(&*store), key)
+                .and_then(|f| std::fs::read(&f.path).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        let first_ref = |text: &str| {
+            text.lines()
+                .find(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_owned)
+                .expect("the playlist names no file")
+        };
+        let source =
+            crate::native::offline_video::hls_local_source(Some(&*store), &kept.master_url)
+                .expect("the stored master was not given a local source");
+        let master = local(&source).expect("the master was not served locally");
+        let playlist = resolve_against(&source, &first_ref(&master));
+        assert_eq!(playlist, MEDIA_KEY);
+        let media = local(&playlist).expect("the playlist was not served locally");
+        let segment = resolve_against(&playlist, &first_ref(&media));
+        assert_eq!(segment, SEG0);
+        assert_eq!(local(&segment).map(String::into_bytes), Some(vec![2; 100]));
+        assert_eq!(
+            rig.server.asked().len(),
+            asked,
+            "playing the download asked the server"
+        );
+        crate::native::offline_video::forget_user();
+    }
+
+    /// A playlist that names a file on another origin cannot play offline:
+    /// the download is refused with the reason, and is never Ready.
+    #[tokio::test]
+    async fn a_playlist_naming_another_origin_is_not_kept() {
+        let rig = Rig::new("not-local");
+        rig.server.files.lock().unwrap().insert(
+            MEDIA_KEY.into(),
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nhttps://cdn.example/0.m4s\n#EXT-X-ENDLIST\n".to_vec(),
+        );
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let kept = only(&store);
+        let KeptState::Failed { reason } = &kept.state else {
+            panic!("{kept:?}");
+        };
+        assert!(reason.contains("reference_not_local"), "{reason}");
+        assert!(!lines("pharos: video keep refused item=1 reason=reference_not_local").is_empty());
+    }
+
+    /// The playlist cap is on what is stored: a redirected master under
+    /// the cap as sent, over it once its references are rebased, is refused
+    /// as too large and nothing of it is kept.
+    #[tokio::test]
+    async fn a_rebased_playlist_over_the_cap_is_refused() {
+        let rig = Rig::new("rebased-cap");
+        let moved = "/videos/1/hls/master.m3u8?PlaySessionId=p";
+        // Two bytes a line as sent, sixteen once rebased.
+        let lines_sent = usize::try_from(PLAYLIST_MAX_BYTES / 4).unwrap();
+        let raw = "x\n".repeat(lines_sent);
+        assert!(raw.len() as u64 <= PLAYLIST_MAX_BYTES);
+        let Localized::Rewritten(rebased) =
+            localize_playlist(&raw, moved, true, PLAN_ORIGIN, usize::MAX)
+        else {
+            panic!("not rewritten");
+        };
+        assert!(rebased.len() as u64 > PLAYLIST_MAX_BYTES);
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(moved.into(), raw.into_bytes());
+        rig.server
+            .redirects
+            .lock()
+            .unwrap()
+            .insert(MASTER_KEY.into(), moved.into());
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let KeptState::Failed { reason } = only(&store).state else {
+            panic!("{:?}", only(&store));
+        };
+        assert!(reason.contains("playlist_too_large"), "{reason}");
+        assert!(store.indexed_file("u1", MASTER_KEY).is_none());
+    }
+
+    /// `rel` resolved against `base`'s folder, as hls.js does.
+    fn resolve_against(base: &str, rel: &str) -> String {
+        if rel.starts_with('/') || rel.contains("://") {
+            return rel.to_owned();
+        }
+        let path = base.split('?').next().unwrap_or_default();
+        let dir = path.rsplit_once('/').map_or("", |(d, _)| d);
+        format!("{dir}/{rel}")
+    }
+
+    #[test]
+    fn names_are_safe_and_stable() {
+        assert_eq!(safe_name("ab-12_Z"), "ab-12_Z");
+        assert_eq!(safe_name("../x"), "%2e%2e%2fx");
+        assert_eq!(safe_name(""), "_");
+        assert_eq!(file_name("/a?b"), file_name("/a?b"));
+        assert_ne!(file_name("/a?b"), file_name("/a?c"));
+        assert_eq!(file_name("/a").len(), 32);
+    }
+
+    #[test]
+    fn the_clock_reads_as_iso_8601_utc() {
+        assert_eq!(iso_from_secs(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso_from_secs(1_784_192_523), "2026-07-16T09:02:03Z");
+        assert_eq!(iso_from_secs(951_782_400), "2000-02-29T00:00:00Z");
+    }
+}
