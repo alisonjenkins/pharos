@@ -135,6 +135,10 @@ fn books_and_songs(user: &mut Option<String>, kept: &mut Vec<OnDevice>) {
         Some(OnDevice::Book {
             id: b.item()?,
             title: b.title.clone(),
+            format: match b.format {
+                super::kept::KeptFormat::Epub => pharos_client::api::BookFormat::Epub,
+                super::kept::KeptFormat::Pdf => pharos_client::api::BookFormat::Pdf,
+            },
             fraction: b.fraction,
         })
     }));
