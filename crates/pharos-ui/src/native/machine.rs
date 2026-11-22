@@ -52,6 +52,13 @@ pub enum SignInReply {
 pub enum SignOutReply {
     Status(u16),
     Failed(String),
+    /// Signed out in this process, but the device could not forget the
+    /// sign-in (its token file stayed), for the reason given.
+    NotSaved(String),
+    /// Signed out, the token file gone, but its folder could not be synced
+    /// (why): a crash before the disk catches up may bring the sign-in
+    /// back after a restart.
+    NotDurable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +69,12 @@ pub enum Event {
     },
     /// The socket opened but the server knows no session for this browser.
     ResumeRefused {
+        epoch: u32,
+    },
+    /// As `ResumeRefused`, but the refused token could be neither removed
+    /// nor marked revoked: a restart may resume its account, and the
+    /// sign-in screen says so.
+    ResumeRefusedTokenKept {
         epoch: u32,
     },
     /// The socket opened but `resume` failed for another reason.
@@ -81,12 +94,22 @@ pub enum Event {
     },
     /// A call answered `revoked` (FR: a revoked session shows sign-in).
     NeedsSignIn,
+    /// As `NeedsSignIn`, for a call sent in `session` ([`Machine::session`]
+    /// when it was sent): it ends only that session, never one signed in
+    /// since.
+    SessionNeedsSignIn {
+        session: u32,
+    },
     SignInSubmitted,
     SignInAnswered(SignInReply),
     SignOutSubmitted,
     SignOutAnswered(SignOutReply),
     Retry,
 }
+
+/// The sign-in screen's warning when a refused token could not be dropped.
+pub const TOKEN_KEPT: &str = "Signed out, but this device could not forget the old sign-in. \
+     It may come back when the app restarts: sign in and sign out again to retry.";
 
 /// The close reason the server sends when the session's token is revoked.
 const REVOKED: &str = "revoked";
@@ -95,6 +118,31 @@ const REVOKED: &str = "revoked";
 const BACKOFF_BASE_MS: u32 = 500;
 /// Cap on the reconnect delay, so a restarted server is found within 30 s.
 const BACKOFF_MAX_MS: u32 = 30_000;
+
+/// What the host runs when a signed-in session ends (the app leaves Ready
+/// for sign-in), whichever event caused it, and the warning it returns for
+/// the sign-in screen (a cleanup that could not be saved). Compares equal
+/// to any other, so it does not take part in the machine's equality.
+#[derive(Clone, Copy, Default)]
+struct SessionEnd(Option<fn() -> Option<String>>);
+
+impl std::fmt::Debug for SessionEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "SessionEnd(set)"
+        } else {
+            "SessionEnd(none)"
+        })
+    }
+}
+
+impl PartialEq for SessionEnd {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SessionEnd {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Machine {
@@ -106,12 +154,26 @@ pub struct Machine {
     /// Connecting again after a signed-in socket dropped: the screens stay
     /// up, so a playing video is not torn down by a network blip.
     reconnecting: bool,
+    /// A session has been Ready and has not ended since: set on Ready,
+    /// cleared only when the app shows sign-in. Kept apart from the phase
+    /// and `reconnecting`, which a failed open or a retry clears, so a
+    /// revoked close after such a detour still ends the session.
+    had_session: bool,
     /// A non-blocking message for the signed-in shell, e.g. a failed
     /// sign-out.
     notice: Option<String>,
     /// Why the last attempt failed, while connecting again after a failure
     /// that may clear by itself (server down, network gone).
     waiting: Option<String>,
+    /// Counts the sessions published: bumped on every resume that makes the
+    /// app Ready, a reconnect's included, so a refusal names the one its
+    /// call was sent in.
+    session: u32,
+    /// Counts the sign-ins started (submitted or answered): a sign-out's
+    /// reply carries the count from when it was sent, and one that a newer
+    /// sign-in overtook is ignored ([`Machine::sign_out_reply_is_current`]).
+    sign_ins: u32,
+    on_session_end: SessionEnd,
 }
 
 impl Default for Machine {
@@ -128,9 +190,23 @@ impl Machine {
             attempt: 0,
             signing_out: false,
             reconnecting: false,
+            had_session: false,
             notice: None,
             waiting: None,
+            session: 0,
+            sign_ins: 0,
+            on_session_end: SessionEnd(None),
         }
+    }
+
+    /// Runs `hook` whenever a signed-in session ends: the app leaves Ready
+    /// for sign-in, by a rejected request, a revoked socket or a sign-out.
+    /// The one place that happens, so no caller can skip it. A warning it
+    /// returns is shown on the sign-in screen, after any message there.
+    #[must_use]
+    pub fn with_session_end(mut self, hook: fn() -> Option<String>) -> Self {
+        self.on_session_end = SessionEnd(Some(hook));
+        self
     }
 
     pub fn phase(&self) -> &Phase {
@@ -140,6 +216,39 @@ impl Machine {
     /// The current connection attempt; events carry it back.
     pub fn epoch(&self) -> u32 {
         self.epoch
+    }
+
+    /// The session signed in now (or last): a call captures it when it is
+    /// sent, so its refusal ends only that session.
+    pub fn session(&self) -> u32 {
+        self.session
+    }
+
+    /// The sign-ins started so far: a sign-out captures it when it is sent.
+    pub fn sign_ins(&self) -> u32 {
+        self.sign_ins
+    }
+
+    /// Whether a sign-out's reply, sent when [`Machine::sign_ins`] was
+    /// `sent_at`, still answers for the session it ended: no sign-in has
+    /// started since. One a newer sign-in overtook (B signed in after A's
+    /// revoked socket showed sign-in) must not end B's session.
+    pub fn sign_out_reply_is_current(&self, sent_at: u32) -> bool {
+        self.sign_ins == sent_at
+    }
+
+    /// Whether attempt `epoch`'s resume would make the app Ready: it is the
+    /// current attempt and the app is still connecting. A sign-out (or any
+    /// other move to a screen) that landed while the attempt was in flight
+    /// refuses it, so the attempt publishes no session.
+    pub fn accepts_resume(&self, epoch: u32) -> bool {
+        epoch == self.epoch && self.phase == Phase::Connecting
+    }
+
+    /// Whether a session has been Ready since the last sign-in screen: a
+    /// refusal then ends it through the session-end hook.
+    pub fn had_session(&self) -> bool {
+        self.had_session
     }
 
     pub fn notice(&self) -> Option<&str> {
@@ -181,27 +290,61 @@ impl Machine {
     }
 
     pub fn apply(&mut self, event: Event) {
+        // A session ends whenever the app shows sign-in after it was
+        // Ready, whatever failed opens or retries came in between.
+        let was_ready = self.had_session;
+        self.step(event);
+        if was_ready && matches!(self.phase, Phase::SignIn { .. }) {
+            if let Some(warning) = self.on_session_end.0.and_then(|hook| hook()) {
+                if let Phase::SignIn { error, .. } = &mut self.phase {
+                    *error = Some(match error.take() {
+                        Some(said) => format!("{said} {warning}"),
+                        None => warning,
+                    });
+                }
+            }
+        }
+    }
+
+    fn step(&mut self, event: Event) {
         let current = |epoch: u32| epoch == self.epoch;
+        // An attempt's open result counts only while it is still connecting:
+        // a sign-out (or any screen) that landed meanwhile ended it, without
+        // a new epoch.
+        let open = |epoch: u32| epoch == self.epoch && self.phase == Phase::Connecting;
         match event {
-            Event::Resumed { epoch } if current(epoch) => {
+            Event::Resumed { epoch } if self.accepts_resume(epoch) => {
                 self.attempt = 0;
                 self.waiting = None;
                 self.phase = Phase::Ready;
+                // Every published session gets its own refusal id, a
+                // reconnect's too: it may carry another token than the one
+                // a pending call was sent with, and that call's refusal must
+                // not end it. `had_session` alone spans the outage.
+                self.session = self.session.wrapping_add(1);
+                self.had_session = true;
             }
-            Event::ResumeRefused { epoch } if current(epoch) => self.sign_in(None),
+            Event::ResumeRefused { epoch } if open(epoch) => self.sign_in(None),
+            Event::ResumeRefusedTokenKept { epoch } if open(epoch) => {
+                self.sign_in(Some(TOKEN_KEPT.to_owned()));
+            }
             // The server is up but could not answer (its database may be
             // down): treat it like an outage.
-            Event::ResumeFailed { epoch, error } if current(epoch) => {
+            Event::ResumeFailed { epoch, error } if open(epoch) => {
                 self.wait_and_retry(format!("The server would not resume the session: {error}"));
             }
-            Event::NotOpened { epoch, probe } if current(epoch) => {
+            Event::NotOpened { epoch, probe } if open(epoch) => {
                 if may_clear(&probe) {
                     self.wait_and_retry(probe_detail(&probe));
                 } else {
                     self.phase = not_opened(&probe);
                 }
             }
-            Event::Closed { epoch, reason } if current(epoch) => {
+            // A session the sign-in screen already ended has no socket to
+            // reconnect, and its warning stays.
+            Event::Closed { epoch, reason }
+                if current(epoch) && !matches!(self.phase, Phase::SignIn { .. }) =>
+            {
                 if reason == REVOKED {
                     let error = (!self.signing_out)
                         .then(|| "Your session ended. Sign in again.".to_owned());
@@ -216,7 +359,17 @@ impl Machine {
             Event::NeedsSignIn if self.phase == Phase::Ready => {
                 self.sign_in(Some("Your session ended. Sign in again.".into()));
             }
+            // The current session's refusal ends it while it lasts, Ready or
+            // reconnecting; a stale one never does.
+            Event::SessionNeedsSignIn { session }
+                if self.had_session && session == self.session =>
+            {
+                self.sign_in(Some("Your session ended. Sign in again.".into()));
+            }
             Event::SignInSubmitted => {
+                if matches!(self.phase, Phase::SignIn { .. }) {
+                    self.sign_ins = self.sign_ins.wrapping_add(1);
+                }
                 if let Phase::SignIn { busy, error } = &mut self.phase {
                     *busy = true;
                     *error = None;
@@ -224,6 +377,7 @@ impl Machine {
             }
             Event::SignInAnswered(reply) => {
                 if matches!(self.phase, Phase::SignIn { .. }) {
+                    self.sign_ins = self.sign_ins.wrapping_add(1);
                     match sign_in_error(&reply) {
                         None => {
                             self.attempt = 0;
@@ -236,6 +390,22 @@ impl Machine {
             Event::SignOutSubmitted if self.phase == Phase::Ready => {
                 self.signing_out = true;
                 self.notice = None;
+            }
+            Event::SignOutAnswered(SignOutReply::NotSaved(why)) => {
+                // Signed out here all the same; the sign-in screen says the
+                // device kept the sign-in, so the user can sign out again.
+                self.sign_in(Some(format!(
+                    "Signed out, but this device could not forget the sign-in ({why}). \
+                     It may come back when the app restarts: sign in and sign out again to retry."
+                )));
+            }
+            Event::SignOutAnswered(SignOutReply::NotDurable(why)) => {
+                // Signed out, but not yet for certain on disk: the sign-in
+                // screen says it may come back after a restart.
+                self.sign_in(Some(format!(
+                    "Signed out, but this device could not confirm it on disk ({why}). \
+                     The sign-in may come back if the phone restarts: sign in and sign out again to make sure."
+                )));
             }
             Event::SignOutAnswered(reply) => {
                 self.signing_out = false;
@@ -276,6 +446,7 @@ impl Machine {
 
     fn sign_in(&mut self, error: Option<String>) {
         self.signing_out = false;
+        self.had_session = false;
         self.notice = None;
         self.phase = Phase::SignIn { error, busy: false };
     }
@@ -357,6 +528,7 @@ fn sign_out_error(reply: &SignOutReply) -> Option<String> {
             Some(format!("Could not sign out (HTTP {status}). Try again."))
         }
         SignOutReply::Failed(error) => Some(format!("Could not sign out: {error}")),
+        SignOutReply::NotSaved(_) | SignOutReply::NotDurable(_) => None,
     }
 }
 
@@ -481,6 +653,141 @@ mod tests {
         );
     }
 
+    static SESSIONS_ENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_end() -> Option<String> {
+        SESSIONS_ENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+
+    static DETOUR_ENDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_detour_end() -> Option<String> {
+        DETOUR_ENDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        None
+    }
+
+    /// A drop, a failed open that does not clear by itself (405), a retry,
+    /// then a revoked close: the session the user was signed into ends and
+    /// the hook runs, though the detour cleared the phase and the
+    /// reconnecting flag. A second sign-in screen runs it no more.
+    #[test]
+    fn a_revoked_close_after_a_failed_open_and_a_retry_ends_the_session() {
+        use std::sync::atomic::Ordering;
+        let mut m = Machine::new().with_session_end(count_detour_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        m.apply(Event::NotOpened {
+            epoch: 1,
+            probe: Probe::Status(405),
+        });
+        assert!(
+            matches!(m.phase, Phase::Unreachable { .. }),
+            "{:?}",
+            m.phase
+        );
+        m.apply(Event::Retry);
+        let epoch = m.epoch();
+        m.apply(Event::Closed {
+            epoch,
+            reason: REVOKED.into(),
+        });
+        assert!(matches!(m.phase, Phase::SignIn { .. }), "{:?}", m.phase);
+        assert_eq!(
+            DETOUR_ENDED.load(Ordering::SeqCst),
+            1,
+            "the signed-in session ended without its hook"
+        );
+        m.apply(Event::SignInAnswered(SignInReply::Status {
+            status: 401,
+            retry_after: None,
+        }));
+        assert_eq!(DETOUR_ENDED.load(Ordering::SeqCst), 1, "the hook ran twice");
+    }
+
+    /// The session-end hook runs when a session revoked after a dropped
+    /// socket ends (the screens were still up), and never for an ordinary
+    /// outage that reconnects. Run as one test: the count is a static.
+    #[test]
+    fn a_revoked_close_after_a_drop_ends_the_session_but_an_outage_does_not() {
+        use std::sync::atomic::Ordering;
+        let count = || SESSIONS_ENDED.load(Ordering::SeqCst);
+        let start = count();
+        let mut m = Machine::new().with_session_end(count_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        // An outage: drop, the server down for a while, then back.
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "idle_timeout".into(),
+        });
+        m.apply(Event::NotOpened {
+            epoch: 1,
+            probe: Probe::Failed("offline".into()),
+        });
+        assert!(m.shows_screens());
+        m.apply(Event::Resumed { epoch: 2 });
+        assert_eq!(count(), start, "an outage ended the session");
+        // A drop, then the reconnect finds the session revoked.
+        m.apply(Event::Closed {
+            epoch: 2,
+            reason: "idle_timeout".into(),
+        });
+        assert!(m.reconnecting());
+        m.apply(Event::Closed {
+            epoch: 3,
+            reason: REVOKED.into(),
+        });
+        assert!(matches!(m.phase, Phase::SignIn { .. }), "{:?}", m.phase);
+        assert_eq!(count(), start + 1, "the revoked session's hook did not run");
+    }
+
+    /// Offline_video 1037 (review 5995569325): a session end whose cleanup
+    /// could not be saved shows its warning on the sign-in screen, after
+    /// the ordinary message, which stays as it was.
+    #[test]
+    fn a_session_ends_cleanup_warning_shows_on_sign_in() {
+        fn unsafe_end() -> Option<String> {
+            Some("A restart may sign it back in.".to_owned())
+        }
+        let mut m = Machine::new().with_session_end(unsafe_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: REVOKED.into(),
+        });
+        assert_eq!(
+            m.phase,
+            Phase::SignIn {
+                error: Some(
+                    "Your session ended. Sign in again. A restart may sign it back in.".into()
+                ),
+                busy: false,
+            }
+        );
+        // A durable end: no warning, and no shared counter touched (the
+        // revoked-close test counts SESSIONS_ENDED).
+        fn durable_end() -> Option<String> {
+            None
+        }
+        let mut m = Machine::new().with_session_end(durable_end);
+        m.apply(Event::Resumed { epoch: 0 });
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: REVOKED.into(),
+        });
+        assert_eq!(
+            m.phase,
+            Phase::SignIn {
+                error: Some("Your session ended. Sign in again.".into()),
+                busy: false,
+            },
+            "a durable cleanup changed the message"
+        );
+    }
+
     #[test]
     fn a_dropped_socket_keeps_the_screens_until_the_reconnect_settles() {
         let mut m = ready();
@@ -586,6 +893,145 @@ mod tests {
         assert!(sign_in_error_of(&m).is_some());
     }
 
+    /// A refusal for a call an earlier session sent does not end the one
+    /// signed in now; the current session's own refusal still does, and
+    /// runs the session-end hook.
+    #[test]
+    fn a_refusal_from_an_earlier_session_leaves_the_current_one() {
+        thread_local! {
+            static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn hook() -> Option<String> {
+            ENDED.with(|n| n.set(n.get() + 1));
+            None
+        }
+        let mut m = Machine::new().with_session_end(hook);
+        m.apply(Event::Resumed { epoch: 0 });
+        let first = m.session();
+        // Signed out and in again while the first session's call was out.
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::SignOutAnswered(SignOutReply::Status(204)));
+        m.apply(Event::SignInAnswered(SignInReply::Status {
+            status: 204,
+            retry_after: None,
+        }));
+        let epoch = m.epoch();
+        m.apply(Event::Resumed { epoch });
+        assert_eq!(m.phase(), &Phase::Ready);
+        assert_ne!(m.session(), first);
+        ENDED.with(|n| n.set(0));
+        m.apply(Event::SessionNeedsSignIn { session: first });
+        assert_eq!(
+            m.phase(),
+            &Phase::Ready,
+            "an old call ended the new session"
+        );
+        assert_eq!(ENDED.with(std::cell::Cell::get), 0);
+        // The current session's own refusal ends it.
+        let now = m.session();
+        m.apply(Event::SessionNeedsSignIn { session: now });
+        assert!(sign_in_error_of(&m).is_some());
+        assert_eq!(ENDED.with(std::cell::Cell::get), 1);
+    }
+
+    /// CR 4638660965: a refusal from the current session lands while the
+    /// socket is reconnecting (not Ready): it still ends that session and
+    /// runs the hook. A stale one still does not.
+    #[test]
+    fn a_current_refusal_during_a_reconnect_ends_the_session() {
+        thread_local! {
+            static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn hook() -> Option<String> {
+            ENDED.with(|n| n.set(n.get() + 1));
+            None
+        }
+        let mut m = Machine::new().with_session_end(hook);
+        m.apply(Event::Resumed { epoch: 0 });
+        let now = m.session();
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "gone".into(),
+        });
+        assert_eq!(m.phase(), &Phase::Connecting);
+        m.apply(Event::SessionNeedsSignIn {
+            session: now.wrapping_sub(1),
+        });
+        assert_eq!(m.phase(), &Phase::Connecting, "a stale refusal acted");
+        m.apply(Event::SessionNeedsSignIn { session: now });
+        assert!(sign_in_error_of(&m).is_some(), "the refusal was dropped");
+        assert_eq!(ENDED.with(std::cell::Cell::get), 1);
+    }
+
+    /// Review 5987743326 (machine.rs:301): a socket close at the current
+    /// epoch after a sign-out that could not forget the token does not
+    /// reconnect or replace the sign-in screen's warning.
+    #[test]
+    fn a_close_after_the_sign_in_screen_is_ignored() {
+        let mut m = ready();
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::SignOutAnswered(SignOutReply::NotSaved(
+            "disk".into(),
+        )));
+        let warning = sign_in_error_of(&m).map(str::to_owned);
+        assert!(warning.is_some());
+        let epoch = m.epoch();
+        m.apply(Event::Closed {
+            epoch,
+            reason: "gone".into(),
+        });
+        assert_eq!(
+            sign_in_error_of(&m),
+            warning.as_deref(),
+            "the close reconnected"
+        );
+        m.apply(Event::Closed {
+            epoch,
+            reason: REVOKED.into(),
+        });
+        assert_eq!(
+            sign_in_error_of(&m),
+            warning.as_deref(),
+            "the warning was replaced"
+        );
+    }
+
+    /// A reconnect may publish another token (B) than the one a pending
+    /// call was sent with (A): A's delayed refusal leaves B's session and
+    /// its token alone, and B's own refusal still ends it.
+    #[test]
+    fn a_refusal_sent_before_a_reconnect_leaves_the_replacement_session() {
+        thread_local! {
+            static ENDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        fn hook() -> Option<String> {
+            ENDED.with(|n| n.set(n.get() + 1));
+            None
+        }
+        let mut m = Machine::new().with_session_end(hook);
+        m.apply(Event::Resumed { epoch: 0 });
+        let a = m.session();
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "gone".into(),
+        });
+        assert!(m.had_session(), "the outage forgot the session");
+        let epoch = m.epoch();
+        m.apply(Event::Resumed { epoch });
+        let b = m.session();
+        assert_ne!(b, a, "the replacement reused the refusal id");
+        m.apply(Event::SessionNeedsSignIn { session: a });
+        assert_eq!(m.phase(), &Phase::Ready, "A's refusal ended B's session");
+        assert_eq!(
+            ENDED.with(std::cell::Cell::get),
+            0,
+            "B's token was cleaned up"
+        );
+        m.apply(Event::SessionNeedsSignIn { session: b });
+        assert!(sign_in_error_of(&m).is_some());
+        assert_eq!(ENDED.with(std::cell::Cell::get), 1);
+    }
+
     #[test]
     fn sign_out_signs_in_quietly_or_keeps_the_session_on_failure() {
         let mut m = ready();
@@ -604,6 +1050,84 @@ mod tests {
         assert_eq!(m.phase(), &Phase::Ready);
         assert!(m.notice().is_some_and(|n| n.contains("503")));
         assert!(!m.signing_out());
+    }
+
+    /// A sign-out that lands while a reconnect is in flight wins: that
+    /// attempt's resume is refused, and the app stays on sign-in.
+    #[test]
+    fn a_resume_after_a_sign_out_won_is_refused() {
+        let mut m = ready();
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::Closed {
+            epoch: 0,
+            reason: "network".into(),
+        });
+        let attempt = m.epoch();
+        assert!(m.accepts_resume(attempt));
+        m.apply(Event::SignOutAnswered(SignOutReply::Status(204)));
+        assert!(
+            !m.accepts_resume(attempt),
+            "a won sign-out still accepts the attempt"
+        );
+        m.apply(Event::Resumed { epoch: attempt });
+        assert_eq!(
+            sign_in_error_of(&m),
+            None,
+            "the attempt resumed over the sign-out"
+        );
+    }
+
+    /// A sign-out the device could not save signs out all the same, and
+    /// the sign-in screen says the device kept the sign-in and how to
+    /// retry; the session-end hook runs.
+    #[test]
+    fn a_sign_out_not_saved_signs_out_and_says_so() {
+        let mut m = ready();
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::SignOutAnswered(SignOutReply::NotSaved(
+            "permission denied".into(),
+        )));
+        let error = sign_in_error_of(&m).unwrap_or_default();
+        assert!(
+            error.contains("could not forget the sign-in (permission denied)")
+                && error.contains("sign out again"),
+            "{error}"
+        );
+        assert!(!m.signing_out());
+    }
+
+    /// CR 4644634569: a sign-out whose removal is not durable signs out
+    /// with a warning that the sign-in may come back after a restart.
+    #[test]
+    fn a_sign_out_not_durable_signs_out_and_warns_of_a_restart() {
+        let mut m = ready();
+        m.apply(Event::SignOutSubmitted);
+        m.apply(Event::SignOutAnswered(SignOutReply::NotDurable(
+            "sync failed".into(),
+        )));
+        assert!(matches!(m.phase(), Phase::SignIn { .. }));
+        let error = sign_in_error_of(&m).unwrap_or_default();
+        assert!(
+            error.contains("(sync failed)") && error.contains("restarts"),
+            "{error}"
+        );
+        assert!(!m.signing_out());
+    }
+
+    /// CR 4640611359: a refused token the device could not drop signs in
+    /// with a warning that the account may come back after a restart, not
+    /// as a plain refusal; a stale attempt's changes nothing.
+    #[test]
+    fn a_refused_token_that_stayed_signs_in_with_a_warning() {
+        let mut m = Machine::new();
+        m.apply(Event::ResumeRefusedTokenKept { epoch: 0 });
+        assert_eq!(sign_in_error_of(&m), Some(TOKEN_KEPT));
+        let mut m = Machine::new();
+        m.apply(Event::ResumeRefused { epoch: 0 });
+        assert_eq!(sign_in_error_of(&m), None);
+        let mut m = Machine::new();
+        m.apply(Event::ResumeRefusedTokenKept { epoch: 7 });
+        assert_eq!(m.phase(), &Phase::Connecting);
     }
 
     #[test]

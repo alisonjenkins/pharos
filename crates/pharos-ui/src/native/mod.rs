@@ -157,3 +157,10 @@ pub mod views;
 pub mod visualiser;
 pub mod watch_view;
 pub mod whats_new;
+// The device token and its user in one file (android.rs keeps it; builds on
+// the host so the sign-in sequences can be tested).
+#[cfg(any(target_os = "android", test))]
+pub mod token_file;
+// A scope-owned temporary folder for the native tests.
+#[cfg(test)]
+pub(crate) mod test_dir;
