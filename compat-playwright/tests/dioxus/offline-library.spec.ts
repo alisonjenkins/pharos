@@ -142,12 +142,14 @@ test.describe("the library offline (spec 049)", () => {
     await expect(page.locator(".pharos-connection-shell")).toBeVisible({ timeout: 20_000 });
     const lostAt = Date.now();
     const note = page.locator(".pharos-offline-note");
-    // Well inside the grace: still the server's screens.
-    await page.waitForTimeout(4_000);
-    await expect(note).toHaveCount(0);
+    // Just short of the 5 s grace (the loss is seen up to a poll late, so
+    // 4.7 s here is under 5 s in the app): still the server's screens. A
+    // one-shot count, not a retrying assertion, so a switch any earlier
+    // fails here. The exact grace is pinned by a unit test
+    // (the_lost_connection_grace_is_five_seconds).
+    await page.waitForTimeout(Math.max(0, 4_700 - (Date.now() - lostAt)));
+    expect(await note.count()).toBe(0);
     await expect(note).toBeVisible({ timeout: 20_000 });
-    // The loss is seen up to one poll late, so allow that much under 5 s.
-    expect(Date.now() - lostAt).toBeGreaterThanOrEqual(4_800);
     await expect(main(page)).toContainText("Reader Fixture");
     await expect(main(page)).not.toContainText("Reader Second", { timeout: 10_000 });
     expect(logs.some((l) => /^pharos: offline library verdict=device reason=connection_lost /.test(l))).toBe(true);
