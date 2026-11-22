@@ -8,12 +8,12 @@ use jni::Env;
 
 /// Runs `f` with the activity on this thread, clearing any exception it
 /// leaves so the next JNI call works.
-fn with_activity(f: impl FnOnce(&mut Env, &JObject) -> Result<(), String>) -> Result<(), String> {
+fn with_activity<T>(f: impl FnOnce(&mut Env, &JObject) -> Result<T, String>) -> Result<T, String> {
     let ctx = ndk_context::android_context();
     // SAFETY: tao put the process's JavaVM and the activity in the context
     // at start-up, and both live as long as the app.
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
-    vm.attach_current_thread_for_scope(|env| -> Result<Result<(), String>, jni::errors::Error> {
+    vm.attach_current_thread_for_scope(|env| -> Result<Result<T, String>, jni::errors::Error> {
         // The context is an app-lifetime handle, not a local reference of
         // this frame, so borrow it instead of taking it over.
         let raw: jni::sys::jobject = ctx.context().cast();
@@ -25,6 +25,11 @@ fn with_activity(f: impl FnOnce(&mut Env, &JObject) -> Result<(), String>) -> Re
         Ok(result)
     })
     .map_err(|e| e.to_string())?
+}
+
+/// The app's private files directory, where the video downloads live.
+pub fn files_dir() -> Result<std::path::PathBuf, String> {
+    with_activity(pharos_android::files_dir).map(std::path::PathBuf::from)
 }
 
 /// Starts the car's media service, while the activity is in the foreground;
