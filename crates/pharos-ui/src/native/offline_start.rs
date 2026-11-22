@@ -221,6 +221,44 @@ fn current_items(store: &dyn OfflineStore) -> (Vec<Download>, Vec<OfflineItem>) 
     (downloads, items)
 }
 
+/// Of the items that can play now, the queue a song `id` starts: its
+/// download's whole tracks, from that song.
+pub fn song_queue(items: &[OfflineItem], id: &str) -> Option<(Vec<String>, usize)> {
+    items.iter().find_map(|item| {
+        let at = item.track_ids.iter().position(|t| t == id)?;
+        Some((item.track_ids.clone(), at))
+    })
+}
+
+/// A cached song asked for with no server (spec 049): the queue it starts
+/// on the phone's own player, or `None` when it is not cached or there is
+/// no player.
+pub fn cached_song(id: &str) -> Option<(Vec<String>, usize)> {
+    let store = offline_store()?;
+    native_audio()?;
+    let (_, items) = current_items(&*store);
+    song_queue(&items, id)
+}
+
+/// Plays a cached song on the phone's own player, once, and shows what is
+/// downloaded with the song playing and its controls.
+#[component]
+pub fn OfflineSong(id: String, ids: Vec<String>, at: usize) -> Element {
+    use_hook(move || match native_audio() {
+        Some(audio) => {
+            platform::info(&format!(
+                "pharos: offline song verdict=play item={id} tracks={} start_index={at}",
+                ids.len()
+            ));
+            audio.play(ids, at);
+        }
+        None => platform::warn(&format!(
+            "pharos: offline song verdict=none item={id} reason=no_player"
+        )),
+    });
+    rsx! { OfflineStart {} }
+}
+
 /// Whether anything is downloaded on this phone, for the slow-connect timer.
 pub fn any_downloaded() -> bool {
     offline_store().is_some_and(|store| {
@@ -699,6 +737,21 @@ mod tests {
         );
         assert!(!html.contains("is-icon"), "{html}");
         assert!(html.contains("pharos-download-head"), "{html}");
+    }
+
+    /// A cached song from the device's library starts its download's
+    /// queue at that song; one not cached starts nothing.
+    #[test]
+    fn a_cached_song_starts_its_download_from_that_song() {
+        let store = kept_store();
+        let items = build_items(&store.downloads(), |_| None);
+        assert_eq!(
+            song_queue(&items, "7-2"),
+            Some((vec!["7-1".to_owned(), "7-2".to_owned()], 1))
+        );
+        assert_eq!(song_queue(&items, "8-1"), None);
+        // No ports registered in a test: nothing to play on.
+        assert_eq!(cached_song("7-1"), None);
     }
 
     #[test]
