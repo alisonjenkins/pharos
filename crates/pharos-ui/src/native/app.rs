@@ -5709,6 +5709,20 @@ impl PartialEq for PlayingRef {
 #[component]
 fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let ctx = use_context::<Ctx>();
+    // With no server, a song cached on the phone plays on its own player
+    // (spec 049): the device's library lists it, and no grant can be asked
+    // for. Decided once, as the screen mounts per item.
+    let cached_song = use_hook(|| {
+        let offline = ctx.offline.peek().is_some() || ctx.api.peek().is_none();
+        offline
+            .then(|| super::offline_start::cached_song(&id.to_string()))
+            .flatten()
+    });
+    if let Some((ids, at)) = cached_song {
+        return rsx! {
+            super::offline_start::OfflineSong { id: id.to_string(), ids, at }
+        };
+    }
     let replace = use_context::<Replace>();
     let together = use_context::<Together>();
     let group_view = together.view;
