@@ -12,7 +12,8 @@
 //! [`offline_error`].
 //!
 //! No I/O here: the platform reads and writes the note
-//! ([`Catalogue::load`]), and the app hands in what is on the device.
+//! ([`super::offline_device::load_catalogue`]), and the app hands in what is
+//! on the device.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -774,11 +775,23 @@ impl OfflineLibrary {
         let ids = match listing.group {
             // A grouped listing (a library's series or albums) lists every
             // item of that kind under the parent, however deep.
-            Some(group) => self
-                .descendants(listing.parent)
-                .into_iter()
-                .filter(|id| self.items.get(id).is_some_and(|i| i.kind == group))
-                .collect(),
+            // A kept item with no note sits straight under its library
+            // (a bare episode or song); it is listed too, unless something
+            // of the grouped kind under it is listed already.
+            Some(group) => {
+                let of_group = |id: &ItemRef| self.items.get(id).is_some_and(|i| i.kind == group);
+                let mut ids: Vec<ItemRef> = self
+                    .descendants(listing.parent)
+                    .into_iter()
+                    .filter(of_group)
+                    .collect();
+                for child in self.children.get(&listing.parent).into_iter().flatten() {
+                    if !of_group(child) && !self.descendants(*child).iter().any(of_group) {
+                        ids.push(*child);
+                    }
+                }
+                ids
+            }
             None => self
                 .children
                 .get(&listing.parent)
@@ -983,7 +996,11 @@ impl PharosApi for OfflineLibrary {
     }
 
     async fn index(&self, _: &CallInfo, listing: &Listing) -> Result<ListIndex, ClientError> {
-        let items = self.listing(&Listing {
+        // The letters jump into the listing as shown (genre applied); the
+        // genre picker offers every genre of the unfiltered listing, as the
+        // server does.
+        let items = self.listing(listing);
+        let all = self.listing(&Listing {
             genre: None,
             ..listing.clone()
         });
@@ -994,7 +1011,7 @@ impl PharosApi for OfflineLibrary {
                 letters.push((letter, u32::try_from(n).unwrap_or(u32::MAX)));
             }
         }
-        let genres: BTreeSet<String> = items
+        let genres: BTreeSet<String> = all
             .iter()
             .filter_map(|i| self.text.get(&i.id))
             .flat_map(|s| s.genres.iter().cloned())
@@ -1489,6 +1506,56 @@ mod tests {
             index.letters,
             vec![("A".to_owned(), 0), ("F".to_owned(), 1)]
         );
+    }
+
+    /// The letters index the listing as shown: with a genre picked, a jump
+    /// lands in the genre's listing, and the picker still offers every
+    /// genre.
+    #[test]
+    fn the_index_follows_the_genre_listing_and_offers_every_genre() {
+        let films = library(FILMS, LibraryKind::Movies, "Movies");
+        let alpha = under(OTHER_FILM, ItemKind::Movie, "Alpha", FILMS);
+        let bravo = under(FILM, ItemKind::Movie, "Bravo", FILMS);
+        let mut alpha_page = detail_with(&alpha, "");
+        alpha_page.genres = vec!["Drama".into()];
+        let mut bravo_page = detail_with(&bravo, "");
+        bravo_page.genres = vec!["Action".into()];
+        let mut c = Catalogue::new("u");
+        c.note(&[films.clone(), alpha], Some(&alpha_page));
+        c.note(&[films, bravo], Some(&bravo_page));
+        let device = vec![
+            video(FILM, ItemKind::Movie, 0),
+            video(OTHER_FILM, ItemKind::Movie, 0),
+        ];
+        let lib = OfflineLibrary::new(&c, &device);
+        let action = Listing {
+            genre: Some("Action".into()),
+            ..Listing::of(FILMS, None, "SortName")
+        };
+        let index = run(lib.index(&info(), &action)).unwrap();
+        assert_eq!(index.letters, vec![("B".to_owned(), 0)]);
+        assert_eq!(index.genres, vec!["Action".to_owned(), "Drama".to_owned()]);
+    }
+
+    /// A kept episode with no note sits straight under its library; the
+    /// library's Series listing still lists it, beside the noted series.
+    #[test]
+    fn a_grouped_listing_keeps_an_unnoted_item_under_its_library() {
+        let unnoted = ItemRef::Real(997);
+        let mut device = device();
+        device.push(video(unnoted, ItemKind::Episode, 0));
+        let lib = OfflineLibrary::new(&catalogue(), &device);
+        let page = run(lib.query(
+            &info(),
+            &Listing::of(TV, Some(ItemKind::Series), "SortName"),
+            0,
+            50,
+        ))
+        .unwrap();
+        let ids: Vec<_> = page.items.iter().map(|i| i.id).collect();
+        assert!(ids.contains(&SHOW), "{ids:?}");
+        assert!(ids.contains(&unnoted), "{ids:?}");
+        assert_eq!(ids.len(), 2, "{ids:?}");
     }
 
     #[test]
