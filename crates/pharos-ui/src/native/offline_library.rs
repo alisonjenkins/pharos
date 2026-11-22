@@ -418,6 +418,19 @@ pub enum OnDevice {
 }
 
 impl OnDevice {
+    /// The kind of library it belongs in when no note says.
+    fn library_kind(&self) -> LibraryKind {
+        match self {
+            Self::Video {
+                kind: ItemKind::Episode,
+                ..
+            } => LibraryKind::TvShows,
+            Self::Video { .. } => LibraryKind::Movies,
+            Self::Book { .. } => LibraryKind::Books,
+            Self::Song { .. } => LibraryKind::Music,
+        }
+    }
+
     pub fn id(&self) -> ItemRef {
         match self {
             Self::Video { id, .. } | Self::Book { id, .. } | Self::Song { id, .. } => *id,
@@ -490,6 +503,17 @@ pub struct OfflineLibrary {
     reading: Vec<ItemRef>,
     /// Where each book was left on the device.
     places: HashMap<ItemRef, f32>,
+}
+
+/// The name of a library made up for kept items with no note.
+fn library_name(kind: LibraryKind) -> &'static str {
+    match kind {
+        LibraryKind::TvShows => "TV Shows",
+        LibraryKind::Movies => "Movies",
+        LibraryKind::Music => "Music",
+        LibraryKind::Books => "Books",
+        LibraryKind::Mixed => "Media",
+    }
 }
 
 /// Home's library order: TV Shows, Movies, Music, Books, then the rest.
@@ -601,6 +625,43 @@ impl OfflineLibrary {
                 if !list.contains(id) {
                     list.push(*id);
                 }
+            }
+        }
+        // A kept item with no note up to a library (kept since the last
+        // notes pass, or never noted) still shows: its top joins a library
+        // of its kind, made up when the device has none noted.
+        for kept in on_device {
+            let mut top = kept.id();
+            for _ in 0..MAX_DEPTH {
+                match lib.items.get(&top).and_then(|i| i.parent) {
+                    Some(parent) if lib.items.contains_key(&parent) => top = parent,
+                    _ => break,
+                }
+            }
+            if lib.items.get(&top).is_some_and(|i| i.kind == ItemKind::Library) {
+                continue;
+            }
+            let kind = kept.library_kind();
+            let library = match lib.libraries.iter().find(|l| {
+                lib.items.get(l).and_then(|i| i.library_kind) == Some(kind)
+            }) {
+                Some(found) => *found,
+                None => {
+                    let id = ItemRef::Synth(u64::MAX - u64::from(library_rank(Some(kind))));
+                    lib.items.insert(
+                        id,
+                        Item {
+                            library_kind: Some(kind),
+                            ..blank_item(id, ItemKind::Library, library_name(kind))
+                        },
+                    );
+                    lib.libraries.push(id);
+                    id
+                }
+            };
+            let list = lib.children.entry(library).or_default();
+            if !list.contains(&top) {
+                list.push(top);
             }
         }
         let items = &lib.items;
@@ -1177,14 +1238,30 @@ mod tests {
         assert!(matches!(err, ClientError::Api { kind: "notFound", .. }), "{err:?}");
     }
 
+    /// Kept since the last notes pass: it shows by its kept title, in a
+    /// library of its kind (the noted one when there is one), so it can be
+    /// found offline at all.
     #[test]
     fn an_unnoted_download_still_shows_by_its_kept_title() {
-        let lib = OfflineLibrary::new(&Catalogue::new("u"), &[video(ItemRef::Real(999), ItemKind::Movie, 5)]);
+        let unnoted = ItemRef::Real(999);
+        let lib = OfflineLibrary::new(&Catalogue::new("u"), &[video(unnoted, ItemKind::Movie, 5)]);
         let home = run(lib.home(&info())).unwrap();
-        assert!(home.rails.is_empty());
+        assert_eq!(home.rails.len(), 1);
+        assert_eq!(home.rails[0].library.name, "Movies");
+        assert_eq!(home.rails[0].latest[0].name, "kept 999");
         assert_eq!(home.resume[0].name, "kept 999");
         let found = run(lib.search(&info(), "KEPT", 0)).unwrap();
         assert_eq!(found.total, 1);
+
+        // With a noted Movies library, it joins that one: one Movies tab.
+        let mut device = device();
+        device.push(video(unnoted, ItemKind::Movie, 0));
+        let lib = OfflineLibrary::new(&catalogue(), &device);
+        let views = run(lib.views(&info())).unwrap();
+        let movies: Vec<_> = views.items.iter().filter(|l| l.name == "Movies").collect();
+        assert_eq!(movies.len(), 1);
+        let listed = run(lib.query(&info(), &Listing::of(FILMS, None, "SortName"), 0, 50)).unwrap();
+        assert!(listed.items.iter().any(|i| i.id == unnoted), "{listed:?}");
     }
 
     #[test]
