@@ -33,7 +33,10 @@ mod testserver;
 pub mod token;
 mod tree;
 
-pub use cache::{Download, DownloadTrack, OfflineSummary, DEFAULT_CAP_BYTES, MIN_FREE_BYTES};
+pub use cache::{
+    admission_guard, statvfs_free, Download, DownloadTrack, MusicPending, NoRoom, OfflineSummary,
+    OutsideBytes, OutsideUsed, DEFAULT_CAP_BYTES, MIN_FREE_BYTES,
+};
 pub use error::ContentError;
 pub use fault::unreachable as server_unreachable;
 pub use id::NodeId;
