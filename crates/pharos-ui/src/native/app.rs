@@ -1149,7 +1149,11 @@ fn hls_engine_adapts() -> bool {
 /// This page load's HLS engine and why (V630).
 fn mse_engine_choice() -> (MseEngine, EngineReason) {
     let stored = stored_mse_engine_raw();
-    pick_mse_engine(&platform::current_search(), stored.as_deref())
+    pick_mse_engine(
+        &platform::current_search(),
+        stored.as_deref(),
+        platform::default_mse_engine(),
+    )
 }
 
 fn stored_mse_engine_raw() -> Option<String> {
@@ -1159,9 +1163,14 @@ fn stored_mse_engine_raw() -> Option<String> {
     })
 }
 
-/// The engine this device's Playback setting names; hls.js when unset.
+/// The engine this device's Playback setting names; the platform's default when unset.
 fn stored_mse_engine() -> MseEngine {
-    pick_mse_engine("", stored_mse_engine_raw().as_deref()).0
+    pick_mse_engine(
+        "",
+        stored_mse_engine_raw().as_deref(),
+        platform::default_mse_engine(),
+    )
+    .0
 }
 
 thread_local! {

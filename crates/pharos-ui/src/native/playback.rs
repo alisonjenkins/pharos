@@ -270,16 +270,17 @@ pub fn choose_engine(is_hls: bool, native_hls: bool, mse: bool, mse_engine: MseE
 /// Which engine plays HLS through Media Source Extensions on this device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MseEngine {
-    /// The vendored hls.js (ADR-0035), the default until spec 031 reaches
-    /// parity.
-    #[default]
+    /// The vendored hls.js (ADR-0035), kept as the way back while the Pharos
+    /// engine is new as the default (ADR-0151).
     HlsJs,
-    /// Pharos's own engine (ADR-0071), opt-in.
+    /// Pharos's own engine (ADR-0071), the default wherever a platform does
+    /// not name another (ADR-0151).
+    #[default]
     Rust,
 }
 
 impl MseEngine {
-    pub const ALL: [MseEngine; 2] = [MseEngine::HlsJs, MseEngine::Rust];
+    pub const ALL: [MseEngine; 2] = [MseEngine::Rust, MseEngine::HlsJs];
 
     /// The stored and logged name.
     pub fn as_str(self) -> &'static str {
@@ -291,8 +292,8 @@ impl MseEngine {
 
     pub fn label(self) -> &'static str {
         match self {
-            MseEngine::HlsJs => "hls.js",
-            MseEngine::Rust => "Pharos (experimental)",
+            MseEngine::HlsJs => "hls.js (older)",
+            MseEngine::Rust => "Pharos",
         }
     }
 
@@ -328,8 +329,13 @@ impl EngineReason {
 }
 
 /// The MSE engine for this page load: a valid `engine=` in the page's query
-/// `search` wins, then the `stored` setting, then the default (V630).
-pub fn pick_mse_engine(search: &str, stored: Option<&str>) -> (MseEngine, EngineReason) {
+/// `search` wins, then the `stored` setting, then the platform's `default`
+/// (V630, V1505).
+pub fn pick_mse_engine(
+    search: &str,
+    stored: Option<&str>,
+    default: MseEngine,
+) -> (MseEngine, EngineReason) {
     let asked = search
         .trim_start_matches('?')
         .split('&')
@@ -340,7 +346,7 @@ pub fn pick_mse_engine(search: &str, stored: Option<&str>) -> (MseEngine, Engine
     }
     match stored.and_then(MseEngine::parse) {
         Some(engine) => (engine, EngineReason::Setting),
-        None => (MseEngine::default(), EngineReason::Default),
+        None => (default, EngineReason::Default),
     }
 }
 
@@ -4975,39 +4981,45 @@ mod tests {
     #[test]
     fn mse_engine_is_override_then_setting_then_default() {
         use EngineReason::{Default, Override, Setting};
-        assert_eq!(pick_mse_engine("", None), (MseEngine::HlsJs, Default));
+        let pick = |search, stored| pick_mse_engine(search, stored, MseEngine::Rust);
+        assert_eq!(pick("", None), (MseEngine::Rust, Default));
+        assert_eq!(pick("", Some("rust")), (MseEngine::Rust, Setting));
+        assert_eq!(pick("", Some("hlsjs")), (MseEngine::HlsJs, Setting));
+        assert_eq!(pick("", Some("shaka")), (MseEngine::Rust, Default));
         assert_eq!(
-            pick_mse_engine("", Some("rust")),
-            (MseEngine::Rust, Setting)
-        );
-        assert_eq!(
-            pick_mse_engine("", Some("hlsjs")),
-            (MseEngine::HlsJs, Setting)
-        );
-        assert_eq!(
-            pick_mse_engine("", Some("shaka")),
-            (MseEngine::HlsJs, Default)
-        );
-        assert_eq!(
-            pick_mse_engine("?a=1&engine=rust", Some("hlsjs")),
+            pick("?a=1&engine=rust", Some("hlsjs")),
             (MseEngine::Rust, Override)
         );
         assert_eq!(
-            pick_mse_engine("?engine=hlsjs", Some("rust")),
+            pick("?engine=hlsjs", Some("rust")),
             (MseEngine::HlsJs, Override)
         );
         assert_eq!(
-            pick_mse_engine("?engine=nope", Some("rust")),
-            (MseEngine::Rust, Setting)
+            pick("?engine=nope", Some("hlsjs")),
+            (MseEngine::HlsJs, Setting)
         );
+        assert_eq!(pick("?xengine=hlsjs", None), (MseEngine::Rust, Default));
         assert_eq!(
-            pick_mse_engine("?xengine=rust", None),
-            (MseEngine::HlsJs, Default)
-        );
-        assert_eq!(
-            pick_mse_engine("?engine=nope&engine=rust", Some("hlsjs")),
+            pick("?engine=nope&engine=rust", Some("hlsjs")),
             (MseEngine::Rust, Override)
         );
+    }
+
+    /// V1505: with nothing chosen the platform's default plays, whichever it is.
+    #[test]
+    fn the_platform_default_plays_when_nothing_is_chosen() {
+        for default in MseEngine::ALL {
+            assert_eq!(
+                pick_mse_engine("", None, default),
+                (default, EngineReason::Default)
+            );
+            assert_eq!(
+                pick_mse_engine("?engine=nope", Some("shaka"), default),
+                (default, EngineReason::Default)
+            );
+        }
+        assert_eq!(MseEngine::default(), MseEngine::Rust);
+        assert_eq!(MseEngine::ALL[0], MseEngine::Rust);
     }
 
     #[test]
