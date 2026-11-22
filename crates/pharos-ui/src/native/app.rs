@@ -2205,6 +2205,8 @@ fn NativeApp(route: Route) -> Element {
         machine,
         marks,
     });
+    // ADR 0148: one download at a time, tried again by itself.
+    super::download_driver::use_download_driver();
     // Spec 049: a dropped connection that lasts past the grace, so a blip
     // does not swap the page for the device's library.
     let mut lost_long = use_signal(|| false);
