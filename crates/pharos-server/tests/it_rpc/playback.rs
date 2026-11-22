@@ -2189,6 +2189,15 @@ async fn an_adopting_reconnect_reports_the_subtitle_it_named() {
 async fn a_renewal_from_another_token_holds_the_stream() {
     let (server, fx) = crate::revocation::start().await;
     seed_playable(&fx).await;
+    // A file on disk, so the stream answers with its bytes, not a 404.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("native.mp4");
+    std::fs::write(&file, b"bytes for the stream to serve").unwrap();
+    let mut item = pharos_core::MediaStore::get(&fx.state.stores, MOVIE)
+        .await
+        .unwrap();
+    item.path = file;
+    fx.state.stores.put(item).await.unwrap();
     let (client, _closed) = crate::revocation::connect(&server).await;
     let old = crate::revocation::signed_in(&client, &fx.user_token).await;
     let new_token = fx.state.stores.issue(fx.user_id, "test").await.unwrap();
@@ -2209,16 +2218,16 @@ async fn a_renewal_from_another_token_holds_the_stream() {
             .status()
     };
     let unauthorized = actix_web::http::StatusCode::UNAUTHORIZED;
-    assert_ne!(
-        status().await,
-        unauthorized,
-        "the control: the stream is open"
+    let open = status().await;
+    assert!(
+        open.is_success(),
+        "the control: the stream serves, got {open}"
     );
     fx.state.stores.revoke(&fx.user_token).await.unwrap();
-    assert_ne!(
-        status().await,
-        unauthorized,
-        "the old token's revocation leaves the kept stream open"
+    let kept = status().await;
+    assert!(
+        kept.is_success(),
+        "the old token's revocation leaves the kept stream serving, got {kept}"
     );
     fx.state.stores.revoke(&new_token).await.unwrap();
     assert_eq!(
@@ -2231,7 +2240,7 @@ async fn a_renewal_from_another_token_holds_the_stream() {
 /// B1490: two renewals naming one session at once keep it for one of them
 /// only; the other gets its own, so no two grants share a stream. The RPC
 /// may run them one after the other; the hold's exclusion itself is pinned
-/// by `a_held_session_is_not_claimed_until_every_hold_drops`.
+/// by `a_held_session_is_not_reserved_until_every_hold_drops`.
 #[actix_web::test]
 async fn concurrent_renewals_keep_a_session_for_one_only() {
     let (server, fx) = crate::revocation::start().await;
@@ -2257,8 +2266,9 @@ async fn concurrent_renewals_keep_a_session_for_one_only() {
 /// B1490: a start on the device replaces a playback's `/Sessions` entry while
 /// its grant lives on, so the listing no longer says the session is held. A
 /// renewal naming it gets its own session, and the live grant's stream runs.
-/// Disarm check: with `claim_free` ignoring the holds, the renewal keeps the
-/// live grant's id and two grants share one stream.
+/// The stored lease is let go first, so only this replica's own hold on the
+/// live grant refuses it. Disarm check: with `reserve` ignoring the holds,
+/// the renewal keeps the live grant's id and two grants share one stream.
 #[actix_web::test]
 async fn a_renewal_cannot_take_a_session_a_live_grant_holds() {
     let live_before = resume_count("live");
@@ -2274,6 +2284,18 @@ async fn a_renewal_cannot_take_a_session_a_live_grant_holds() {
     assert!(
         !listed.iter().any(|s| s.id == first.psid),
         "the control: the second start replaced the first's entry"
+    );
+
+    let epoch = fx.state.play_holds.epoch(&first.psid).expect("leased");
+    assert!(
+        pharos_core::TranscodeSessionStore::release_transcode_session_lease(
+            &fx.state.stores,
+            &first.psid,
+            epoch,
+        )
+        .await
+        .unwrap(),
+        "the control: the stored lease no longer refuses a takeover"
     );
 
     let (_c, renewed) = renew_naming(&session, &direct, &first.psid).await.unwrap();
@@ -2304,7 +2326,7 @@ fn resume_count(outcome: &str) -> u64 {
 /// the session is forgotten as the old process's would be.
 async fn as_after_a_rollout(fx: &Fixture, grant: playback_grant::Client, psid: &str) {
     std::mem::forget(grant);
-    fx.state.play_holds.forget(psid);
+    fx.state.play_holds.forget(psid).await;
     fx.state
         .sessions
         .apply(pharos_server::sessions::SessionEvent::Stopped {
@@ -2353,6 +2375,227 @@ async fn after_a_rollout_a_renewal_keeps_its_streams_session() {
         settles_gone(&fx, &first.psid).await,
         "its stop ends the stream"
     );
+}
+
+/// B1490: once a renewal on another replica has taken a session over (its
+/// grant's lease lapsed, as when that replica lost the store), the old
+/// grant's stop and reports are fenced to the epoch it held: they end
+/// nothing, store no position, and the new grant's token still holds the
+/// stream.
+/// Disarm check: with `stop` passing no epoch to `stop_at`, the old grant's
+/// stop deletes the row and the stream is gone; with the epoch read from the
+/// hold instead of kept on the grant, the repeated stop does; with
+/// `superseded` taking a missing row as current, the late report stores its
+/// position; with `end_at` taking a gone row as the grant's, the last stop
+/// does.
+#[actix_web::test]
+async fn a_stop_from_a_grant_a_renewal_took_over_from_ends_nothing() {
+    use pharos_core::TranscodeSessionStore as _;
+    let superseded_before = stop_count("superseded");
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (old, first) = play_on(&session, &direct).await.unwrap();
+    let old_epoch = fx.state.play_holds.epoch(&first.psid).expect("leased");
+    let lease = fx
+        .state
+        .stores
+        .transcode_session_grant(&first.psid)
+        .await
+        .unwrap()
+        .expect("the control: a lease row");
+    assert_eq!(lease.epoch, old_epoch);
+    // Its lease lapses, and a renewal on another replica takes it over.
+    assert!(fx
+        .state
+        .stores
+        .release_transcode_session_lease(&first.psid, old_epoch)
+        .await
+        .unwrap());
+    let renewing = pharos_core::SessionHolder {
+        user_id: fx.user_id,
+        token_id: "another-replicas-renewal".into(),
+    };
+    let now = pharos_server::services::play_holds::now_unix_secs();
+    let new_epoch = fx
+        .state
+        .stores
+        .take_over_transcode_session(
+            &first.psid,
+            lease.source.as_deref().unwrap_or_default(),
+            &renewing,
+            now,
+            0,
+            pharos_server::services::play_holds::lease_until(now),
+        )
+        .await
+        .unwrap()
+        .expect("the control: the takeover wins");
+    assert!(new_epoch > old_epoch);
+
+    let reports_before = superseded_count("report");
+    report(&old, 30_000, true).await.unwrap();
+    assert!(
+        superseded_count("report") > reports_before,
+        "the old grant's report is refused as superseded"
+    );
+    assert_eq!(
+        fx.state
+            .stores
+            .get_user_data(fx.user_id, MOVIE)
+            .await
+            .unwrap()
+            .last_played_position_ticks,
+        0,
+        "and stores no position"
+    );
+    stop(&old, 45_000).await.unwrap();
+    assert!(
+        stream_is_live(&fx, &first.psid).await,
+        "the old grant's stop leaves the new grant's stream running"
+    );
+    // A superseded stop keeps the grant's hold (it ended nothing), so a
+    // second one is fenced by the epoch the hold still names.
+    stop(&old, 46_000).await.unwrap();
+    assert!(
+        stream_is_live(&fx, &first.psid).await,
+        "a repeated stop from the old grant leaves it running too"
+    );
+    // With the hold gone from this replica's map, as after a rollout, only
+    // the epoch the grant was negotiated at fences it, and still does.
+    fx.state.play_holds.forget(&first.psid).await;
+    assert_eq!(
+        fx.state.play_holds.epoch(&first.psid),
+        None,
+        "the control: no hold names an epoch any more"
+    );
+    stop(&old, 47_000).await.unwrap();
+    assert!(
+        stream_is_live(&fx, &first.psid).await,
+        "a stop with the hold gone is fenced by the grant's own epoch"
+    );
+    assert_eq!(
+        fx.state
+            .stores
+            .get_transcode_session(&first.psid, 0)
+            .await
+            .unwrap()
+            .and_then(|s| s.holder),
+        Some(renewing),
+        "and it still answers to the renewal's token"
+    );
+    assert_eq!(
+        fx.state
+            .stores
+            .get_user_data(fx.user_id, MOVIE)
+            .await
+            .unwrap()
+            .last_played_position_ticks,
+        0,
+        "neither superseded stop stored its position"
+    );
+    assert!(stop_count("superseded") > superseded_before, "counted");
+
+    // The new grant's stream ends, taking the row with it: the store can no
+    // longer say whose the session was, and the old grant holds no lease
+    // here, so its late report still stores nothing.
+    assert!(fx
+        .state
+        .stores
+        .remove_transcode_session_at(&first.psid, new_epoch)
+        .await
+        .unwrap());
+    let reports_before = superseded_count("report");
+    report(&old, 31_000, true).await.unwrap();
+    assert!(
+        superseded_count("report") > reports_before,
+        "a report with the row gone is refused as superseded"
+    );
+    assert_eq!(
+        fx.state
+            .stores
+            .get_user_data(fx.user_id, MOVIE)
+            .await
+            .unwrap()
+            .last_played_position_ticks,
+        0,
+        "and moves no resume point back"
+    );
+    // Nor does a stop: the row is gone, and nothing shows this grant ended
+    // it, so its position cannot overwrite the new grant's.
+    stop(&old, 47_000).await.unwrap();
+    assert_eq!(
+        fx.state
+            .stores
+            .get_user_data(fx.user_id, MOVIE)
+            .await
+            .unwrap()
+            .last_played_position_ticks,
+        0,
+        "a stop with the row gone stores nothing either"
+    );
+}
+
+/// B1490: once a stop succeeds the grant stays stopped. A later stop that
+/// fails (here: its token was revoked in the store, unannounced, so the
+/// connection stays up) must not make the grant's drop hold a release: the
+/// first stop already let its hold go, and a negotiate adopting that release
+/// would rebind a session a renewal may have taken over.
+/// Disarm check: with `stop` setting `stopped` from each answer, the failed
+/// stop clears it and the drop holds a release.
+#[actix_web::test]
+async fn a_failed_stop_after_a_stop_holds_no_release() {
+    use pharos_core::TokenStore as _;
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    let (grant, _first) = play_on(&session, &direct).await.unwrap();
+    stop(&grant, 10_000).await.unwrap();
+    fx.state.stores.revoke(&fx.user_token).await.unwrap();
+    assert!(
+        stop(&grant, 11_000).await.is_err(),
+        "the control: the repeated stop is denied"
+    );
+    drop(grant);
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert_eq!(
+            fx.state.pending_releases.len(),
+            0,
+            "a stopped grant's drop holds no release"
+        );
+    }
+}
+
+/// What `pharos_play_grant_superseded_total{what}` has counted so far.
+fn superseded_count(what: &str) -> u64 {
+    let _ = pharos_server::obs::init("info", None);
+    pharos_server::obs::render()
+        .lines()
+        .filter(|l| {
+            l.starts_with("pharos_play_grant_superseded_total{")
+                && l.contains(&format!("what=\"{what}\""))
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// What `pharos_play_stop_total{reason}` has counted so far.
+fn stop_count(reason: &str) -> u64 {
+    let _ = pharos_server::obs::init("info", None);
+    pharos_server::obs::render()
+        .lines()
+        .filter(|l| {
+            l.starts_with("pharos_play_stop_total{") && l.contains(&format!("reason=\"{reason}\""))
+        })
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
 }
 
 /// B1490: a named session is kept only when it is provably the stream asked
@@ -2413,5 +2656,40 @@ async fn a_renewal_keeps_only_a_session_that_is_its_own_stream() {
     assert_eq!(
         kept.psid, held.psid,
         "the control: its own renewal keeps it"
+    );
+}
+
+/// B1490: a grant whose session the session cap ended while it was still
+/// that grant's stops with its final position stored: the store remembers
+/// the row was removed at the grant's epoch. Disarm check: with
+/// `end_granted` answering `Gone` for every gone row, the position stays 0.
+#[actix_web::test]
+async fn a_stop_after_the_cap_ended_its_session_stores_its_position() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, first) = play_on(&session, &direct).await.unwrap();
+    assert!(
+        fx.state.play_holds.epoch(&first.psid).is_some(),
+        "the control: it is leased"
+    );
+    // The cap ends it as an eviction does: the row goes, whoever holds it.
+    fx.state
+        .transcode_sessions
+        .remove(&pharos_core::PlaySessionId::from(first.psid.as_str()))
+        .await
+        .unwrap();
+    stop(&grant, 45_000).await.unwrap();
+    assert_eq!(
+        fx.state
+            .stores
+            .get_user_data(fx.user_id, MOVIE)
+            .await
+            .unwrap()
+            .last_played_position_ticks,
+        45_000 * 10_000,
+        "the stop stores its final position"
     );
 }

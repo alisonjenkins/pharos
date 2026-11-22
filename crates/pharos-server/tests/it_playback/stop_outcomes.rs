@@ -113,6 +113,8 @@ fn stop_outcome_labels_are_distinct_and_stable() {
             ("store_error", "user_data_write"),
             ("below_minimum", "video"),
             ("below_minimum", "song"),
+            ("skipped", "superseded"),
+            ("store_error", "session_end"),
         ]
     );
 }

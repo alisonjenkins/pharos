@@ -1646,82 +1646,7 @@ pub struct Grant {
     pub hold: SessionHold,
 }
 
-/// How many live grants on this replica hold each play session. A renewal
-/// keeps the session it names only when none does: its `/Sessions` entry can
-/// go while its grant lives (another start on the device replaces it), so the
-/// listing alone does not say the stream is free (B1490).
-#[derive(Debug, Default)]
-pub struct PlayHolds(std::sync::Mutex<std::collections::HashMap<String, usize>>);
-
-impl PlayHolds {
-    fn held(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<String, usize>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// A hold on `play_session_id` beside any others: a minted session, or
-    /// one adopted while its release is still being decided.
-    pub fn acquire(self: &std::sync::Arc<Self>, play_session_id: &str) -> SessionHold {
-        *self.held().entry(play_session_id.to_owned()).or_default() += 1;
-        SessionHold {
-            holds: std::sync::Arc::clone(self),
-            play_session_id: play_session_id.to_owned(),
-        }
-    }
-
-    /// The first hold on `play_session_id`, or `None` when a live grant
-    /// already holds it.
-    pub fn claim_free(self: &std::sync::Arc<Self>, play_session_id: &str) -> Option<SessionHold> {
-        let mut held = self.held();
-        if held.get(play_session_id).is_some_and(|n| *n > 0) {
-            return None;
-        }
-        held.insert(play_session_id.to_owned(), 1);
-        drop(held);
-        Some(SessionHold {
-            holds: std::sync::Arc::clone(self),
-            play_session_id: play_session_id.to_owned(),
-        })
-    }
-
-    /// Whether a live grant on this replica holds `play_session_id`.
-    pub fn is_held(&self, play_session_id: &str) -> bool {
-        self.held().get(play_session_id).is_some_and(|n| *n > 0)
-    }
-
-    /// Forgets every hold on `play_session_id`, as a restart does: the grants
-    /// that held it are gone with the old process. Tests stand in for a
-    /// rollout with it while their grant objects stay alive.
-    pub fn forget(&self, play_session_id: &str) {
-        self.held().remove(play_session_id);
-    }
-}
-
-/// One grant's hold on its play session, released on drop.
-#[derive(Debug)]
-pub struct SessionHold {
-    holds: std::sync::Arc<PlayHolds>,
-    play_session_id: String,
-}
-
-impl SessionHold {
-    pub fn play_session_id(&self) -> &str {
-        &self.play_session_id
-    }
-}
-
-impl Drop for SessionHold {
-    fn drop(&mut self) {
-        let mut held = self.holds.held();
-        if let Some(n) = held.get_mut(&self.play_session_id) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                held.remove(&self.play_session_id);
-            }
-        }
-    }
-}
+pub use super::play_holds::{ClaimRefused, PlayHolds, SessionHold};
 
 #[derive(Debug)]
 pub enum GrantError {
@@ -1988,13 +1913,17 @@ pub async fn grant(
             reported_ms: adopted.reported_ms,
         });
     }
-    let resumed = resume_named(state, user, id, r, &item.probe, &negotiated).await;
+    // The file the stream plays, which a takeover must match (B1490): two
+    // editions of one item can share a probe.
+    let source = item.path.to_string_lossy().into_owned();
+    let resumed = resume_named(state, user, id, r, &item.probe, &negotiated, &source).await;
     let is_resumed = resumed.is_some();
-    let hold = resumed.unwrap_or_else(|| {
-        state
+    let hold = match resumed {
+        Some(hold) => hold,
+        None => state
             .play_holds
-            .acquire(&uuid::Uuid::new_v4().simple().to_string())
-    });
+            .acquire(&uuid::Uuid::new_v4().simple().to_string()),
+    };
     let play_session_id = hold.play_session_id().to_owned();
     let resume_ticks = if user_data.played {
         0
@@ -2056,6 +1985,8 @@ pub async fn grant(
             holder.clone(),
         )
         .await;
+        // Once stored: the lease is a value on the session's row.
+        state.play_holds.lease_minted(&hold, &source).await;
         // The client will not ask for segment 0 until its player has loaded the
         // master, so warm the opening segments now, off its critical path. The
         // URL is the one handed back, so the prewarm derives the keys the same
@@ -2157,7 +2088,11 @@ async fn adopt_released(
             };
             match state
                 .transcode_sessions
-                .rebind_holder(&pharos_core::PlaySessionId::from(psid.as_str()), holder)
+                .rebind_holder(
+                    &pharos_core::PlaySessionId::from(psid.as_str()),
+                    holder,
+                    state.play_holds.epoch(&psid),
+                )
                 .await
             {
                 Ok(true) => {
@@ -2209,16 +2144,20 @@ pub enum ResumeOutcome {
     NotHeld,
     /// It plays another file, or another stream of this one.
     OtherStream,
+    /// No grant ever leased it (one negotiated before leases, or by a path
+    /// that takes none), so nothing says no grant still plays it.
+    Unleased,
     Failed,
 }
 
 impl ResumeOutcome {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Resumed,
         Self::Live,
         Self::Gone,
         Self::NotHeld,
         Self::OtherStream,
+        Self::Unleased,
         Self::Failed,
     ];
 
@@ -2229,6 +2168,7 @@ impl ResumeOutcome {
             Self::Gone => "gone",
             Self::NotHeld => "not_held",
             Self::OtherStream => "other_stream",
+            Self::Unleased => "unleased",
             Self::Failed => "failed",
         }
     }
@@ -2248,11 +2188,13 @@ impl ResumeOutcome {
 /// Keeps the play session a renewal names when no released grant was adopted:
 /// after a rollout the table of releases is gone, while the transcode session
 /// the player still pulls from is stored and outlives it (B1490). Kept only
-/// when no grant on this replica holds it and this replica's `/Sessions`
-/// does not list it (both are in memory, so a grant on another replica is not
-/// seen), this user holds it for this item, and it is
-/// the stream just negotiated: the same file, decision and burned subtitles.
-/// Anything else mints a session, as before; the named one is left to run.
+/// when no live grant on this replica holds it, this replica's `/Sessions`
+/// does not list it, this user holds it for this item, it is the stream just
+/// negotiated (the same decision and burned subtitles), and the store's
+/// takeover wins: it refuses while any grant's lease on the session runs, on
+/// any replica, and unless the session was leased playing `source`, the file
+/// just resolved. Anything else mints a session, as before; the named one is
+/// left to run.
 async fn resume_named(
     state: &AppState,
     user: &pharos_core::User,
@@ -2260,16 +2202,19 @@ async fn resume_named(
     r: &GrantRequest<'_>,
     probe: &pharos_core::MediaProbe,
     negotiated: &Negotiated,
+    source: &str,
 ) -> Option<SessionHold> {
     let named = r.resumes;
     if named.is_empty() {
         return None;
     }
     let psid = pharos_core::PlaySessionId::from(named);
-    let Some(claim) = state.play_holds.claim_free(named) else {
-        let outcome = ResumeOutcome::Live;
-        outcome.record(named, "a live grant on this replica holds it");
-        return None;
+    let hold = match state.play_holds.reserve(named) {
+        Ok(hold) => hold,
+        Err(refused) => {
+            refused.outcome.record(named, &refused.reason);
+            return None;
+        }
     };
     let (outcome, reason) = match state.sessions.snapshot().await {
         Err(e) => (
@@ -2297,25 +2242,143 @@ async fn resume_named(
                 Some(why) => (ResumeOutcome::OtherStream, why),
                 None => {
                     // The stream now answers to the renewing token, as an
-                    // adopted release's does.
+                    // adopted release's does, in the takeover itself.
                     let holder = pharos_core::SessionHolder {
                         user_id: user.id,
                         token_id: pharos_core::TokenStore::token_id(&state.stores, r.token),
                     };
-                    match state.transcode_sessions.rebind_holder(&psid, holder).await {
-                        Ok(true) => (ResumeOutcome::Resumed, "the same stream".to_owned()),
-                        Ok(false) => (ResumeOutcome::Gone, "ended while resuming".to_owned()),
-                        Err(e) => (
-                            ResumeOutcome::Failed,
-                            format!("rebinding its holder failed: {e}"),
-                        ),
+                    let until = super::play_holds::lease_until(state.play_holds.now());
+                    match state
+                        .transcode_sessions
+                        .take_over(&psid, s, source, holder, until)
+                        .await
+                    {
+                        Ok(Some(epoch)) => settle_takeover(state, &hold, &psid, epoch, until).await,
+                        Ok(None) => refused_takeover(state, &psid, source).await,
+                        Err(e) => (ResumeOutcome::Failed, format!("taking it over failed: {e}")),
                     }
                 }
             },
         },
     };
     outcome.record(named, &reason);
-    (outcome == ResumeOutcome::Resumed).then_some(claim)
+    (outcome == ResumeOutcome::Resumed).then_some(hold)
+}
+
+/// A committed takeover of `psid` at grant `epoch` (B1490), kept for the
+/// renewal only while this replica can hold its lease: attached to `hold`,
+/// renewed at once if it landed lapsed, and not let go by a drain since. A
+/// takeover that is not kept leaves the session's row in place, so the
+/// stream the player is still fetching keeps playing until it renegotiates,
+/// as any renewal that mints a session of its own leaves it; its lease is
+/// let go (by the drain, or when `hold` drops), so a replacing replica's
+/// renewal can take the session over, and the grant before it stays fenced
+/// out by the epoch the takeover moved on.
+async fn settle_takeover(
+    state: &AppState,
+    hold: &SessionHold,
+    psid: &pharos_core::PlaySessionId,
+    epoch: i64,
+    until: i64,
+) -> (ResumeOutcome, String) {
+    let named = psid.as_str();
+    let (outcome, reason) = match state.play_holds.attach(hold, epoch, Some(until)).await {
+        Ok(()) => match state.play_holds.refresh_if_lapsed(hold, until).await {
+            // A takeover that landed with its lease already
+            // lapsed, then lost to another before it could
+            // renew it, keeps nothing.
+            Some(super::play_holds::LeaseOutcome::Lost) => (
+                ResumeOutcome::Live,
+                format!(
+                    "the takeover at grant epoch {epoch} landed with its lease lapsed, and another grant took the session first"
+                ),
+            ),
+            // Kept only if the lease still runs here and
+            // no drain began since it was attached: the
+            // drain lets every lease go, so the stream
+            // would be the replacing replica's to take.
+            None | Some(super::play_holds::LeaseOutcome::Renewed)
+                if state.play_holds.keeps(named, epoch) =>
+            {
+                (
+                    ResumeOutcome::Resumed,
+                    format!("the same stream, now at grant epoch {epoch}"),
+                )
+            }
+            None | Some(super::play_holds::LeaseOutcome::Renewed) => (
+                ResumeOutcome::Live,
+                format!(
+                    "the takeover at grant epoch {epoch} holds no running lease here any more (the replica began draining, or the lease lapsed)"
+                ),
+            ),
+            // Landed lapsed and not renewed since: another
+            // replica could take it over at any moment, so
+            // this grant plays a stream of its own, and the
+            // takeover is ended below.
+            Some(other) => (
+                ResumeOutcome::Failed,
+                format!(
+                    "the takeover at grant epoch {epoch} landed with its lease lapsed, and renewing it came to {}",
+                    other.label()
+                ),
+            ),
+        },
+        Err(refused) => (refused.outcome, refused.reason),
+    };
+    if outcome != ResumeOutcome::Resumed {
+        tracing::info!(
+            play_session_id = %pharos_core::secret_prefix(named),
+            epoch,
+            outcome = outcome.label(),
+            %reason,
+            "playback: a takeover the renewal does not keep leaves the stream playing and its lease free"
+        );
+    }
+    (outcome, reason)
+}
+
+/// Why the store refused a renewal's takeover of `psid`, read after it.
+async fn refused_takeover(
+    state: &AppState,
+    psid: &pharos_core::PlaySessionId,
+    source: &str,
+) -> (ResumeOutcome, String) {
+    let now = super::play_holds::now_unix_secs();
+    match state.transcode_sessions.grant(psid).await {
+        Err(e) => (
+            ResumeOutcome::Failed,
+            format!("the store refused the takeover, and reading why failed: {e}"),
+        ),
+        Ok(None) => (ResumeOutcome::Gone, "ended while resuming".to_owned()),
+        Ok(Some(g)) if g.epoch == 0 => (
+            ResumeOutcome::Unleased,
+            "no grant ever leased it, so nothing says no other grant plays it".to_owned(),
+        ),
+        Ok(Some(g)) if g.source.as_deref() != Some(source) => (
+            ResumeOutcome::OtherStream,
+            format!(
+                "it was leased playing another file than the one just resolved (grant epoch {})",
+                g.epoch
+            ),
+        ),
+        Ok(Some(g)) => match g.lease_until_unix_secs {
+            Some(until) if until >= now => (
+                ResumeOutcome::Live,
+                format!(
+                    "the lease of grant epoch {} runs for {}s more, on another replica",
+                    g.epoch,
+                    until - now
+                ),
+            ),
+            _ => (
+                ResumeOutcome::NotHeld,
+                format!(
+                    "refused at grant epoch {} with its lease over: its holder or its age changed meanwhile",
+                    g.epoch
+                ),
+            ),
+        },
+    }
 }
 
 /// The first way the stored session `s` is not the stream negotiated now.
@@ -2384,50 +2447,6 @@ fn server_codec_support(caps: &pharos_transcode::ServerEncodeCapabilities) -> Se
         ServerCodecSupport::default()
     } else {
         ServerCodecSupport { encodable }
-    }
-}
-
-#[cfg(test)]
-mod play_hold_tests {
-    #![allow(clippy::expect_used)]
-
-    use super::PlayHolds;
-
-    /// B1490: a session any live grant holds cannot be claimed by a renewal,
-    /// whether that grant minted it, adopted it, or resumed it; it frees once
-    /// the last hold drops.
-    /// Disarm check: with `claim_free` ignoring the count, the claims hold.
-    #[test]
-    fn a_held_session_is_not_claimed_until_every_hold_drops() {
-        let holds = std::sync::Arc::new(PlayHolds::default());
-        let id = "play-hold-test-session";
-        let minted = holds.acquire(id);
-        assert!(holds.claim_free(id).is_none(), "the minting grant holds it");
-        let adopted = holds.acquire(id);
-        drop(minted);
-        assert!(
-            holds.claim_free(id).is_none(),
-            "the adopting grant holds it"
-        );
-        assert!(
-            holds.claim_free("another-session").is_some(),
-            "others are free"
-        );
-        drop(adopted);
-        let resumed = holds.claim_free(id).expect("free once no grant holds it");
-        assert!(
-            holds.claim_free(id).is_none(),
-            "a second renewal is refused"
-        );
-        drop(resumed);
-        let again = holds.acquire(id);
-        holds.forget(id);
-        assert!(!holds.is_held(id), "a restart forgets it");
-        drop(again);
-        assert!(
-            holds.claim_free(id).is_some(),
-            "and a late drop leaves it free"
-        );
     }
 }
 
@@ -3345,5 +3364,121 @@ mod resume_outcome_tests {
         labels.sort_unstable();
         labels.dedup();
         assert_eq!(labels.len(), ResumeOutcome::ALL.len());
+    }
+}
+
+#[cfg(test)]
+mod settle_takeover_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+    use crate::state::Stores;
+    use crate::transcode_sessions::GrantEnd;
+    use pharos_core::{SessionHolder, TranscodeSessionStore as _};
+
+    /// B1490: a takeover that committed but that a drain then kept from the
+    /// renewal leaves the stream the player still fetches in place, with its
+    /// lease free for the replacing replica's renewal to take over, and the
+    /// grant before it stays fenced out. Disarm check: with `settle_takeover`
+    /// ending the takeover at its epoch, the row is gone.
+    #[tokio::test]
+    async fn a_takeover_a_drain_interrupts_keeps_the_stream_and_frees_its_lease() {
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let state = AppState::new(stores, "t".into());
+        let user = pharos_core::UserId::new();
+        let id = "drained-takeover";
+        let psid = pharos_core::PlaySessionId::from(id);
+        let session = crate::transcode_sessions::TranscodeSession {
+            media_id: 1,
+            decision: pharos_jellyfin_api::device_profile::Decision::Transcode {
+                target_container: "mp4".into(),
+                target_video_codec: Some("h264".into()),
+                target_audio_codec: Some("aac".into()),
+                max_video_bitrate_bps: Some(2_500_000),
+            },
+            source_probe: pharos_core::MediaProbe::default(),
+            burn_subtitle_indices: Default::default(),
+            holder: SessionHolder {
+                user_id: user,
+                token_id: "first-token".into(),
+            },
+        };
+        let now = super::super::play_holds::now_unix_secs();
+        let until = super::super::play_holds::lease_until(now);
+        state
+            .transcode_sessions
+            .insert(psid.clone(), session.clone())
+            .await
+            .unwrap();
+        let first = state
+            .stores
+            .lease_transcode_session(id, "file", until)
+            .await
+            .unwrap()
+            .expect("leased");
+        assert!(state
+            .stores
+            .release_transcode_session_lease(id, first)
+            .await
+            .unwrap());
+
+        let hold = state.play_holds.reserve(id).expect("reserved");
+        let renewing = SessionHolder {
+            user_id: user,
+            token_id: "renewing-token".into(),
+        };
+        let epoch = state
+            .transcode_sessions
+            .take_over(&psid, session, "file", renewing, until)
+            .await
+            .unwrap()
+            .expect("the control: the takeover commits");
+        // The replica begins draining between the commit and the attach.
+        state.play_holds.drain().await;
+        let (outcome, reason) = settle_takeover(&state, &hold, &psid, epoch, until).await;
+        assert_ne!(outcome, ResumeOutcome::Resumed, "{reason}");
+        drop(hold);
+        assert!(
+            state
+                .stores
+                .get_transcode_session(id, 0)
+                .await
+                .unwrap()
+                .is_some(),
+            "the stream the player still fetches keeps playing: {reason}"
+        );
+        assert_eq!(
+            state.stores.transcode_session_end(id).await.unwrap(),
+            None,
+            "nothing ended it"
+        );
+        let replacing = SessionHolder {
+            user_id: user,
+            token_id: "replacing-token".into(),
+        };
+        let stored = state
+            .transcode_sessions
+            .get(psid.clone())
+            .await
+            .unwrap()
+            .expect("still stored");
+        assert_eq!(
+            state
+                .transcode_sessions
+                .take_over(&psid, stored, "file", replacing, until)
+                .await
+                .unwrap(),
+            Some(epoch + 1),
+            "the replacing replica's renewal can take the session over"
+        );
+        assert_eq!(
+            state
+                .transcode_sessions
+                .end_granted(&psid, user, first)
+                .await
+                .unwrap(),
+            GrantEnd::Superseded,
+            "the grant before it is still fenced out"
+        );
     }
 }

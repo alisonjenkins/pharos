@@ -260,7 +260,10 @@ fn report_error(e: play_state::ReportError) -> actix_web::Error {
     match e {
         play_state::ReportError::Withheld(hidden) => crate::api::jellyfin::access_error(hidden),
         // FR-108: the client may send the stop again.
-        store @ play_state::ReportError::Store { .. } => error::ErrorServiceUnavailable(store),
+        store
+        @ (play_state::ReportError::Store { .. } | play_state::ReportError::SessionEnd(_)) => {
+            error::ErrorServiceUnavailable(store)
+        }
         other => error::ErrorInternalServerError(other),
     }
 }

@@ -1538,6 +1538,11 @@ async fn await_shutdown_signal() {
     }
 }
 
+/// How long shutdown waits for the drain to let this replica's play
+/// session leases go (B1490).
+#[cfg(unix)]
+const LEASE_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn serve(cfg: Config) -> Result<(), AppError> {
     // SEC — never log the DSN verbatim: it carries the postgres password, and
     // a log line outlives the pod (Loki keeps it, kubectl logs does not).
@@ -2317,6 +2322,8 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // background loops during a rolling-deploy surge; the loops below gate on
     // `is_bg_leader`. Under SQLite this wins immediately.
     pharos_server::state::AppState::spawn_bg_leadership(app_state.clone().into_inner());
+    // B1490: keeps the leases of the play sessions this replica's grants hold.
+    std::sync::Arc::clone(&app_state.play_holds).spawn_renewal();
 
     // LIB-A9 — tiered library change-detection. Each media root picks the best
     // mode it can sustain (native watch on a local fs when the `watch` feature
@@ -2549,7 +2556,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // departing client and leave SyncPlay memberships (+ persisted group
     // snapshots) intact for the next replica to recover.
     #[cfg(unix)]
-    tokio::spawn(async {
+    let play_holds = app_state.play_holds.clone();
+    // Joined before `serve` returns, so the drain's lease releases are not
+    // dropped with the runtime.
+    #[cfg(unix)]
+    let lease_drain = tokio::spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
@@ -2571,6 +2582,8 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         }
         tracing::info!("shutdown signal observed — draining (SyncPlay memberships preserved)");
         pharos_server::state::begin_shutdown();
+        // B1490: the replica taking over may now take this one's streams over.
+        play_holds.drain().await;
     });
 
     let handle_for_app = readiness.clone();
@@ -2699,6 +2712,20 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             written = outcome.written,
             "held playback progress written on shutdown"
         );
+    }
+    // B1490: let the drain's lease releases finish, so the replica taking
+    // over can keep this one's streams at once. Bounded: if the store is
+    // unreachable the leases lapse on their own after 30 s.
+    #[cfg(unix)]
+    if pharos_server::state::is_shutting_down() {
+        match tokio::time::timeout(LEASE_DRAIN_DEADLINE, lease_drain).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(error = %e, "play session lease drain ended abnormally"),
+            Err(_) => tracing::warn!(
+                deadline_secs = LEASE_DRAIN_DEADLINE.as_secs(),
+                "play session leases not all let go before shutdown; they lapse on their own"
+            ),
+        }
     }
     served?;
     // P31 — shutdown reached. If the SSDP responder is alive, send

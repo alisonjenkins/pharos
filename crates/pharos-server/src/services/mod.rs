@@ -14,6 +14,7 @@ pub mod metadata_edit;
 pub mod metadata_text;
 pub mod mix;
 pub mod person;
+pub mod play_holds;
 pub mod play_state;
 pub mod playback;
 pub mod reader_password;
