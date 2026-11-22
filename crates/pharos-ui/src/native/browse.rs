@@ -1163,7 +1163,7 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
             if !fresh {
                 return Ok((place, listing, first));
             }
-            let Some(api) = ctx.api.peek().clone() else {
+            let Some(api) = ctx.peek_library() else {
                 return Err("not signed in".to_owned());
             };
             fetch_more(
@@ -1770,7 +1770,7 @@ fn PagedGrid(
                 let Some((start, limit)) = claimed else {
                     continue;
                 };
-                let Some(api) = ctx.api.peek().clone() else {
+                let Some(api) = ctx.peek_library() else {
                     pager.write().fail(NOT_SIGNED_IN);
                     continue;
                 };
@@ -1867,7 +1867,15 @@ fn PagedGrid(
     let index = use_resource(move || {
         let listing = indexed.clone();
         // A watched mark can change what a watched filter's listing holds.
-        let key = index_key(&listing, revision.map_or(0, |r| (r.0)()), (ctx.marks)());
+        // The device's library and the server's index the same listing
+        // differently; a switch between them fetches the index afresh.
+        let device = ctx.offline.read().is_some();
+        let key = index_key(
+            &listing,
+            revision.map_or(0, |r| (r.0)()),
+            (ctx.marks)(),
+            device,
+        );
         async move {
             if let Some(kept) = kept_index(&key) {
                 return Some(kept);
@@ -2323,11 +2331,13 @@ static INDEXES: std::sync::Mutex<Vec<(String, ListIndex)>> = std::sync::Mutex::n
 static INDEX_ACCOUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// The key a listing's index is kept under: the account, the library
-/// revision and the watched marks it was fetched at, and the listing, so a
-/// change to any fetches it again.
-fn index_key(listing: &Listing, revision: u32, marks: u32) -> String {
+/// revision and the watched marks it was fetched at, which library answered
+/// (the device's or the server's), and the listing, so a change to any
+/// fetches it again.
+fn index_key(listing: &Listing, revision: u32, marks: u32, device: bool) -> String {
     let account = INDEX_ACCOUNT.load(std::sync::atomic::Ordering::Relaxed);
-    format!("{account} {revision} {marks} {listing:?}")
+    let from = if device { "device" } else { "server" };
+    format!("{account} {from} {revision} {marks} {listing:?}")
 }
 
 /// Drops every kept index: the account signed out (B1417).
@@ -2771,7 +2781,7 @@ pub fn EpisodeList(
         let source = source.clone();
         move |start: u32, limit: u32| {
             let (ctx, source) = (ctx?, source.clone()?);
-            let api = ctx.api.peek().clone()?;
+            let api = ctx.peek_library()?;
             Some(async move {
                 let result = fetch_more(
                     &api,
@@ -3435,7 +3445,7 @@ fn MusicAlbums(library: ItemRef, first: Page, order: Signal<Narrow>) -> Element 
             if !fresh {
                 return Ok((listing, first));
             }
-            let Some(api) = ctx.api.peek().clone() else {
+            let Some(api) = ctx.peek_library() else {
                 return Err("not signed in".to_owned());
             };
             fetch_more(
@@ -5154,17 +5164,29 @@ mod tests {
         assert_eq!(reuse_newest(&mut kept, "gone"), None);
 
         let listing = Listing::of(ItemRef::Real(7), None, "SortName");
-        assert_ne!(index_key(&listing, 1, 0), index_key(&listing, 2, 0));
-        assert_ne!(index_key(&listing, 1, 0), index_key(&listing, 1, 1));
-        let key = index_key(&listing, 1, 0);
+        assert_ne!(
+            index_key(&listing, 1, 0, false),
+            index_key(&listing, 2, 0, false)
+        );
+        assert_ne!(
+            index_key(&listing, 1, 0, false),
+            index_key(&listing, 1, 1, false)
+        );
+        // The device's index is never the server's.
+        assert_ne!(
+            index_key(&listing, 1, 0, false),
+            index_key(&listing, 1, 0, true)
+        );
+        let key = index_key(&listing, 1, 0, false);
         keep_index(key.clone(), ListIndex::default());
         assert_eq!(kept_index(&key), Some(ListIndex::default()));
-        assert_eq!(kept_index(&index_key(&listing, 2, 0)), None);
+        assert_eq!(kept_index(&index_key(&listing, 2, 0, false)), None);
+        assert_eq!(kept_index(&index_key(&listing, 1, 0, true)), None);
         // Signing out drops them, and one fetched before it is never found.
         forget_indexes();
         assert_eq!(kept_index(&key), None);
         keep_index(key.clone(), ListIndex::default());
-        assert_eq!(kept_index(&index_key(&listing, 1, 0)), None);
+        assert_eq!(kept_index(&index_key(&listing, 1, 0, false)), None);
     }
 
     #[test]
