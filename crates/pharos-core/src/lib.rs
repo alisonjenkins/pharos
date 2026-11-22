@@ -7,6 +7,7 @@ pub mod copy_plan;
 pub mod ensemble;
 pub mod fuzzy;
 pub mod language;
+pub mod lyrics_text;
 pub mod metadata_edit;
 pub mod origin;
 pub mod parental_rank;

@@ -100,8 +100,7 @@ sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 simd-adler32 = { version = "0.3" }
 simdutf8 = { version = "0.1", features = ["aarch64_neon"] }
-skrifa-53698392db9f8492 = { package = "skrifa", version = "0.50" }
-skrifa-8ed344a00b7dfd1e = { package = "skrifa", version = "0.49" }
+skrifa = { version = "0.49" }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde", "union"] }
 socket2 = { version = "0.6", default-features = false, features = ["all"] }

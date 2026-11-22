@@ -341,6 +341,7 @@ pub(super) mod tests {
                 .collect(),
             offset_ms,
             scores: vec![None; lines.len()],
+            mismatch: None,
         }
     }
 
