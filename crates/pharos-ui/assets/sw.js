@@ -17,6 +17,11 @@ const PRECACHE = __PHAROS_PRECACHE__;
 // under /videos/ (no Range) is answered from a `pharos-videos-*` cache by
 // exact URL, query included, when one holds it, else it goes to the network.
 // The page writes those caches; the worker only reads them.
+//
+// And ADR 0149: it serves the posters of what is kept on the device. A
+// same-origin GET of an item's picture is answered from a `pharos-art-*`
+// cache, by its URL without `fillWidth` and `format`, when one holds it,
+// else it goes to the network. The page writes those caches too.
 const SHELL_PREFIX = "pharos-shell-";
 const SHELL_CACHE = SHELL_PREFIX + VERSION;
 
@@ -37,16 +42,58 @@ const VIDEO_PATH = "/videos/";
 let videoCaches = null;
 let videoCachesRead = null;
 
+// Kept posters (ADR 0149), read and kept current like the video caches.
+const ART_PREFIX = "pharos-art-";
+const ART_PATH = /^\/Items\/[^/]+\/Images\//;
+let artCaches = null;
+
 function refreshVideoCaches() {
   videoCachesRead = caches
     .keys()
     .then((names) => {
       videoCaches = names.filter((n) => n.startsWith(VIDEO_PREFIX));
+      artCaches = names.filter((n) => n.startsWith(ART_PREFIX));
     })
     .catch(() => {
       videoCaches = [];
+      artCaches = [];
     });
   return videoCachesRead;
+}
+
+// A poster's URL without the width and format a card asks for, so every
+// card size finds the one stored copy. pharos-ui's `art_key` makes the same.
+function artKey(url) {
+  const at = url.indexOf("?");
+  if (at < 0) return url;
+  const kept = url
+    .slice(at + 1)
+    .split("&")
+    .filter((p) => p !== "" && !p.startsWith("fillWidth=") && !p.startsWith("format="));
+  return kept.length === 0 ? url.slice(0, at) : url.slice(0, at) + "?" + kept.join("&");
+}
+
+function isArtRequest(request, url) {
+  return (
+    request.method === "GET" &&
+    url.origin === self.location.origin &&
+    ART_PATH.test(url.pathname)
+  );
+}
+
+async function keptArt(request) {
+  try {
+    if (artCaches === null) await (videoCachesRead || refreshVideoCaches());
+    const key = artKey(request.url);
+    for (const name of artCaches) {
+      const cache = await caches.open(name);
+      const hit = await cache.match(key, { ignoreVary: true });
+      if (hit) return hit;
+    }
+  } catch (err) {
+    // A cache that cannot be read is no reason to fail a picture.
+  }
+  return fetch(request);
 }
 
 const precached = new Set(PRECACHE);
@@ -98,6 +145,8 @@ self.addEventListener("fetch", (event) => {
   if (key === null) {
     if (isVideoRequest(event.request, url) && !(videoCaches && videoCaches.length === 0)) {
       event.respondWith(downloadedVideo(event.request));
+    } else if (isArtRequest(event.request, url) && !(artCaches && artCaches.length === 0)) {
+      event.respondWith(keptArt(event.request));
     }
     return;
   }
@@ -161,7 +210,11 @@ self.addEventListener("message", (event) => {
   if (data && data.kind === "pharos-sw" && data.event === "hello" && event.source) {
     event.source.postMessage({ kind: "pharos-sw", event: "version", version: VERSION });
   }
-  if (data && data.kind === "pharos-sw" && data.event === "videos-changed") {
+  if (
+    data &&
+    data.kind === "pharos-sw" &&
+    (data.event === "videos-changed" || data.event === "art-changed")
+  ) {
     event.waitUntil(refreshVideoCaches());
   }
 });

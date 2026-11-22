@@ -54,6 +54,8 @@ pub mod manage;
 pub mod mixes;
 pub mod music_bridge;
 pub mod my_devices;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod offline_art_web;
 pub mod offline_device;
 pub mod offline_library;
 pub mod offline_names;
