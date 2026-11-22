@@ -259,7 +259,7 @@ pub fn ManageScreen() -> Element {
     // `None` while the lookup runs, `Some(None)` when it failed. The pages
     // wait for it: without the admin's own id their card would offer Delete
     // and the admin switch (V881).
-    let me = account.0.read().clone();
+    let me = account.answer();
     let me_id = me.clone().flatten().map(|me| me.id).unwrap_or_default();
     let current = *state.read();
     match current {
@@ -298,7 +298,7 @@ pub fn ManageScreen() -> Element {
                     class: "pharos-button",
                     r#type: "button",
                     onclick: move |_| {
-                        let mut me = account.0;
+                        let mut me = account;
                         me.restart();
                     },
                     "Try again"
