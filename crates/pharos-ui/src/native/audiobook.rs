@@ -332,7 +332,7 @@ pub fn AudiobookControls(
         let (Some(album), true) = (album, folder) else {
             return;
         };
-        let Some(api) = ctx.and_then(|c| c.api.peek().clone()) else {
+        let Some(api) = ctx.and_then(|c| c.peek_library()) else {
             return;
         };
         spawn(async move {

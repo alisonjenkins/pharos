@@ -141,6 +141,46 @@ body {
   margin: 0;
 }
 
+/* Spec 049: the screens show what is on this device. A slim pill, not an
+   error: the app works, with less in it. No color-mix() or :has(), which the
+   TV WebView lacks. */
+.pharos-offline-note {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  margin: 0.75rem 1.5rem 0;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--px-color-warning);
+  border-radius: 999px;
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
+  font-size: 0.875rem;
+  max-width: calc(100% - 3rem);
+}
+.pharos-offline-note--back {
+  border-color: var(--px-color-success);
+}
+.pharos-offline-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--px-color-warning);
+  flex: none;
+}
+.pharos-offline-note--back .pharos-offline-dot {
+  background: var(--px-color-success);
+}
+.pharos-offline-note-more {
+  color: var(--px-color-fg-muted);
+}
+@media (max-width: 600px) {
+  .pharos-offline-note {
+    margin: 0.5rem 1rem 0;
+    max-width: calc(100% - 2rem);
+  }
+}
+
 .pharos-library {
   padding: 1rem 1.5rem;
 }
