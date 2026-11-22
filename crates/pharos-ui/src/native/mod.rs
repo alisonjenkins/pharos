@@ -24,6 +24,7 @@ pub mod find;
 pub mod grid_window;
 pub mod group_app;
 // 014: the network Together client, shared by the browser and the TV app.
+pub mod download_queue;
 #[cfg(any(
     all(feature = "web", target_arch = "wasm32"),
     all(feature = "mobile", target_os = "android")
