@@ -171,7 +171,20 @@ impl SignedOut {
 /// reports: an unlink that failed is kept apart from an unlink whose
 /// folder sync failed.
 pub fn sign_out(path: &Path) -> SignedOut {
-    match end_session(path, None, None) {
+    signed_out(end_session(path, None, None))
+}
+
+/// The sign-out the phone runs: every token fenced and the one on file
+/// ended in one hold of the file's lock
+/// (`pharos_content::token::sign_out_fenced`).
+fn sign_out_fenced(path: &Path) -> SignedOut {
+    watch_stores();
+    signed_out(pharos_content::token::sign_out_fenced(path))
+}
+
+/// What a session end that was a sign-out is, as the app reports it.
+fn signed_out(ended: Ended) -> SignedOut {
+    match ended {
         Ended::Forgotten(Forgotten::Durable) | Ended::Changed => SignedOut::Saved,
         Ended::Forgotten(Forgotten::NotDurable(why)) => {
             log::warn!("pharos: token forget verdict=signed_out_not_durable reason={why}");
@@ -206,30 +219,41 @@ pub enum ServiceNotice {
 /// The phone's sign-out (`android::forget_token`), with its platform parts
 /// passed in: `path_lookup` finds the token file, `clear` drops what the
 /// caller cached (with the path, when there is one), and `notifier` tells
-/// the media service. Every exit publishes a fence first, so no early
-/// return can skip it: every token at the file's path, or at every path
-/// when the path cannot be found. The sign-out itself never narrows that
-/// fence: when the token can be neither removed nor marked, `end_session`
-/// unions a fence naming it into this one, and the union of `Every` with
-/// anything is still `Every`. Only a later confirmed store changes it
-/// (`after_store` lifts the stored token's name). A `NotSaved`, the failed
-/// lookup included, asks the service to stay signed out.
+/// the media service.
+///
+/// Lock order: the token file's lock is held only inside [`sign_out_fenced`] (the
+/// content layer's one operation: every token fenced, then the token on
+/// file removed or revoked), and nothing is called while it is held. `clear`
+/// and `notifier` run after it, so neither can sit behind, nor be run under,
+/// the file's lock, and no other lock is taken inside it. The fence is
+/// published before `clear` runs on every exit: every token at the file's
+/// path, or at every path when the path cannot be found. The sign-out
+/// itself never narrows that fence: when the token can be neither removed
+/// nor marked, the operation unions a fence naming it into this one, and
+/// the union of `Every` with anything is still `Every`. Only a later
+/// confirmed store changes it (`after_store` lifts the stored token's
+/// name). A `NotSaved`, the failed lookup included, asks the service to
+/// stay signed out.
 pub fn forget_token_with(
     path_lookup: impl FnOnce() -> Result<PathBuf, String>,
     clear: impl FnOnce(Option<&Path>),
     notifier: impl FnOnce(ServiceNotice),
 ) -> SignedOut {
     let path = path_lookup();
-    match &path {
-        Ok(path) => add_fence(path, &SignOutFence::Every, "sign_out_started"),
-        Err(_) => fence_every_file("token_path_unknown"),
-    }
+    // The fence, the removal or revocation and the choice of what they
+    // apply to are one operation under the token file's lock
+    // ([`sign_out`]); the caller's cache clear and the service's notice run
+    // after it has released the lock, so a store that lands meanwhile (a
+    // Quick Connect sign-in) is neither held up by them nor signed out by
+    // them. A path that cannot be found fences every file at once.
     let verdict = match path {
         Ok(path) => {
+            let verdict = sign_out_fenced(&path);
             clear(Some(&path));
-            sign_out(&path)
+            verdict
         }
         Err(e) => {
+            fence_every_file("token_path_unknown");
             clear(None);
             log::warn!(
                 "pharos: token forget verdict=not_removed reason=token_path_unknown error={e}"
@@ -413,6 +437,38 @@ mod sign_out_tests {
             run_token(&path, "u1").is_err(),
             "the signed-out token B was sent"
         );
+    }
+
+    /// A Quick Connect sign-in that stores a token while the sign-out's cache
+    /// clear runs lands after the sign-out's one locked operation, so it is
+    /// kept: the sign-out ended the token it found, not the one stored
+    /// after it.
+    #[test]
+    fn a_store_during_the_clear_after_a_sign_out_is_kept() {
+        let d = super::super::test_dir::TmpDir::new("forget-then-store");
+        let path = d.path().join("device-token");
+        store(&path, "tokA").unwrap();
+        pair(&path, Some("tokA"), "u1").unwrap();
+        let p2 = path.clone();
+        let out = forget_token_with(
+            || Ok(path.clone()),
+            move |_| {
+                assert!(
+                    read(&p2).unwrap().is_none(),
+                    "the cache clear ran before the token was removed"
+                );
+                pharos_content::token::store(&p2, "tokB").unwrap();
+            },
+            |_| {},
+        );
+        assert_eq!(out, SignedOut::Saved);
+        assert_eq!(
+            read(&path).unwrap().map(|s| s.token).as_deref(),
+            Some("tokB"),
+            "the sign-out removed the token a sign-in stored after it"
+        );
+        assert!(fence(&path).refuses("tokA"));
+        assert!(!fence(&path).refuses("tokB"));
     }
 
     /// CR 4639608778, 4639798750: a sign-out whose token path cannot be
