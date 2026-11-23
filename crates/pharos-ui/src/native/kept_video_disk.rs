@@ -35,9 +35,9 @@ use tokio::io::AsyncWriteExt as _;
 use super::download_queue::{halt_for_status, Halt};
 use super::kept_video::{
     check_not_kept, content_type_for, find, fits, insert_front, interrupted, is_retryable,
-    localize_playlist, missing_files, new_record, progress_due, renewal, renewed_record,
-    request_key, retry_delay_secs, take, url_path, KeepVideoRefusal, KeepVideoRequest, KeptState,
-    KeptVideo, Localized, StoredFile, VideoStore,
+    is_server_failure, localize_playlist, missing_files, new_record, progress_due, renewal,
+    renewed_record, request_key, retry_delay_secs, take, url_path, KeepVideoRefusal,
+    KeepVideoRequest, KeptState, KeptVideo, Localized, StoredFile, VideoStore,
 };
 use super::platform;
 
@@ -203,6 +203,11 @@ enum Stop {
     /// `Failed` is, files kept, and the record carries the halt so the
     /// queue tries again by itself.
     Halted(Halt, String),
+    /// The server answered a fetch with its own failure (5xx) and the
+    /// retries are used up: a halt like `Halted(Unreachable, _)` for the
+    /// queue, but the only answer that lets a last segment's sliver go
+    /// (B1476, B1484).
+    ServerFailed(String),
 }
 
 /// A user's request key to the whole files on disk that answer it, one per
@@ -2404,9 +2409,13 @@ async fn fetch_file(
             (true, Some(secs)) => (inner.env.sleep)(secs).await,
             _ => {
                 let reason = format!("{} answered {failure}", url_path(key));
-                return Err(match halt_for_status(failure.status) {
-                    Some(halt) => Stop::Halted(halt, reason),
-                    None => Stop::Failed(reason),
+                return Err(if is_server_failure(failure.status) {
+                    Stop::ServerFailed(reason)
+                } else {
+                    match halt_for_status(failure.status) {
+                        Some(halt) => Stop::Halted(halt, reason),
+                        None => Stop::Failed(reason),
+                    }
                 });
             }
         }
@@ -3712,10 +3721,10 @@ async fn fetch_planned(
     match fetch_file(inner, user, item, run, &key, None).await {
         Ok(len) => Ok((key, Some(len))),
         // B1476: the sliver of a last segment can fail to encode; the
-        // copy plays without it, ending a frame early.
-        Err(Stop::Failed(reason) | Stop::Halted(Halt::Unreachable, reason))
-            if short_tails.contains(&key) =>
-        {
+        // copy plays without it, ending a frame early. Only the server's own
+        // failure says so: a lost network, a 404 or an ended session keeps
+        // the tail owed, and the run halts for the queue to try again.
+        Err(Stop::ServerFailed(reason)) if short_tails.contains(&key) => {
             emit(
                 true,
                 format!(
@@ -4277,6 +4286,7 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
     // record carries why, for the queue.
     let (outcome, halt) = match outcome {
         Err(Stop::Halted(halt, reason)) => (Err(Stop::Failed(reason)), Some(halt)),
+        Err(Stop::ServerFailed(reason)) => (Err(Stop::Failed(reason)), Some(Halt::Unreachable)),
         other => (other, None),
     };
     {
@@ -4436,7 +4446,12 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 format!("pharos: video keep parked item={item} run={run} reason={why} ms={ms}"),
             );
         }
-        Err(Stop::Refused(reason) | Stop::Failed(reason) | Stop::Halted(_, reason)) => {
+        Err(
+            Stop::Refused(reason)
+            | Stop::Failed(reason)
+            | Stop::Halted(_, reason)
+            | Stop::ServerFailed(reason),
+        ) => {
             // The fetches cancelled with the failure leave their staging
             // files, which the figure below does not count: they go first,
             // and one that will not leaves the folder unknown before the
@@ -14681,12 +14696,11 @@ pub(crate) mod tests {
         assert_eq!(only(&rig.open()).position_ms, 61_000);
     }
 
-    /// A short tail whose write fails is skipped, but its staging file
-    /// can stay. It goes before the Ready figure (which counts no staging
-    /// file) is published, and one that will not go leaves the folder
-    /// unknown first; the tail is still skipped and the download Ready.
+    /// A short tail whose local write fails is not the server's failure, so
+    /// it is not skipped: the download fails (its staging file left for the
+    /// retry is counted, or the folder is unknown), never Ready without it.
     #[tokio::test]
-    async fn a_skipped_tail_that_failed_mid_write_is_cleaned_before_ready() {
+    async fn a_short_tail_that_failed_to_write_fails_the_download() {
         for stuck in [false, true] {
             let rig = Rig::new(if stuck {
                 "tail-part-stuck"
@@ -14702,31 +14716,27 @@ pub(crate) mod tests {
             FAIL_FLUSH_OF.with(|f| *f.borrow_mut() = Some(file_name(SEG1)));
             FAIL_PART_DELETE.with(|f| f.set(stuck));
             let store = rig.open();
-            let files = rig.dir.join("u1").join("1").join("files");
-            let seen: std::rc::Rc<RefCell<Option<(bool, u64, u64)>>> = std::rc::Rc::default();
-            let (s2, seen2, files2) = (store.clone(), seen.clone(), files.clone());
-            DURING_SAVE.with(|d| {
-                *d.borrow_mut() = Some(Box::new(move |v: &KeptVideo| {
-                    if v.ready() {
-                        let unknown = lock(&s2.inner.state).unknown_folder().is_some();
-                        *seen2.borrow_mut() = Some((unknown, v.estimated_bytes, on_disk(&files2)));
-                    }
-                }));
-            });
             store.start(request("1")).unwrap();
             store.settled().await;
-            DURING_SAVE.with(|d| *d.borrow_mut() = None);
             FAIL_FLUSH_OF.with(|f| *f.borrow_mut() = None);
             FAIL_PART_DELETE.with(|f| f.set(false));
-            assert_eq!(only(&store).state, KeptState::Ready, "stuck={stuck}");
-            let (unknown, figure, on_disk) = (*seen.borrow()).expect("no Ready record was saved");
+            let v = only(&store);
             assert!(
-                unknown || figure >= on_disk,
-                "stuck={stuck}: Ready published at {figure} with {on_disk} on disk"
+                matches!(v.state, KeptState::Failed { .. }),
+                "stuck={stuck}: {v:?}"
             );
-            if stuck {
-                assert!(unknown, "the stuck staging file was uncounted at Ready");
-            }
+            assert!(
+                lines("pharos: video keep skipped short tail").is_empty(),
+                "stuck={stuck}: a local write failure excused the tail"
+            );
+            let files = rig.dir.join("u1").join("1").join("files");
+            let unknown = lock(&store.inner.state).unknown_folder().is_some();
+            assert!(
+                unknown || v.estimated_bytes >= on_disk(&files),
+                "stuck={stuck}: failed at {} with {} on disk",
+                v.estimated_bytes,
+                on_disk(&files)
+            );
         }
     }
 
@@ -14899,6 +14909,33 @@ pub(crate) mod tests {
         store.settled().await;
         assert_eq!(only(&store).state, KeptState::Ready);
         assert!(rig.server.asked().is_empty(), "{:?}", rig.server.asked());
+    }
+
+    /// A short last segment goes only when the server itself failed it
+    /// (5xx). A lost network or a missing file (404) keeps it owed: the run
+    /// halts for the queue to try again, never Ready with a segment absent.
+    #[tokio::test]
+    async fn the_short_last_segment_is_owed_unless_the_server_failed_it() {
+        for (name, answers) in [("tail-404", [404u16; 8]), ("tail-net", [0u16; 8])] {
+            let rig = Rig::new(name);
+            let media = MEDIA.replace("#EXTINF:6.0,\n1.m4s", "#EXTINF:0.042,\n1.m4s");
+            rig.server
+                .files
+                .lock()
+                .unwrap()
+                .insert(MEDIA_KEY.into(), media.into_bytes());
+            rig.server.fail(SEG1, &answers);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            let v = only(&store);
+            assert!(matches!(v.state, KeptState::Failed { .. }), "{name}: {v:?}");
+            assert_eq!(v.halt, Some(Halt::Unreachable), "{name}");
+            assert!(
+                lines("pharos: video keep skipped short tail").is_empty(),
+                "{name}: the tail went on a failure that is not the server's"
+            );
+        }
     }
 
     /// Only a Ready download is served: while one runs, the files it has
