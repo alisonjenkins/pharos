@@ -326,6 +326,24 @@ pub fn next_action(
     Action::Idle
 }
 
+/// Whether a download may begin negotiating now: no other negotiation is
+/// running (`starting`) and none of the user's downloads is running. The
+/// queue's tick holds to both; a viewer's Retry must too, or it would start
+/// beside them. Err names the closed gate for the log, and the item stays
+/// due for the tick to start once both are open.
+pub fn start_gate(starting: bool, records: &[KeptVideo], user: &str) -> Result<(), &'static str> {
+    if starting {
+        return Err("another_start_in_progress");
+    }
+    if records
+        .iter()
+        .any(|r| r.user == user && matches!(r.state, KeptState::Downloading { .. }))
+    {
+        return Err("another_download_running");
+    }
+    Ok(())
+}
+
 /// Whether `entry` fits beside everything kept and queued: the downloads
 /// cap and the free-space floor hold for what is promised, not only what is
 /// on disk. `used` is what the store counts (its own records included).
@@ -767,6 +785,20 @@ mod tests {
         let cap = one * 2 + one / 2;
         assert!(admit(&q, &[], &third, 0, cap, u64::MAX).is_err());
         assert!(admit(&Queue::default(), &[], &third, 0, cap, u64::MAX).is_ok());
+    }
+
+    /// CR review 6018104500 (download_driver.rs:195-197): a start
+    /// waits for the gates the tick keeps.
+    #[test]
+    fn a_start_keeps_the_ticks_gates() {
+        let records = [record("1", downloading(), None)];
+        assert_eq!(start_gate(true, &[], "u"), Err("another_start_in_progress"));
+        assert_eq!(
+            start_gate(false, &records, "u"),
+            Err("another_download_running")
+        );
+        assert_eq!(start_gate(false, &records, "other"), Ok(()));
+        assert_eq!(start_gate(false, &[], "u"), Ok(()));
     }
 
     /// CR review 6018104500 (download_queue.rs:344): a download already
