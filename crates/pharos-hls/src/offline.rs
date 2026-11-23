@@ -223,11 +223,33 @@ pub fn same_playlist(
     }
 }
 
-/// `line` with each `PlaySessionId=<live>` parameter put back to `kept`.
+/// `line` with the session put back to `kept` where the line names a URI:
+/// a URI line (anything that is not a `#` tag or comment) whole, and the
+/// `URI="…"` attributes of a tag line. An `#EXTINF` title, a comment or any
+/// other tag text is left as it is, even if it contains the session.
+fn restore_session(line: &str, live: &str, kept: &str) -> String {
+    if !line.starts_with('#') {
+        return restore_in(line, live, kept);
+    }
+    let lower = line.to_ascii_lowercase();
+    let mut out = String::with_capacity(line.len());
+    let mut at = 0;
+    while let Some(found) = lower[at..].find("uri=\"") {
+        let start = at + found + "uri=\"".len();
+        let end = line[start..].find('"').map_or(line.len(), |n| start + n);
+        out.push_str(&line[at..start]);
+        out.push_str(&restore_in(&line[start..end], live, kept));
+        at = end;
+    }
+    out.push_str(&line[at..]);
+    out
+}
+
+/// `text` with each `PlaySessionId=<live>` parameter put back to `kept`.
 /// Only that parameter's value moves: a path, another parameter or any
 /// other text that happens to contain `live` is left as it is, so a changed
 /// path still shows up as a difference.
-fn restore_session(line: &str, live: &str, kept: &str) -> String {
+fn restore_in(line: &str, live: &str, kept: &str) -> String {
     if live.is_empty() {
         return line.to_owned();
     }
@@ -310,6 +332,20 @@ mod tests {
     const MEDIA: &str = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n\
         #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"init.mp4?PlaySessionId=p\"\n\
         #EXTINF:6.0,\n0.m4s?PlaySessionId=p\n#EXTINF:4.5,\n1.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n";
+
+    /// CR 4666431560: the session rewrite touches URI lines and `URI="…"`
+    /// attributes only; a title or comment that names the session is text.
+    #[test]
+    fn the_session_is_restored_in_uris_only() {
+        let renewed = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4?PlaySessionId=new\"\n\
+            #EXTINF:6.0,a?PlaySessionId=new\n0.m4s?PlaySessionId=new\n";
+        let stored = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4?PlaySessionId=old\"\n\
+            #EXTINF:6.0,a?PlaySessionId=new\n0.m4s?PlaySessionId=old\n";
+        assert_eq!(same_playlist(stored, renewed, "old", "new"), Ok(()));
+        // A title that differs only by the session is a different title.
+        let other = stored.replace("a?PlaySessionId=new", "a?PlaySessionId=old");
+        assert!(same_playlist(&other, renewed, "old", "new").is_err());
+    }
 
     #[test]
     fn a_master_names_its_variant_and_audio_playlists_with_their_queries() {
