@@ -2546,13 +2546,16 @@ fn live_key(inner: &Inner, user: &str, item: &str, key: &str) -> String {
 /// The whole body of `key` fetched under the live session, not stored, at
 /// most `limit` bytes: a renewal's comparison. One try; a failure is a
 /// halt when a later try can mend it.
+///
+/// With the key it was answered from after a redirect, when that is not
+/// the one asked for (a playlist's relative references resolve against it).
 async fn fetch_compare(
     inner: &Inner,
     user: &str,
     item: &str,
     key: &str,
     limit: u64,
-) -> Result<Vec<u8>, Stop> {
+) -> Result<(Vec<u8>, Option<String>), Stop> {
     let url = live_key(inner, user, item, key);
     let failed = |e: FetchError| {
         let reason = format!("{} answered {e}", url_path(key));
@@ -2582,7 +2585,7 @@ async fn fetch_compare(
             break;
         }
     }
-    Ok(bytes)
+    Ok((bytes, body.final_key().filter(|f| f != key)))
 }
 
 /// Checks the renewed session hands out the stored stream (ADR 0148): every
@@ -2656,7 +2659,7 @@ async fn verify_renewal(
         // One byte past the limit tells a playlist that ends at it from one
         // that goes on: the second is not the stored stream, whatever its
         // first PLAYLIST_MAX_BYTES say.
-        let renewed =
+        let (renewed, final_key) =
             fetch_compare(inner, user, item, key, PLAYLIST_MAX_BYTES.saturating_add(1)).await?;
         if renewed.len() as u64 > PLAYLIST_MAX_BYTES {
             return Err(changed(format!(
@@ -2669,7 +2672,15 @@ async fn verify_renewal(
         // is put the same way before it is compared.
         let server = inner.env.fetcher.server_base();
         let cap = usize::try_from(PLAYLIST_MAX_BYTES).unwrap_or(usize::MAX);
-        let renewed = match localize_playlist(&renewed, key, false, &server, cap) {
+        // As the first fetch localized it: against the key a redirect
+        // answered from, else the one asked for.
+        let renewed = match localize_playlist(
+            &renewed,
+            final_key.as_deref().unwrap_or(key),
+            final_key.is_some(),
+            &server,
+            cap,
+        ) {
             Localized::Unchanged => renewed.into_owned(),
             Localized::Rewritten(t) => t,
             Localized::TooLarge | Localized::NotLocal(_) => {
@@ -2690,7 +2701,7 @@ async fn verify_renewal(
         };
         // One byte past the stored length is enough to tell them apart.
         let limit = (stored.len() as u64).saturating_add(1);
-        let renewed = fetch_compare(inner, user, item, key, limit).await?;
+        let (renewed, _) = fetch_compare(inner, user, item, key, limit).await?;
         if renewed != stored {
             return Err(changed(format!(
                 "url_path={} init_bytes kept={} renewed={}",
@@ -9039,6 +9050,62 @@ pub(crate) mod tests {
             "{changed:?}"
         );
     }
+    /// CR review 6018104500 (kept_video_disk.rs:2662): a renewed master the
+    /// server moves into another folder is localized against the key it was
+    /// answered from, as the first fetch did, so the same stream is not
+    /// reported as changed.
+    #[tokio::test]
+    async fn a_renewed_playlist_that_is_redirected_is_localized_like_the_first_fetch() {
+        let rig = Rig::new("renew-redirected");
+        let moved = "/videos/1/hls/master.m3u8?PlaySessionId=p";
+        let seg1 = "/videos/1/hls/1.m4s?PlaySessionId=p";
+        {
+            let mut f = rig.server.files.lock().unwrap();
+            f.clear();
+            f.insert(
+                moved.into(),
+                b"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS=\"avc1.64001f\"\nmain.m3u8?PlaySessionId=p\n".to_vec(),
+            );
+            f.insert(
+                "/videos/1/hls/main.m3u8?PlaySessionId=p".into(),
+                MEDIA.as_bytes().to_vec(),
+            );
+            f.insert("/videos/1/hls/init.mp4?PlaySessionId=p".into(), vec![1; 10]);
+            f.insert("/videos/1/hls/0.m4s?PlaySessionId=p".into(), vec![2; 100]);
+            f.insert(seg1.into(), vec![3; 100]);
+        }
+        rig.server
+            .redirects
+            .lock()
+            .unwrap()
+            .insert(MASTER_KEY.into(), moved.into());
+        let gate = rig.server.slow_first_open(seg1);
+        rig.server.fail(seg1, &[401]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        wait_indexed(&store, "/videos/1/hls/init.mp4?PlaySessionId=p").await;
+        gate.store(true, Ordering::SeqCst);
+        store.settled().await;
+        assert_eq!(only(&store).halt, Some(Halt::SessionEnded));
+        let renamed = renew_server(&rig, "q");
+        {
+            let mut r = rig.server.redirects.lock().unwrap();
+            r.clear();
+            r.insert(renamed(MASTER_KEY), renamed(moved));
+        }
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.state, KeptState::Ready, "{v:?}");
+        let changed: Vec<String> = lines("pharos: video keep renewed")
+            .into_iter()
+            .filter(|l| l.contains("verdict=stream_changed"))
+            .collect();
+        assert!(changed.is_empty(), "{changed:?}");
+    }
+
     /// A retry under another stream (another bitrate) starts afresh and
     /// removes the files of the plan it replaces.
     #[tokio::test]
