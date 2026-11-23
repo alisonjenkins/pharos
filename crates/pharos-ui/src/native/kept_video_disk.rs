@@ -4486,6 +4486,9 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
                 // A failed attempt's files stay for a retry; the record
                 // holds what is really on disk, not what was planned.
                 v.estimated_bytes = figure(v, bytes);
+                // What the transfer had written, apart from the figure the
+                // Failed record reports as its bytes (the reservation).
+                v.transferred = bytes;
                 v.state = KeptState::Failed {
                     reason: reason.clone(),
                 };
@@ -5751,6 +5754,7 @@ impl VideoStore for DiskVideoStore {
             }
             let held = v.bytes();
             v.estimated_bytes = v.estimated_bytes.max(held);
+            v.transferred = held;
             v.state = KeptState::Failed {
                 reason: "paused".to_owned(),
             };
@@ -9312,6 +9316,10 @@ pub(crate) mod tests {
         let v = only(&store);
         assert_eq!(v.halt, Some(Halt::Paused), "{v:?}");
         assert!(matches!(v.state, KeptState::Failed { .. }));
+        // What the transfer wrote is kept apart from the reservation the
+        // Failed record reports as its bytes, for the paused row.
+        assert!(v.transferred > 0, "{v:?}");
+        assert!(v.transferred <= v.estimated_bytes, "{v:?}");
         assert!(store.indexed_file("u1", INIT).is_some());
         assert!(store.pause("u1", "1").is_err(), "not downloading now");
         store.start(request("1")).unwrap();

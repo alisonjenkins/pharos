@@ -462,7 +462,7 @@ pub fn rows(
         }
         let progress = record.map_or((0, 0), |r| match r.state {
             KeptState::Downloading { done, total, bytes } => (percent(done, total), bytes),
-            _ => (0, r.bytes()),
+            _ => (0, r.held()),
         });
         let t = tries.get(&e.item).copied().unwrap_or_default();
         let in_secs = t.next_at_ms.saturating_sub(now_ms).div_ceil(1000);
@@ -527,7 +527,7 @@ fn stored_percent(r: &KeptVideo) -> u32 {
     if r.estimated_bytes == 0 {
         return 0;
     }
-    let p = r.bytes().saturating_mul(100) / r.estimated_bytes;
+    let p = r.held().saturating_mul(100) / r.estimated_bytes;
     u32::try_from(p.min(100)).unwrap_or(100)
 }
 
@@ -586,6 +586,7 @@ mod tests {
             saved_at: String::new(),
             estimate_from_adoption: false,
             stale_on_disk: 0,
+            transferred: 0,
             halt,
         }
     }
@@ -606,6 +607,48 @@ mod tests {
             total: 4,
             bytes: 10,
         }
+    }
+
+    /// A paused or halted row shows what the transfer had written, not the
+    /// estimate a Failed record reports as its bytes; a record from before
+    /// that was kept shows the estimate, as it did.
+    #[test]
+    fn a_stopped_row_shows_what_was_transferred_not_the_reservation() {
+        let q = queue(&["1"]);
+        let mut paused = record(
+            "1",
+            KeptState::Failed {
+                reason: "paused".into(),
+            },
+            Some(Halt::Paused),
+        );
+        let mut q2 = q.clone();
+        q2.entries[0].paused = true;
+        let row = |records: &[KeptVideo], q: &Queue| {
+            rows(q, records, &HashMap::new(), "u", 0).remove(0).state
+        };
+        paused.transferred = 250;
+        assert_eq!(
+            row(&[paused.clone()], &q2),
+            RowState::Paused {
+                percent: 25,
+                bytes: 250
+            }
+        );
+        paused.transferred = 0;
+        assert_eq!(
+            row(&[paused], &q2),
+            RowState::Paused {
+                percent: 100,
+                bytes: 1_000
+            },
+            "an older record changed"
+        );
+        let old: KeptVideo = serde_json::from_str(
+            r#"{"item":"1","user":"u","master_url":"/m","files":[],"state":{"state":"ready"}}"#,
+        )
+        .unwrap();
+        assert_eq!(old.transferred, 0);
     }
 
     #[test]
