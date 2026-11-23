@@ -65,6 +65,23 @@ fn save(queue: &Queue) {
     *QUEUE_CHANGED.write() += 1;
 }
 
+/// Whether `rendered`, the user a row or control was drawn for, is still the
+/// authorized offline owner ([`offline_video::last_user`], read now): an
+/// action of a stale screen (another account signed in, or a sign-out, since
+/// it was drawn) must not touch someone else's queue. Logged when it is not,
+/// as the Remove path does, with presence flags only.
+pub(super) fn owner_unchanged(action: &str, item: &str, rendered: &str) -> bool {
+    let now = offline_video::last_user();
+    let same = now.as_deref() == Some(rendered);
+    if !same {
+        platform::info(&format!(
+            "pharos: video queue {action} verdict=skipped reason=owner_changed item={item} owner_set={}",
+            now.is_some()
+        ));
+    }
+    same
+}
+
 /// The driver's tries, for the page's rows.
 pub fn tries() -> HashMap<String, Tries> {
     TRIES.with(|t| t.borrow().clone())
@@ -87,10 +104,21 @@ pub(super) async fn enqueue(
     version: &str,
     quality_bps: u64,
     store: &dyn VideoStore,
+    rendered: Option<&str>,
 ) -> Result<(), String> {
     let Some(user) = offline_video::last_user() else {
         return Err("Sign in to download this video.".into());
     };
+    // The page the click came from was drawn for `rendered`: another
+    // account signing in since means the click is not theirs.
+    if rendered != Some(user.as_str()) {
+        platform::info(&format!(
+            "pharos: video queue add verdict=skipped reason=owner_changed item={} rendered_for_set={} stage=click",
+            detail.item.id,
+            rendered.is_some()
+        ));
+        return Err("The signed-in account changed. Open this title again to download it.".into());
+    }
     // The chosen file's tracks are its own.
     let own;
     let detail = if version.is_empty() {
@@ -123,6 +151,15 @@ pub(super) async fn enqueue(
         paused: false,
         failed: None,
     };
+    // The detail call above awaited: the owner is read again right before
+    // anything is written, on the versioned path and the unversioned one.
+    if offline_video::last_user().as_deref() != Some(user.as_str()) {
+        platform::info(&format!(
+            "pharos: video queue add verdict=skipped reason=owner_changed item={} stage=before_save",
+            item.id
+        ));
+        return Err("The signed-in account changed. Open this title again to download it.".into());
+    }
     let mut queue = load();
     let records = store.videos(&user);
     admit(
@@ -155,6 +192,9 @@ pub(super) async fn enqueue(
 /// The viewer's Pause: a running download stops where it is, a queued one
 /// is passed over until Resume.
 pub fn pause(store: &dyn VideoStore, user: &str, item: &str) -> Result<(), String> {
+    if !owner_unchanged("pause", item, user) {
+        return Ok(());
+    }
     let running = store
         .videos(user)
         .iter()
@@ -174,6 +214,9 @@ pub fn pause(store: &dyn VideoStore, user: &str, item: &str) -> Result<(), Strin
 
 /// The viewer's Resume, Retry or Try now: the download is due at once.
 pub fn resume(user: &str, item: &str) {
+    if !owner_unchanged("resume", item, user) {
+        return;
+    }
     let mut queue = load();
     queue.set_paused(user, item, false);
     if let Some(e) = queue
@@ -191,6 +234,9 @@ pub fn resume(user: &str, item: &str) {
 /// The viewer's Retry of a download that failed for good: due at once, and
 /// started even though its record carries no halt.
 pub(super) fn retry(ctx: Ctx, user: &str, item: &str) {
+    if !owner_unchanged("retry", item, user) {
+        return;
+    }
     resume(user, item);
     let (user, item) = (user.to_owned(), item.to_owned());
     spawn_forever(async move {
@@ -202,6 +248,9 @@ pub(super) fn retry(ctx: Ctx, user: &str, item: &str) {
 
 /// Moves a queued download one place.
 pub fn shift(user: &str, item: &str, up: bool) {
+    if !owner_unchanged("shift", item, user) {
+        return;
+    }
     let mut queue = load();
     if queue.shift(user, item, up) {
         save(&queue);
@@ -530,6 +579,35 @@ mod tests {
             subtitles: Vec::new(),
             quality_bps: 0,
         }
+    }
+
+    /// A queue action from a screen drawn for another account is skipped: it
+    /// changes nothing of the current owner's queue, and the owner's own
+    /// goes through. Resume forgets the item's tries when it runs.
+    #[test]
+    fn an_action_from_a_stale_screen_is_skipped() {
+        let mut dom = VirtualDom::new(|| rsx! {});
+        dom.rebuild_in_place();
+        offline_video::remember_user("alice");
+        TRIES.with(|t| {
+            t.borrow_mut().insert("stale".to_owned(), Tries::default());
+        });
+        dom.in_runtime(|| {
+            resume("bob", "stale");
+            pause(&Store::default(), "bob", "stale").unwrap();
+            shift("bob", "stale", true);
+        });
+        assert!(
+            TRIES.with(|t| t.borrow().contains_key("stale")),
+            "another account's Resume reached this queue"
+        );
+        assert!(owner_unchanged("pause", "stale", "alice"));
+        assert!(!owner_unchanged("pause", "stale", "bob"));
+        dom.in_runtime(|| resume("alice", "stale"));
+        assert!(
+            !TRIES.with(|t| t.borrow().contains_key("stale")),
+            "the owner's own Resume was skipped"
+        );
     }
 
     fn tries_of(item: &str) -> Tries {

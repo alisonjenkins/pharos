@@ -469,6 +469,7 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
     .into_iter()
     .find(|v| v.item == item);
     let remove_user = user.clone();
+    let download_owner = user.clone();
     let remove_item = item.clone();
     let remove_store = store.clone();
     let _ = download_driver::QUEUE_CHANGED.read();
@@ -487,10 +488,20 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
             on_download: move |()| {
                 let (detail, version, store) = (detail.clone(), version.clone(), store.clone());
                 let bps = *quality.peek();
+                let rendered = download_owner.clone();
                 busy.set(true);
                 message.set(None);
                 spawn(async move {
-                    match download_driver::enqueue(ctx, &detail, &version, bps, &*store).await {
+                    match download_driver::enqueue(
+                        ctx,
+                        &detail,
+                        &version,
+                        bps,
+                        &*store,
+                        rendered.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(()) => {}
                         Err(line) => {
                             platform::warn(&format!(
