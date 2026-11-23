@@ -729,8 +729,9 @@ fn localize_ref<'a>(
         // Its dot segments resolved first, percent-encoded ones included:
         // `/jf/../media/0.m4s` and `/jf/%2e%2e/media/0.m4s` are both
         // `/media/0.m4s`, outside a `/jf` base, whatever its prefix says.
-        let resolved = normalized(r);
-        let base_path = url_path(server).trim_end_matches('/');
+        let resolved = parsed_form(&normalized(r));
+        let base = parsed_form(url_path(server));
+        let base_path = base.trim_end_matches('/');
         if base_path.is_empty() {
             local_key(&resolved)?;
             return Ok(if resolved == r {
@@ -750,14 +751,15 @@ fn localize_ref<'a>(
     // Resolved against the URL the playlist was fetched from (the final
     // one after a redirect), base path and all, so a reference that climbs
     // out of the base path is seen to; the key is what is left under it.
-    let base_path = url_path(server).trim_end_matches('/');
+    let base = parsed_form(url_path(server));
+    let base_path = base.trim_end_matches('/');
     // Encoded dot segments are spelled as dots before resolving, so the
     // resolver removes them with the literal ones in one pass, in order.
     let decoded = decoded_dot_segments(r);
-    let resolved = normalized(&pharos_hls::uri::resolve(
+    let resolved = parsed_form(&normalized(&pharos_hls::uri::resolve(
         &format!("{base_path}{upstream}"),
         decoded.as_deref().unwrap_or(r),
-    ));
+    )));
     let Some(rest) = under_base(&resolved, base_path) else {
         outside_base(r, &resolved);
         return Err(());
@@ -785,6 +787,21 @@ fn normalized(r: &str) -> String {
     match decoded_dot_segments(r) {
         Some(decoded) => without_dot_segments(&decoded),
         None => without_dot_segments(r),
+    }
+}
+
+/// A root-relative path (query kept) in the form the client sends and the
+/// response names it: parsed, so a character it percent-encodes (`é`) is its
+/// escape. [`landed`] compares URLs this way; a base path and the paths
+/// checked against it are held to it, so `/café` and `/caf%C3%A9` are one.
+/// As given when it will not parse.
+fn parsed_form(path: &str) -> String {
+    match url::Url::parse(&format!("http://h{path}")) {
+        Ok(u) => match u.query() {
+            Some(q) => format!("{}?{q}", u.path()),
+            None => u.path().to_owned(),
+        },
+        Err(_) => path.to_owned(),
     }
 }
 
@@ -1314,6 +1331,42 @@ mod tests {
                 usize::MAX
             ),
             Localized::NotLocal(other.to_owned())
+        );
+    }
+
+    /// A base path with a character the client percent-encodes (`/café`) is
+    /// held in its parsed, encoded form, as the response's is: a reference
+    /// under it localizes whether it spells the character or its escape, by
+    /// an absolute path and by a relative one, and one under another path
+    /// does not.
+    #[test]
+    fn an_encoded_reference_under_an_encoded_base_path_localizes() {
+        let server = "https://s.example/caf\u{e9}";
+        let local =
+            |text: &str| localize_playlist(text, "/videos/main.m3u8", false, server, usize::MAX);
+        for reference in ["/caf%C3%A9/videos/1/0.m4s", "/caf\u{e9}/videos/1/0.m4s"] {
+            assert_eq!(
+                local(&format!("#EXTINF:6.0,\n{reference}\n")),
+                Localized::Rewritten("#EXTINF:6.0,\n/videos/1/0.m4s\n".to_owned()),
+                "{reference}"
+            );
+        }
+        for reference in [
+            "../../caf%C3%A9/videos/0.m4s",
+            "../../caf\u{e9}/videos/0.m4s",
+        ] {
+            assert_eq!(
+                local(&format!("#EXTINF:6.0,\n{reference}\n")),
+                Localized::Rewritten("#EXTINF:6.0,\n/videos/0.m4s\n".to_owned()),
+                "{reference}"
+            );
+        }
+        assert!(
+            matches!(
+                local("#EXTINF:6.0,\n/cafe/videos/1/0.m4s\n"),
+                Localized::NotLocal(_)
+            ),
+            "another path was taken for the base"
         );
     }
 
