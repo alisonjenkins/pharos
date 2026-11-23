@@ -797,6 +797,10 @@ impl Library {
     pub fn unpin(&self, container_id: &str) {
         if let Some(o) = self.offline.get() {
             o.cache.unpin(container_id);
+            // Playback work deferred behind that pin waits out its park
+            // unless the worker looks again.
+            o.downloader.wake();
+            log::info!("cache unpin: container released, downloader woken");
         }
     }
 
@@ -3041,6 +3045,34 @@ mod tests {
     /// shares the disk reads), and gone when the job ends. The downloader
     /// is the real one over the real cache, resolving to a local server
     /// (the library's own resolver needs the server's node protocol).
+    #[test]
+    fn unpinning_wakes_the_downloader() {
+        use crate::prefetch::{Downloader, Resolver, Tuning};
+        let dir = TmpDir::new("lib-unpin-wake");
+        let lib = Library::connect_with(&dead_server(), &dir.join("token"), quick()).unwrap();
+        let cache = Arc::new(
+            Cache::open_with_probe(&dir.join("cache"), 100 << 30, Box::new(|_| Ok(u64::MAX)))
+                .unwrap(),
+        );
+        let resolve: Resolver =
+            Arc::new(|_| Err(crate::prefetch::ResolveError::Permanent("none".into())));
+        let downloader = Downloader::start(cache.clone(), resolve, Tuning::default()).unwrap();
+        assert!(lib
+            .offline
+            .set(Offline {
+                cache: cache.clone(),
+                downloader,
+            })
+            .is_ok());
+        let before = lib.offline.get().unwrap().downloader.wakes();
+        lib.unpin("album/a");
+        assert_eq!(
+            lib.offline.get().unwrap().downloader.wakes(),
+            before + 1,
+            "Library::unpin left the downloader asleep"
+        );
+    }
+
     #[test]
     fn a_download_held_mid_window_is_outstanding_until_the_job_ends() {
         use crate::prefetch::{Downloader, Resolver, Tuning, FREE_CHECK_BYTES};

@@ -134,6 +134,8 @@ struct Gate {
     queue: Mutex<Queue>,
     idle: Condvar,
     wake: Notify,
+    /// How many times a caller asked for a look at the queue ([`Downloader::wake`]).
+    wakes: AtomicU64,
 }
 
 pub struct Downloader {
@@ -250,6 +252,7 @@ impl Downloader {
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
+            wakes: AtomicU64::new(0),
         });
         let for_thread = gate.clone();
         let thread = std::thread::Builder::new()
@@ -370,6 +373,19 @@ impl Downloader {
             );
         }
         self.gate.wake.notify_one();
+    }
+
+    /// Wakes the worker to look at its queue again: something it was
+    /// waiting on (a pin that deferred playback work) has gone.
+    pub fn wake(&self) {
+        self.gate.wakes.fetch_add(1, Ordering::SeqCst);
+        self.gate.wake.notify_one();
+    }
+
+    /// How many times [`Self::wake`] was called.
+    #[cfg(test)]
+    pub(crate) fn wakes(&self) -> u64 {
+        self.gate.wakes.load(Ordering::SeqCst)
     }
 
     /// Whether downloading is allowed now.
@@ -1824,6 +1840,7 @@ mod tests {
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
+            wakes: AtomicU64::new(0),
         });
         let dl = Downloader {
             gate: gate.clone(),
@@ -1876,6 +1893,7 @@ mod tests {
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
+            wakes: AtomicU64::new(0),
         };
         cache.pin("album/a", &ids(&["track/1"]));
         // The job ended with the track not whole (evicted after commit).
@@ -1939,6 +1957,7 @@ mod tests {
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
+            wakes: AtomicU64::new(0),
         });
         let dl = Arc::new(Downloader {
             gate: gate.clone(),
@@ -2014,6 +2033,7 @@ mod tests {
             }),
             idle: Condvar::new(),
             wake: Notify::new(),
+            wakes: AtomicU64::new(0),
         });
         let dl = Downloader {
             gate: gate.clone(),
@@ -2934,7 +2954,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         starve.store(false, Ordering::SeqCst);
         r.cache.unpin("album/a");
-        r.dl.gate.wake.notify_one();
+        r.dl.wake();
         assert!(
             r.dl.wait_idle(Duration::from_secs(5)),
             "the deferred request was lost"
