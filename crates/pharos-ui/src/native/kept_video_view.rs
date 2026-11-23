@@ -579,14 +579,14 @@ fn row_kind(state: &RowState) -> &'static str {
 
 /// The download queue (ADR 0148): every download not on the device yet, in
 /// the order they run, each with what it is doing and what the viewer can
-/// do. Nothing when the queue is empty.
+/// do. Nothing when the queue is empty. The Downloads page's one polled
+/// `listing`, so the page reads the store once for its two sections.
 #[component]
-pub fn VideoQueue() -> Element {
+fn VideoQueue(listing: Signal<Listing>) -> Element {
     let Some(store) = shown_video_store() else {
         return rsx! {};
     };
     let user = use_user();
-    let listing = use_listing();
     let _ = download_driver::QUEUE_CHANGED.read();
     let Some(user) = user else {
         return rsx! {};
@@ -768,7 +768,7 @@ pub fn VideoDownloads(
                 },
                 }
             }
-            VideoQueue {}
+            VideoQueue { listing }
             VideoList {
                 videos: rows_for(&listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref()))
                     .into_iter()
