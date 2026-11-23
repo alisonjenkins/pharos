@@ -3695,9 +3695,13 @@ mod tests {
         *slot.lock().unwrap() = Some(part.clone());
         std::fs::write(&part, body(600, 1)).unwrap();
         // A newer request that does not list the track.
-        let gate = r.dl.gate.clone();
+        // Held weakly: the hook lives inside the gate, so a strong handle
+        // would keep the gate alive through itself.
+        let gate = Arc::downgrade(&r.dl.gate);
         *r.dl.gate.after_first_chunk.lock().unwrap() = Some(Box::new(move || {
-            gate.lock().generation += 1;
+            if let Some(gate) = gate.upgrade() {
+                gate.lock().generation += 1;
+            }
         }));
         r.dl.prefetch(&ids(&["track/1"]));
         assert!(r.dl.wait_idle(Duration::from_secs(10)), "never ended");
