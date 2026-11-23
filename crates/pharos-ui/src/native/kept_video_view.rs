@@ -1108,9 +1108,11 @@ mod tests {
             paused: false,
             failed: None,
             retry_due: false,
+            generation: 0,
         };
         let mut queue = download_queue::Queue {
             entries: vec![entry("u", "1"), entry("other", "9"), entry("u", "2")],
+            ..Default::default()
         };
         assert_eq!(
             queued_status(&queue, "u", "2"),
