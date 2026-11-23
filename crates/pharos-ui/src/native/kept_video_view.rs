@@ -1810,7 +1810,7 @@ mod tests {
             saved_at: "2026-11-16T09:00:00Z".into(),
             estimate_from_adoption: false,
             stale_on_disk: 0,
-            transferred: 0,
+            transferred: None,
             halt: None,
         }
     }
