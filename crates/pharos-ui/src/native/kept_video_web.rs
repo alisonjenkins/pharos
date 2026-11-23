@@ -23,11 +23,11 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::download_queue::{halt_for_status, Halt};
 use super::kept_video::{
-    absolute_url, cache_name, cap_from_stored, cap_selected, check_not_kept, find, fits,
-    insert_front, interrupted, is_retryable, is_server_failure, missing_files, needs_admission,
-    new_record, progress_due, put_is_retryable, renewal, renewed_record, reserved_by,
-    retry_delay_secs, stale_files, still_needed, take, url_path, used_by, KeepVideoRefusal,
-    KeepVideoRequest, KeptState, KeptVideo, VideoStore, CAP_KEY, RECORDS_KEY,
+    absolute_url, apply_plan, cache_name, cap_from_stored, cap_selected, check_not_kept, find,
+    fits, insert_front, interrupted, is_retryable, is_server_failure, missing_files,
+    needs_admission, new_record, progress_due, put_is_retryable, renewal, renewed_record,
+    reserved_by, retry_delay_secs, stale_files, still_needed, take, url_path, used_by,
+    KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore, CAP_KEY, RECORDS_KEY,
 };
 use super::platform::{self, info, warn};
 
@@ -556,15 +556,20 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     let total = u32::try_from(all.len()).unwrap_or(u32::MAX);
     let planned = all.clone();
     let stale = stale_files(&record.files, &all);
+    let mut running = false;
     if !update(user, item, |v| {
-        v.files = planned;
-        v.estimated_bytes = estimate;
-        v.state = KeptState::Downloading {
-            done: 0,
-            total,
-            bytes: 0,
-        };
+        running = apply_plan(v, planned, estimate, total);
     }) {
+        return Err(Stop::Gone);
+    }
+    if !running {
+        // A pause landed while the plan was made: it stays paused, with the
+        // plan's files recorded for the resume.
+        let _ = save();
+        info(&format!(
+            "pharos: video keep plan item={item} verdict=kept_paused files={}",
+            all.len()
+        ));
         return Err(Stop::Gone);
     }
     let _ = save();
