@@ -2471,6 +2471,8 @@ pub(crate) mod tests {
         assert!(!fence(&p).refuses("tokB"));
     }
 
+    // `faults::MARKER` is checked in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_retried_sign_out_marks_the_token_an_earlier_one_left_when_the_absence_is_not_durable() {
         let d = dir("absent-retained");
