@@ -8281,9 +8281,24 @@ pub(crate) mod tests {
             } else {
                 "stale-share-fits"
             });
-            rig.server.fail(SEG1, &[403]);
+            // The first run stops at the second segment, but only once the
+            // init and the first segment are stored: the files are fetched
+            // side by side, and a 403 that lands first would abort the init
+            // fetch and leave a record the renewal reads as a changed
+            // stream (the run is then a restart, not the exact fit under
+            // test).
+            let fail = rig.server.hold_first(SEG1);
             let store = rig.open();
             store.start(request("1")).unwrap();
+            let mut waited = 0;
+            while store.indexed_file("u1", INIT).is_none()
+                || store.indexed_file("u1", SEG0).is_none()
+            {
+                waited += 1;
+                assert!(waited < 5_000, "the init and first segment were not stored");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            fail.store(true, Ordering::SeqCst);
             store.settled().await;
             // 2 MB an earlier plan left that the prune cannot delete.
             let files = rig.dir.join("u1").join("1").join("files");
