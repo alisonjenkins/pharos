@@ -1182,9 +1182,12 @@ load-bearing — tasks, bugs and code comments cite these ids. Never renumber; a
   - The Downloads page polls the unreadable count with the videos. The
     discard's thread is made with `thread::Builder`; one that cannot start is
     reported and the button enabled again.
-  - A registration whose folder could not be created opened nothing and gives
-    its claim back, so a later caller tries again; the music hook goes in once
-    and stays fail closed. One that reached the store keeps its claim.
+  - A registration that failed before the store could have opened (its
+    folder could not be created, or a failure `BeforeOpen`: the runtime or
+    thread) opened nothing and gives its claim back, so a later caller tries
+    again; the music hook goes in once and stays fail closed. Only one that
+    failed after the store may have opened keeps its claim; calling the
+    registration is not enough to keep it.
   - A token the proxy dropped on one redirect stays dropped for the rest of
     the request, back on its own origin too. The library's sign-out logs
     `token forget verdict=signed_out_not_durable` when its removal could not
