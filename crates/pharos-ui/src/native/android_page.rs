@@ -183,6 +183,12 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
             );
             Err(OpenError::NotSignedInTokenKept)
         }
+        Resumed::RefusedNotDurable => {
+            log::warn!(
+                "pharos: open server={base} signed_in=false reason=token_refused_not_durable {timing}"
+            );
+            Err(OpenError::NotSignedInTokenKept)
+        }
         Resumed::Superseded => {
             log::info!(
                 "pharos: open server={base} signed_in=unknown reason=token_replaced_during_resume {timing}"
@@ -228,11 +234,19 @@ impl offline_video::Resumer for PhoneResumer<'_> {
     }
 
     fn forget_token(&self, refused: &str) -> offline_video::TokenDropped {
-        use super::token_file::Ended;
+        use super::token_file::{self, Ended};
         match android::forget_refused_token(refused, None) {
             Ended::Changed => offline_video::TokenDropped::Replaced,
             Ended::Unsafe { .. } => offline_video::TokenDropped::Unsafe,
-            Ended::Forgotten(_) | Ended::Marked(_) => offline_video::TokenDropped::Gone,
+            Ended::Forgotten(token_file::Forgotten::NotDurable(why)) => {
+                log::warn!(
+                    "pharos: resume token forget verdict=not_durable reason=removal_not_synced why={why}"
+                );
+                offline_video::TokenDropped::GoneNotDurable
+            }
+            Ended::Forgotten(token_file::Forgotten::Durable) | Ended::Marked(_) => {
+                offline_video::TokenDropped::Gone
+            }
         }
     }
 }
