@@ -1127,7 +1127,20 @@ impl Worker {
             let fence = token::fence(&self.token_path);
             let newer = match &self.link {
                 Some(l) => !fence.refuses(&l.token),
-                None => self.load_token().ok().flatten().is_some(),
+                // A read that fails is not an absent token: it is the
+                // lookup failing, handled as for a dropped link below.
+                None => match self.load_token() {
+                    Ok(t) => t.is_some(),
+                    Err(e) => {
+                        let polling = self.stop_sign_in();
+                        self.shared.set_auth(AuthState::SignedOut);
+                        log::warn!(
+                            "credentials stay signed out: verdict=signed_out reason=token_lookup_failed linked=false quickconnect_stopped={polling} error={}",
+                            e.redacted()
+                        );
+                        return Err(e);
+                    }
+                },
             };
             if newer {
                 log::info!(
@@ -2626,6 +2639,31 @@ mod tests {
             lines.iter().any(|l| l.contains(
                 "credentials stay signed out: verdict=signed_out reason=token_lookup_failed"
             )),
+            "{lines:?}"
+        );
+    }
+
+    /// CR review 6018104500 (library.rs:1125): with no link open, a token
+    /// file that cannot be read is a failed lookup, not an absent token:
+    /// QuickConnect stops, the service is signed out and the error comes
+    /// back.
+    #[test]
+    fn a_stay_signed_out_with_no_link_and_an_unreadable_token_fails() {
+        let root = test_root("stay-signed-out-no-link-unreadable");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        assert!(w.link.is_none());
+        std::fs::create_dir_all(&token_path).unwrap();
+        crate::testlog::start();
+        let result = local.block_on(&rt, w.execute(&Op::StaySignedOut, &events));
+        let lines = crate::testlog::lines();
+        assert!(result.is_err(), "the lookup error was swallowed: {lines:?}");
+        assert_eq!(shared.lock().auth, AuthState::SignedOut, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("reason=token_lookup_failed linked=false")),
             "{lines:?}"
         );
     }
