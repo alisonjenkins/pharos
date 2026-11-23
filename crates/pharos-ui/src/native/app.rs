@@ -2171,6 +2171,14 @@ fn device_reason_unchanged(remembered: &str, reason: &str) -> bool {
     remembered != WAITING_FOR_DEVICE && remembered == reason
 }
 
+/// Whether the device effect has nothing to do: its standing is the one
+/// already decided, and (when the device's library is the one shown) no
+/// video store has been published since it read it. A store published later
+/// lists more videos, so the shown library is read again.
+fn device_effect_skips(remembered: &str, reason: &str, device: bool, store_changed: bool) -> bool {
+    device_reason_unchanged(remembered, reason) && !(device && store_changed)
+}
+
 #[component]
 fn NativeApp(route: Route) -> Element {
     super::kept_video_view::use_video_store_watch();
@@ -2286,10 +2294,12 @@ fn NativeApp(route: Route) -> Element {
     // change of connection; the "Back online" line shows for a moment after.
     let mut back_online = use_signal(|| false);
     let mut device_reason = use_signal(|| "connecting");
+    let store_seen = use_hook(|| Rc::new(Cell::new(false)));
     use_effect(move || {
         // A video store published after the device library was found
         // missing (it lists the stores' videos) asks again.
-        let _ = super::kept_video_view::shown_video_store();
+        let store_now = super::kept_video_view::shown_video_store().is_some();
+        let store_changed = store_seen.replace(store_now) != store_now;
         let standing = {
             let m = machine.read();
             Standing {
@@ -2303,8 +2313,13 @@ fn NativeApp(route: Route) -> Element {
             }
         };
         let (device, reason) = device_verdict(standing);
-        if device_reason_unchanged(*device_reason.peek(), reason) {
+        if device_effect_skips(*device_reason.peek(), reason, device, store_changed) {
             return;
+        }
+        if store_changed && device && device_reason_unchanged(*device_reason.peek(), reason) {
+            platform::info(&format!(
+                "pharos: offline library action=reread reason={reason} trigger=video_store_published"
+            ));
         }
         device_reason.set(reason);
         let was_device = offline.peek().is_some();
@@ -9971,6 +9986,37 @@ mod tests {
         assert!(!super::device_reason_unchanged(
             super::WAITING_FOR_DEVICE,
             "no_network"
+        ));
+    }
+
+    /// CR 4666431568: a store published after the device library was read
+    /// reads it again under the same standing; a server standing, or no
+    /// publication, still skips.
+    #[test]
+    fn a_published_store_rereads_the_device_library_under_the_same_standing() {
+        assert!(super::device_effect_skips(
+            "no_network",
+            "no_network",
+            true,
+            false
+        ));
+        assert!(!super::device_effect_skips(
+            "no_network",
+            "no_network",
+            true,
+            true
+        ));
+        assert!(super::device_effect_skips(
+            "connected",
+            "connected",
+            false,
+            true
+        ));
+        assert!(!super::device_effect_skips(
+            "no_network",
+            "slow_connect",
+            true,
+            false
         ));
     }
 
