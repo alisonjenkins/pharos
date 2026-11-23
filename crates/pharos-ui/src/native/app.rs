@@ -6102,6 +6102,7 @@ fn offline_playing(
         asked_subtitle: TrackChoice::default(),
         version: copy.version.clone(),
         offline: Some(OfflineSave { store, user }),
+        owner_gone: Cell::new(false),
         detail,
     })))
 }
@@ -6127,6 +6128,10 @@ struct Playing {
     /// so a reconnect swaps in a fresh one under the same player.
     /// `None` for a downloaded copy, which has no session on the server.
     grant: RefCell<Option<NativeGrant>>,
+    /// Set once a reconnect has retired this copy's owner: its position was
+    /// kept for them then, and the player's own stop (which carries the
+    /// reset zero) must not save over it.
+    owner_gone: Cell<bool>,
     /// Set for a downloaded copy: the position is kept on the device.
     offline: Option<OfflineSave>,
     /// The API generation `grant` was negotiated on.
@@ -6167,9 +6172,48 @@ impl Playing {
         let Some(save) = &self.offline else {
             return false;
         };
+        if self.owner_gone.get() {
+            platform::info(&format!(
+                "pharos: playback offline item={} verdict=save_skipped reason=owner_gone at_ms={at_ms}",
+                self.detail.item.id
+            ));
+            return true;
+        }
         save.store
             .save_position(&save.user, &self.detail.item.id.to_string(), at_ms);
         true
+    }
+
+    /// Keeps the place the departed owner reached. Written past the
+    /// `owner_gone` guard, which it then closes for the player's own stop.
+    fn save_for_departed_owner(&self, at_ms: u64) {
+        let Some(save) = &self.offline else {
+            return;
+        };
+        save.store
+            .save_position(&save.user, &self.detail.item.id.to_string(), at_ms);
+    }
+
+    /// After a reconnect: when this downloaded copy's owner is no longer
+    /// the authorized one, keeps their place, retires the player from
+    /// saving anything more (its own stop carries the reset zero) and says
+    /// so.
+    fn retire_if_owner_lost(
+        &self,
+        id: ItemRef,
+        authorized: Option<&str>,
+        last_ms: &Cell<u64>,
+    ) -> bool {
+        let Some(save) = &self.offline else {
+            return false;
+        };
+        let stops = offline_reconnect_stops(id, &save.user, authorized, last_ms, |ms| {
+            self.save_for_departed_owner(ms)
+        });
+        if stops {
+            self.owner_gone.set(true);
+        }
+        stops
     }
 
     /// Mounts the player afresh: a new session, or a renegotiation.
@@ -6640,6 +6684,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         },
                         method: decision.method,
                         asked_subtitle: asked.subtitle,
+                        owner_gone: Cell::new(false),
                     })))
                 }),
             )
@@ -6734,12 +6779,10 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         // owner is still the authorized offline user (`session_replaced`
         // ran before the new API was set). Otherwise the player goes, and
         // the start is decided again for whoever is authorized now.
-        if let Some(save) = &p.0.offline {
+        if p.0.offline.is_some() {
             let authorized = offline_video::last_user();
-            let keep = |ms| {
-                p.0.save_offline(ms);
-            };
-            if offline_reconnect_stops(id, &save.user, authorized.as_deref(), &owner_last_ms, keep)
+            if p.0
+                .retire_if_owner_lost(id, authorized.as_deref(), &owner_last_ms)
             {
                 playing.restart();
             }
@@ -10127,9 +10170,8 @@ mod tests {
     /// A downloaded copy's player as [`offline_playing`] builds it for
     /// `user`, whatever engine the host has.
     fn offline_player_for(user: &str) -> PlayingRef {
-        use super::super::kept_video::{
-            KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore,
-        };
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, KeptVideo, VideoStore};
+        #[derive(Default)]
         struct NoStore;
         impl VideoStore for NoStore {
             fn videos(&self, _: &str) -> Vec<KeptVideo> {
@@ -10150,6 +10192,15 @@ mod tests {
                 0
             }
         }
+        offline_player_in(user, std::sync::Arc::new(NoStore))
+    }
+
+    /// As [`offline_player_for`], over `store`.
+    fn offline_player_in(
+        user: &str,
+        store: std::sync::Arc<dyn super::super::kept_video::VideoStore>,
+    ) -> PlayingRef {
+        use super::super::kept_video::KeptState;
         let mut copy = offline_video::tests::video("7", "", KeptState::Ready);
         copy.user = user.into();
         let detail = offline_video::offline_detail(&copy).unwrap();
@@ -10174,13 +10225,62 @@ mod tests {
             asked_subtitle: TrackChoice::default(),
             version: String::new(),
             offline: Some(OfflineSave {
-                store: std::sync::Arc::new(NoStore),
+                store,
                 user: user.into(),
             }),
+            owner_gone: Cell::new(false),
             renegotiation: 0,
             session_suspect: Cell::new(false),
             detail,
         }))
+    }
+
+    /// CR (app.rs:6714): after a reconnect retired A's copy, the player's
+    /// own stop must not save the reset zero over the place kept for A; a
+    /// zero saved before the retirement (a finished video) still goes
+    /// through.
+    #[test]
+    fn a_retired_players_stop_does_not_save_over_the_departed_owners_place() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<(String, u64)>>);
+        impl super::super::kept_video::VideoStore for Recording {
+            fn videos(&self, _: &str) -> Vec<super::super::kept_video::KeptVideo> {
+                Vec::new()
+            }
+            fn start(
+                &self,
+                _: super::super::kept_video::KeepVideoRequest,
+            ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, user: &str, _: &str, at: u64) {
+                self.0.lock().unwrap().push((user.to_owned(), at));
+            }
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        let store = std::sync::Arc::new(Recording::default());
+        let p = offline_player_in("A", store.clone());
+        // A finished video saves 0 legitimately, before any retirement.
+        assert!(p.0.save_offline(0));
+        let id: ItemRef = "7".parse().unwrap();
+        let carried = Cell::new(90_000u64);
+        assert!(p.0.retire_if_owner_lost(id, Some("B"), &carried));
+        // The player's stop, after the reset.
+        assert!(p.0.save_offline(carried.get()));
+        assert_eq!(
+            *store.0.lock().unwrap(),
+            vec![("A".to_owned(), 0), ("A".to_owned(), 90_000)],
+            "the retired player's stop saved over A's place"
+        );
     }
 
     /// Mounts A's downloaded copy behind a negotiation as the watch screen
