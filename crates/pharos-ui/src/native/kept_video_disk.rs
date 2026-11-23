@@ -4648,8 +4648,38 @@ fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[S
             return;
         }
         let path = inner.file_path(user, item, key);
-        let _ = std::fs::remove_file(&path);
+        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                // Still on disk: still indexed, and still charged to the
+                // run, so the folder's bytes do not drop out of the books.
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep dropped plan file verdict=kept item={item} run={run} reason=delete_failed len={len} error={e}"
+                    ),
+                );
+                continue;
+            }
+        }
         st.index.remove(&(user.to_owned(), key.clone()), &path);
+        // A playlist that landed this run and is deleted is no longer owed
+        // as landed: the replan fetches it again and lands it afresh.
+        let who = (user.to_owned(), item.to_owned(), run);
+        if let Some(landed) = st.playlists_landed.get_mut(&who) {
+            let released = len.min(*landed);
+            *landed -= released;
+            if released > 0 {
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep dropped plan file verdict=released item={item} run={run} released={released} landed={landed}"
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -12012,6 +12042,52 @@ pub(crate) mod tests {
         drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
         assert!(!path.exists());
         assert!(store.stored_file("u1", &key).is_none());
+    }
+
+    /// CR outside-diff (kept_video_disk.rs:4203): a refused plan's deleted
+    /// playlist is no longer charged as landed, and one that would not be
+    /// deleted keeps its charge and its index entry.
+    #[tokio::test]
+    async fn a_deleted_refused_playlist_releases_its_landed_charge_only_once_deleted() {
+        let rig = Rig::new("refused-releases-landed");
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        let key = SEG0.to_owned();
+        let path = store.stored_file("u1", &key).unwrap().path;
+        let len = std::fs::metadata(&path).unwrap().len();
+        let who = ("u1".to_owned(), "1".to_owned(), 999u64);
+        {
+            let mut st = lock(&store.inner.state);
+            st.runs.insert(("u1".to_owned(), "1".to_owned()), 999);
+            st.playlists_landed.insert(who.clone(), len + 7);
+        }
+        drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
+        assert!(!path.exists());
+        assert_eq!(
+            lock(&store.inner.state).playlists_landed.get(&who).copied(),
+            Some(7),
+            "the deleted playlist stayed charged as landed"
+        );
+        // One that cannot be deleted (a folder where the file is) keeps
+        // both its charge and its index entry.
+        let stuck = "/videos/1/h264cmaf/stuck.m3u8?PlaySessionId=p".to_owned();
+        let stuck_path = store.inner.file_path("u1", "1", &stuck);
+        std::fs::create_dir_all(stuck_path.join("inner")).unwrap();
+        lock(&store.inner.state)
+            .index
+            .insert(("u1".to_owned(), stuck.clone()), (stuck_path.clone(), 5));
+        lock(&store.inner.state)
+            .playlists_landed
+            .insert(who.clone(), 50);
+        drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&stuck));
+        assert!(stuck_path.exists());
+        assert_eq!(
+            lock(&store.inner.state).playlists_landed.get(&who).copied(),
+            Some(50),
+            "a delete that failed released its charge"
+        );
+        assert!(store.stored_file("u1", &stuck).is_some(), "and forgot it");
     }
 
     /// Downloads are served to the user who kept them: another account
