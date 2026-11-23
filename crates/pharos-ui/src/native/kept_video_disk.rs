@@ -4127,6 +4127,24 @@ async fn wait_for_accounting(
     }
 }
 
+/// Whether a refusal says the music cache's figures could not be read, as
+/// the admissions word it.
+fn accounting_refusal(reason: &str) -> bool {
+    reason.contains("reason=music_size_unknown") || reason.contains("music cache is not up yet")
+}
+
+/// What of the music cache's figures cannot be read now, as (ready, known),
+/// or None when both can.
+fn accounting_missing(inner: &Arc<Inner>) -> Option<(bool, bool)> {
+    let budget = &inner.env.budget;
+    let _admission = budget.admission_guard();
+    let (ready, known) = (
+        budget.accounting_ready(),
+        budget.other_pending_bytes().1.is_some(),
+    );
+    (!(ready && known)).then_some((ready, known))
+}
+
 async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Result<Finished, Stop> {
     let record = find(&lock(&inner.state).list, user, item)
         .cloned()
@@ -4142,40 +4160,60 @@ async fn download(inner: &Arc<Inner>, user: &str, item: &str, run: u64) -> Resul
         verify_renewal(inner, user, item, &record, kept, live).await?;
     }
     wait_for_revoked_writers(inner, user, item, run).await?;
-    wait_for_accounting(inner, user, item, run).await?;
-    // A folder whose adoption walk fell short blocks admission, and no
-    // sweep measures it while this run owns it: the run measures it first.
-    inner.remeasure(Some((user, item, run)));
-    // An earlier run's staging files go before the plan is admitted: the
-    // admission replaces the floor that counted them, and the walks after it
-    // count this run's files only. One that will not go keeps the folder
-    // unknown, so the admission is refused rather than made without it.
-    drop_old_runs_parts(inner, user, item, run);
-    // Every way out of planning passes here: a refusal there (a playlist's
-    // reservation or size limit, the plan's admission) keeps nothing this
-    // run fetched to plan. A new download drops the playlists it read; a
-    // resumed one only those this run fetched, its other files kept for a
-    // later retry.
-    let mut playlists = Playlists::default();
-    let planned = match plan_and_admit(inner, user, item, run, &record, &mut playlists).await {
-        Ok(p) => p,
-        Err(Stop::Refused(reason)) => {
-            let dropped = if resume {
-                &playlists.fetched
-            } else {
-                &playlists.read
-            };
-            drop_refused_files(inner, user, item, run, dropped);
-            emit(
-                false,
-                format!(
-                    "pharos: video keep planning refused item={item} resume={resume} playlists_dropped={}",
-                    dropped.len()
-                ),
-            );
-            return Err(Stop::Refused(reason));
+    // The figures read ready when the wait ended can stop being so before the
+    // plan's admission reads them again (the music cache restarted, its
+    // downloads could not all be measured). That refusal is not the run's
+    // end: with nothing to restart it, it would stay Failed. The run goes
+    // back to the wait, and plans again once they can be read; a refusal
+    // while they are readable (the cap, the free space) is final as before.
+    let planned = loop {
+        wait_for_accounting(inner, user, item, run).await?;
+        // A folder whose adoption walk fell short blocks admission, and no
+        // sweep measures it while this run owns it: the run measures it first.
+        inner.remeasure(Some((user, item, run)));
+        // An earlier run's staging files go before the plan is admitted: the
+        // admission replaces the floor that counted them, and the walks after
+        // it count this run's files only. One that will not go keeps the
+        // folder unknown, so the admission is refused rather than made
+        // without it.
+        drop_old_runs_parts(inner, user, item, run);
+        // Every way out of planning passes here: a refusal there (a
+        // playlist's reservation or size limit, the plan's admission) keeps
+        // nothing this run fetched to plan. A new download drops the
+        // playlists it read; a resumed one only those this run fetched, its
+        // other files kept for a later retry.
+        let mut playlists = Playlists::default();
+        match plan_and_admit(inner, user, item, run, &record, &mut playlists).await {
+            Ok(p) => break p,
+            Err(Stop::Refused(reason)) => {
+                let dropped = if resume {
+                    &playlists.fetched
+                } else {
+                    &playlists.read
+                };
+                drop_refused_files(inner, user, item, run, dropped);
+                emit(
+                    false,
+                    format!(
+                        "pharos: video keep planning refused item={item} resume={resume} playlists_dropped={}",
+                        dropped.len()
+                    ),
+                );
+                let missing = accounting_missing(inner);
+                let said = accounting_refusal(&reason);
+                if missing.is_some() || said {
+                    emit(
+                        false,
+                        format!(
+                            "pharos: video keep waiting item={item} run={run} reason=accounting_lost_after_wait unreadable_now={missing:?} refusal_says_so={said} refusal={reason}"
+                        ),
+                    );
+                    continue;
+                }
+                return Err(Stop::Refused(reason));
+            }
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
     };
     let Planned {
         all,
@@ -7627,9 +7665,12 @@ pub(crate) mod tests {
     /// CR outside-diff kept_video_disk.rs:1894: music accounting readable
     /// when the accounting wait ends but unreadable at the plan's admission
     /// refuses a resume too, not only a fresh download: it is never
-    /// admitted on free space alone.
+    /// admitted on free space alone. The refusal is not the run's end (CR
+    /// 3980, 1758): the run goes back to the accounting wait and is admitted
+    /// once the figures can be read, instead of staying Failed with nothing
+    /// to restart it.
     #[tokio::test]
-    async fn a_resume_is_refused_when_music_turns_unmeasurable_before_admission() {
+    async fn a_resume_waits_when_music_turns_unmeasurable_before_admission() {
         let rig = Rig::new("resume-music-unknown");
         rig.server.sign_in("u1");
         let mid = rig.server.hold_mid_body(SEG0);
@@ -7649,11 +7690,22 @@ pub(crate) mod tests {
         let b2 = budget.clone();
         set_hook(&AFTER_PRUNE, move || b2.armed.store(true, Ordering::SeqCst));
         store.resume_user("u1");
-        store.settled().await;
-        clear_hook(&AFTER_PRUNE);
+        let mut waited = 0;
+        while lines("pharos: video keep waiting item=1")
+            .iter()
+            .all(|l| !l.contains("reason=accounting_lost_after_wait"))
+        {
+            waited += 1;
+            assert!(
+                waited < 5_000,
+                "the run never went back to the wait: {:?}",
+                captured()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         assert!(
-            !only(&store).ready(),
-            "a resume was admitted with music unmeasured: {:?}",
+            !only(&store).ready() && !matches!(only(&store).state, KeptState::Failed { .. }),
+            "a resume was admitted with music unmeasured, or failed: {:?}",
             only(&store).state
         );
         assert!(
@@ -7663,6 +7715,10 @@ pub(crate) mod tests {
             "{:?}",
             captured()
         );
+        clear_hook(&AFTER_PRUNE);
+        budget.armed.store(false, Ordering::SeqCst);
+        store.settled().await;
+        assert!(only(&store).ready(), "{:?}", only(&store).state);
     }
 
     /// A music download held mid-window leaves one window of free space
