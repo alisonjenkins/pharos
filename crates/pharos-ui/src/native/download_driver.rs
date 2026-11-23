@@ -151,6 +151,7 @@ pub(super) async fn enqueue(
         paused: false,
         failed: None,
         retry_due: false,
+        generation: 0,
     };
     // The detail call above awaited: the owner is read again right before
     // anything is written, on the versioned path and the unversioned one.
@@ -414,9 +415,18 @@ async fn start(ctx: Ctx, store: &dyn VideoStore, user: &str, item: &str, why: &s
     STARTING.set(false);
     // The viewer may have removed or paused it while the negotiation was
     // out: its grant is dropped, nothing is started.
-    if let (Ok(_), Err(gone)) = (&outcome, still_startable(&load(), user, item)) {
+    // That holds for a refusal too: a late Offline, Busy or Never answer
+    // must not count a try against, nor fail, an entry that was paused, or
+    // one queued again since.
+    if let Err(gone) = still_startable(&load(), user, item, entry.generation) {
         platform::info(&format!(
-            "pharos: video queue action=start verdict=dropped item={item} reason={gone}"
+            "pharos: video queue action=start verdict=dropped item={item} reason={gone} outcome={}",
+            match &outcome {
+                Ok(_) => "granted",
+                Err(Negotiation::Offline(_)) => "offline",
+                Err(Negotiation::Busy(_)) => "busy",
+                Err(Negotiation::Never(_)) => "never",
+            }
         ));
         return;
     }
