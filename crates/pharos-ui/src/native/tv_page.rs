@@ -170,6 +170,28 @@ pub fn redirects_exceeded(previous: usize) -> bool {
     previous > DOWNLOAD_REDIRECTS
 }
 
+/// What a response's redirect says: `None` when it is no redirect or its
+/// `Location` is missing (nothing to follow), `Some(Err)` when the header is
+/// there but unreadable (`location` is `Err`) or cannot be joined, `Some(Ok)`
+/// with the joined URL otherwise. An unreadable `Location` is a redirect the
+/// download cannot follow, not a response to hand on as it is: it reaches
+/// the redirect-error path like any other bad target.
+pub fn redirect_target(
+    redirection: bool,
+    location: Option<Result<&str, ()>>,
+    join: impl FnOnce(&str) -> Result<String, String>,
+) -> Option<Result<String, String>> {
+    if !redirection {
+        return None;
+    }
+    match location? {
+        Ok(location) => Some(join(location)),
+        Err(()) => Some(Err(
+            "the redirect's Location header is not readable".to_owned()
+        )),
+    }
+}
+
 /// Whether a download's request to `original` may follow a redirect to
 /// `next`: only when scheme, host and port all match. The download sends the
 /// device token in a header, so a redirect to another host would hand it
@@ -1894,6 +1916,24 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// CR review 6018104500 (android_page.rs:3486): an unreadable Location
+    /// on a redirect is an error, not "no redirect"; a missing one is still
+    /// none, and a readable one joins as before.
+    #[test]
+    fn an_unreadable_location_is_a_redirect_error() {
+        let join = |l: &str| Ok(format!("http://h/{l}"));
+        assert_eq!(super::redirect_target(false, Some(Ok("x")), join), None);
+        assert_eq!(super::redirect_target(true, None, join), None);
+        assert_eq!(
+            super::redirect_target(true, Some(Ok("x")), join),
+            Some(Ok("http://h/x".to_owned()))
+        );
+        assert!(matches!(
+            super::redirect_target(true, Some(Err(())), join),
+            Some(Err(_))
+        ));
+    }
+
     use super::*;
 
     /// CR 4642574391: `previous` holds the original and each redirect
