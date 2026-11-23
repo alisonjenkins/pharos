@@ -1107,6 +1107,7 @@ mod tests {
             quality_bps: 1,
             paused: false,
             failed: None,
+            retry_due: false,
         };
         let mut queue = download_queue::Queue {
             entries: vec![entry("u", "1"), entry("other", "9"), entry("u", "2")],
