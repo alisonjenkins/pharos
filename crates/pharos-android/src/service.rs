@@ -133,6 +133,14 @@ impl TrimDebt {
 
     /// The cache opened (and so trimmed itself); `had_accounting` says the
     /// accounting was installed when it did, so nothing more is owed.
+    ///
+    /// `had_accounting` is read before the open starts, and the open trims
+    /// at a point inside it that the service cannot see. An arrival between
+    /// the read and the trim is therefore left owed: one more trim, which
+    /// finds the cache already within its cap and evicts nothing
+    /// (`a_second_trim_under_the_same_accounting_evicts_nothing`). Deciding
+    /// coverage after the open instead would miss a trim for an arrival
+    /// that landed after the open's own, which costs a cache over its cap.
     pub(crate) fn cache_opened(&self, had_accounting: bool) {
         if had_accounting {
             let mut s = self.state();
@@ -1008,6 +1016,19 @@ mod tests {
         let debt = TrimDebt::new();
         debt.cache_opened(accounting_usable(Some(&hook)));
         debt.accounting_arrived();
+        assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
+    }
+
+    /// CR (service.rs:61): a retry that lands between the open's accounting
+    /// check and the open's end leaves the trim owed: one settle trims, then
+    /// nothing is owed, so the cache trims at most once more than the open.
+    #[test]
+    fn an_arrival_between_the_check_and_the_open_owes_exactly_one_more_trim() {
+        let debt = TrimDebt::new();
+        // The open read "no accounting"; the retry then installed it.
+        debt.accounting_arrived();
+        debt.cache_opened(false);
+        assert_eq!(debt.take(true, true), TrimVerdict::Trim);
         assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
     }
 
