@@ -346,39 +346,15 @@ struct Listing {
     cap: u64,
 }
 
-/// Which rows a listing reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Rows {
-    /// Every row, through [`VideoStore::videos`] (which may recover).
-    All,
-    /// The Ready rows, from memory ([`VideoStore::ready_videos`]).
-    Ready,
-    /// None: the parent gave them ([`VideoDownloads`]'s snapshot), so only
-    /// the counts and the usage are read.
-    Given,
-}
-
 /// The listing to show for `user` now: nothing without a store or a user,
 /// except the unreadable count, which is the store's.
-#[cfg(test)]
 fn listing(store: Option<&dyn VideoStore>, user: Option<&str>) -> Listing {
-    listing_with(store, user, Rows::All)
-}
-
-/// [`listing`] reading only `rows`.
-fn listing_with(store: Option<&dyn VideoStore>, user: Option<&str>, rows: Rows) -> Listing {
     let Some(store) = store else {
         return Listing::default();
     };
     Listing {
         owner: user.map(str::to_owned),
-        videos: user
-            .map(|u| match rows {
-                Rows::All => store.videos(u),
-                Rows::Ready => store.ready_videos(u),
-                Rows::Given => Vec::new(),
-            })
-            .unwrap_or_default(),
+        videos: user.map(|u| store.videos(u)).unwrap_or_default(),
         unreadable: store.unreadable_count(),
         leftover: store.leftover_count(),
         usage: user.map(|u| store.usage(u)),
@@ -404,37 +380,8 @@ fn rows_for(
     fresh().videos
 }
 
-/// The rows a Downloads screen renders. Given the parent's snapshot (the
-/// offline start's, which its verdict was logged from), those rows, while
-/// they were read for `user`; else the polled listing's ([`rows_for`]).
-/// Never a second read beside the snapshot, and never another user's rows.
-fn downloads_rows(
-    snapshot: Option<&offline_video::ReadyVideos>,
-    shown: &Listing,
-    user: Option<&str>,
-    fresh: impl FnOnce() -> Listing,
-) -> Vec<KeptVideo> {
-    match snapshot {
-        Some(snap) => rows_for(
-            &Listing {
-                owner: snap.owner.clone(),
-                videos: snap.videos.clone(),
-                ..Listing::default()
-            },
-            user,
-            || {
-                let mut now = fresh();
-                now.videos.retain(KeptVideo::ready);
-                now
-            },
-        ),
-        None => rows_for(shown, user, fresh),
-    }
-}
-
-/// [`listing_with`] over a store in hand.
-fn listing_now(store: &dyn VideoStore, user: Option<&str>, rows: Rows) -> Listing {
-    listing_with(Some(store), user, rows)
+fn listing_now(store: &dyn VideoStore, user: Option<&str>) -> Listing {
+    listing(Some(store), user)
 }
 
 /// The listing a poll sets, when it differs from the one shown.
@@ -447,20 +394,13 @@ fn refreshed(shown: &Listing, now: Listing) -> Option<Listing> {
 /// saw. A fence that props and signals do not show (the owner becoming
 /// nobody) changes the listing's owner, and the poll sets it: the screen
 /// renders again for whoever is authorized now.
-#[cfg(test)]
 fn polled(store: Option<&dyn VideoStore>) -> Listing {
-    polled_with(store, Rows::All)
+    listing(store, offline_video::last_user().as_deref())
 }
 
-/// [`polled`] reading only `rows`.
-fn polled_with(store: Option<&dyn VideoStore>, rows: Rows) -> Listing {
-    listing_with(store, offline_video::last_user().as_deref(), rows)
-}
-
-/// The user's listing, re-read every [`POLL_MS`] while the component lives,
-/// with only `rows` (fixed for the component's life).
-fn use_listing(rows: Rows) -> Signal<Listing> {
-    let read = move || polled_with(video_store().as_deref(), rows);
+/// The user's listing, re-read every [`POLL_MS`] while the component lives.
+fn use_listing() -> Signal<Listing> {
+    let read = move || polled(video_store().as_deref());
     let mut shown = use_signal(read);
     use_future(move || async move {
         poll_every(
@@ -510,14 +450,14 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
     };
     let ctx = use_context::<Ctx>();
     let user = use_user();
-    let listing = use_listing(Rows::All);
+    let listing = use_listing();
     let id = detail.item.id;
     let item = id.to_string();
     let mut quality = use_signal(|| DEFAULT_QUALITY_BPS);
     let mut busy = use_signal(|| false);
     let mut message = use_signal(|| None::<String>);
     let video = rows_for(&listing.read(), user.as_deref(), || {
-        listing_now(&*store, user.as_deref(), Rows::All)
+        listing_now(&*store, user.as_deref())
     })
     .into_iter()
     .find(|v| v.item == item);
@@ -612,25 +552,15 @@ async fn start_download(
 /// The Downloads page's videos. Nothing without a registered store.
 #[component]
 pub fn VideoDownloads(
-    /// Show the space allowance picker (the Downloads page does; the
-    /// offline start, which only plays, does not).
+    /// Show the space allowance picker.
     #[props(default = true)]
     settings: bool,
-    /// The rows to render, read once by the parent (the offline start,
-    /// which logged its verdict from them). `None`: the polled listing.
-    #[props(default)]
-    rows: Option<offline_video::ReadyVideos>,
 ) -> Element {
     let Some(store) = shown_video_store() else {
         return rsx! {};
     };
     let user = use_user();
-    // Given rows (the offline start's snapshot) are not walked again: the
-    // poll reads the counts and the usage, and an owner change reads the
-    // Ready rows from memory. Recovery stays with the worker's listing.
-    let snapshot = rows.is_some();
-    let listing = use_listing(if snapshot { Rows::Given } else { Rows::All });
-    let fresh_rows = if snapshot { Rows::Ready } else { Rows::All };
+    let listing = use_listing();
     let nav = use_context::<Nav>();
     // Both figures from one read: the polled one while it was read for this
     // user, else a fresh one.
@@ -682,7 +612,7 @@ pub fn VideoDownloads(
                 }
             }
             VideoList {
-                videos: downloads_rows(rows.as_ref(), &listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref(), fresh_rows)),
+                videos: rows_for(&listing.read(), user.as_deref(), || listing_now(&*store, user.as_deref())),
                 used,
                 videos_used,
                 used_known: usage.is_some(),
@@ -1198,119 +1128,6 @@ mod tests {
         );
         assert!(!html.contains("disabled"), "a retry is not offered: {html}");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a second discard ran");
-    }
-
-    /// CR 4638524434: the offline start renders the rows of the snapshot its
-    /// verdict was logged from. A video removed after that read (the second
-    /// read here finds none) still leaves the rendered rows matching the
-    /// logged count; a snapshot read for another user is never shown.
-    #[test]
-    fn the_offline_rows_are_the_snapshot_the_verdict_was_logged_from() {
-        let snapshot = offline_video::ReadyVideos {
-            owner: Some("A".into()),
-            videos: vec![video("7", KeptState::Ready)],
-        };
-        // The listing read after the snapshot: the video is gone.
-        let later = Listing {
-            owner: Some("A".into()),
-            ..Listing::default()
-        };
-        let logged = snapshot.videos.len();
-        let rows = downloads_rows(Some(&snapshot), &later, Some("A"), || {
-            unreachable!("read again beside the snapshot")
-        });
-        assert_eq!(rows.len(), logged, "the rows and the logged count differ");
-        thread_local! {
-            static ROWS: RefCell<Vec<KeptVideo>> = const { RefCell::new(Vec::new()) };
-        }
-        fn root() -> Element {
-            let videos = ROWS.with(|r| r.borrow().clone());
-            rsx! {
-                VideoList {
-                    videos,
-                    used: 0,
-                    cap: 0,
-                    on_play: |_| {},
-                    on_remove: |_| {},
-                }
-            }
-        }
-        ROWS.with(|r| *r.borrow_mut() = rows);
-        let mut dom = VirtualDom::new(root);
-        dom.rebuild_in_place();
-        let html = dioxus_ssr::render(&dom);
-        assert!(
-            html.contains("data-kind=\"video\""),
-            "no video row rendered: {html}"
-        );
-        // The snapshot is A's; the screen is B's: B's rows, read fresh.
-        let rows = downloads_rows(Some(&snapshot), &later, Some("B"), || Listing {
-            owner: Some("B".into()),
-            ..Listing::default()
-        });
-        assert!(rows.is_empty(), "A's rows were shown to B");
-        // No snapshot: the polled listing, as on the Downloads page.
-        assert!(downloads_rows(None, &later, Some("A"), Listing::default).is_empty());
-    }
-
-    /// A store that counts its `videos` walks and answers Ready rows from
-    /// memory.
-    struct Walks(std::sync::atomic::AtomicUsize);
-    impl VideoStore for Walks {
-        fn videos(&self, _: &str) -> Vec<KeptVideo> {
-            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            vec![video("7", KeptState::Ready)]
-        }
-        fn ready_videos(&self, _: &str) -> Vec<KeptVideo> {
-            vec![video("7", KeptState::Ready)]
-        }
-        fn start(
-            &self,
-            _: super::super::kept_video::KeepVideoRequest,
-        ) -> Result<(), super::super::kept_video::KeepVideoRefusal> {
-            Ok(())
-        }
-        fn remove(&self, _: &str, _: &str) {}
-        fn save_position(&self, _: &str, _: &str, _: u64) {}
-        fn cap_bytes(&self) -> u64 {
-            0
-        }
-        fn used_bytes(&self, _: &str) -> u64 {
-            0
-        }
-        fn free_bytes(&self) -> u64 {
-            0
-        }
-    }
-
-    /// CR 4644634592: with rows given by the parent, the screen's poll and
-    /// an owner change's reread never walk the store's `videos` (which may
-    /// recover); the polled listing without a snapshot still does.
-    #[test]
-    fn given_rows_are_not_walked_again() {
-        use std::sync::atomic::Ordering;
-        let store = Walks(std::sync::atomic::AtomicUsize::new(0));
-        let polled = listing_with(Some(&store), Some("A"), Rows::Given);
-        assert!(polled.videos.is_empty());
-        let snapshot = offline_video::ReadyVideos {
-            owner: Some("A".into()),
-            videos: vec![video("7", KeptState::Ready)],
-        };
-        let rows = downloads_rows(Some(&snapshot), &polled, Some("B"), || {
-            listing_now(&store, Some("B"), Rows::Ready)
-        });
-        assert_eq!(rows.len(), 1, "B's Ready rows were not read");
-        assert_eq!(
-            store.0.load(Ordering::SeqCst),
-            0,
-            "given rows were walked again"
-        );
-        let _ = listing(Some(&store), Some("A"));
-        assert_eq!(
-            store.0.load(Ordering::SeqCst),
-            1,
-            "the polled listing stopped walking"
-        );
     }
 
     /// A poll refreshes the screen when only the unreadable count changed:
