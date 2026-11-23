@@ -192,12 +192,11 @@ pub fn same_playlist(
     kept: &str,
     live: &str,
 ) -> Result<(), PlanMismatch> {
-    let renewed = if live.is_empty() {
-        renewed.to_owned()
-    } else {
-        renewed.replace(live, kept)
-    };
-    let (mut a, mut b) = (stored.lines(), renewed.lines());
+    let renewed: Vec<String> = renewed
+        .lines()
+        .map(|line| restore_session(line, live, kept))
+        .collect();
+    let (mut a, mut b) = (stored.lines(), renewed.iter().map(String::as_str));
     let mut at = 0;
     loop {
         at += 1;
@@ -213,6 +212,37 @@ pub fn same_playlist(
             }
         }
     }
+}
+
+/// `line` with each `PlaySessionId=<live>` parameter put back to `kept`.
+/// Only that parameter's value moves: a path, another parameter or any
+/// other text that happens to contain `live` is left as it is, so a changed
+/// path still shows up as a difference.
+fn restore_session(line: &str, live: &str, kept: &str) -> String {
+    if live.is_empty() {
+        return line.to_owned();
+    }
+    let key = format!("{SESSION_KEY}=").to_ascii_lowercase();
+    let lower = line.to_ascii_lowercase();
+    let mut out = String::with_capacity(line.len());
+    let mut at = 0;
+    while let Some(found) = lower[at..].find(&key) {
+        let key_at = at + found;
+        let value_at = key_at + key.len();
+        let after_delim = key_at > 0 && matches!(line.as_bytes()[key_at - 1], b'?' | b'&');
+        let value_end = line[value_at..]
+            .find(['&', '#', '"', ' ', ','])
+            .map_or(line.len(), |n| value_at + n);
+        out.push_str(&line[at..value_at]);
+        if after_delim && &line[value_at..value_end] == live {
+            out.push_str(kept);
+        } else {
+            out.push_str(&line[value_at..value_end]);
+        }
+        at = value_end;
+    }
+    out.push_str(&line[at..]);
+    out
 }
 
 /// Where a renewed stream's plan first parts from the stored one, with the
@@ -364,6 +394,29 @@ mod tests {
     #[test]
     fn an_hour_at_two_megabits_is_about_900_mb() {
         assert_eq!(estimate_bytes(2_000_000, 3_600_000), 900_000_000);
+    }
+
+    /// CR review 6018104500 (offline.rs:192): only the session parameter is
+    /// put back. A renewed playlist whose path carries the live id, or whose
+    /// other parameter does, differs from the stored one.
+    #[test]
+    fn only_the_session_value_is_put_back_in_a_renewed_playlist() {
+        let kept = "#EXTM3U\n/p/seg0.m4s?PlaySessionId=p&x=1\n";
+        let same = "#EXTM3U\n/p/seg0.m4s?PlaySessionId=q&x=1\n";
+        assert_eq!(same_playlist(kept, same, "p", "q"), Ok(()));
+        // The live id in a path is a different path, not a session.
+        let kept = "#EXTM3U\n/p/seg0.m4s?PlaySessionId=p\n";
+        let moved = "#EXTM3U\n/q/seg0.m4s?PlaySessionId=q\n";
+        let err = same_playlist(kept, moved, "p", "q").unwrap_err();
+        assert_eq!(err.at, 2, "a changed path passed as a session swap");
+        // So is the id in another parameter.
+        let other = "#EXTM3U\n/p/seg0.m4s?PlaySessionId=q&tag=q\n";
+        let kept = "#EXTM3U\n/p/seg0.m4s?PlaySessionId=p&tag=p\n";
+        assert!(same_playlist(kept, other, "p", "q").is_err());
+        // A key's URI attribute is a URI reference too.
+        let kept = "#EXT-X-KEY:METHOD=AES-128,URI=\"/k?PlaySessionId=p\"\n";
+        let renewed = "#EXT-X-KEY:METHOD=AES-128,URI=\"/k?PlaySessionId=q\"\n";
+        assert_eq!(same_playlist(kept, renewed, "p", "q"), Ok(()));
     }
 
     #[test]
