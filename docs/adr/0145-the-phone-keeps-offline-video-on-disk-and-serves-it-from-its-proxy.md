@@ -122,6 +122,11 @@ rules, the log lines and their fields) are in V1464 in
   including after a sign-out, nothing is served from disk; the files stay on
   disk for that user's next sign-in.
 
+- Offline, a downloaded video is an item of the device library (ADR-0149),
+  not a screen of its own: the library lists the signed-in owner's Ready
+  downloads beside the songs and books, and choosing one plays it through
+  the stored-playback path above (V1512).
+
 ## Alternatives considered
 
 - A separate 4 GiB video budget: simpler, but doubles what the phone may fill.
@@ -131,5 +136,6 @@ rules, the log lines and their fields) are in V1464 in
 ## Invariants
 
 V1463 (whole files on disk, proxy answers stored keys), V1464 (shared cap and
-free-space guard) and V1465 (every outcome logged, offline start counts
-videos) in `specs/001-pharos-baseline/invariants.md` guard this decision.
+free-space guard), V1465 (every outcome logged) and V1512 (the device library
+lists the owner's Ready videos, with its verdict logged) in
+`specs/001-pharos-baseline/invariants.md` guard this decision.
