@@ -868,6 +868,7 @@ async fn run(user: String, item: String, id: u64, resume: bool) {
             let mut applied = false;
             update(&user, &item, |v| {
                 if running(v) {
+                    v.transferred = v.bytes();
                     v.state = KeptState::Failed { reason };
                     v.halt = None;
                     applied = true;
@@ -885,6 +886,7 @@ async fn run(user: String, item: String, id: u64, resume: bool) {
             let mut applied = false;
             update(&user, &item, |v| {
                 if running(v) {
+                    v.transferred = v.bytes();
                     v.state = KeptState::Failed { reason };
                     v.halt = Some(halt);
                     applied = true;
@@ -981,6 +983,7 @@ impl VideoStore for WebVideoStore {
         let mut paused = false;
         update(user, item, |v| {
             if matches!(v.state, KeptState::Downloading { .. }) {
+                v.transferred = v.bytes();
                 v.state = KeptState::Failed {
                     reason: "paused".to_owned(),
                 };
