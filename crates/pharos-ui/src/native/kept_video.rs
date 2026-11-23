@@ -1147,6 +1147,41 @@ pub fn apply_plan(v: &mut KeptVideo, files: Vec<String>, estimate: u64, total: u
     running
 }
 
+/// Which run owns each download, by user and item: a start claims the item
+/// under a new id, and only the run holding the current id may fetch for it,
+/// publish its progress or end it. An older run (a paused download started
+/// again) sees its id is stale and stops without touching its successor.
+#[derive(Debug, Default)]
+pub struct RunIds {
+    last: u64,
+    current: std::collections::HashMap<(String, String), u64>,
+}
+
+impl RunIds {
+    /// A new id for `user`'s `item`, replacing the one before it.
+    pub fn claim(&mut self, user: &str, item: &str) -> u64 {
+        self.last += 1;
+        self.current
+            .insert((user.to_owned(), item.to_owned()), self.last);
+        self.last
+    }
+
+    /// Whether `run` still owns the item.
+    pub fn is_current(&self, user: &str, item: &str, run: u64) -> bool {
+        self.current.get(&(user.to_owned(), item.to_owned())) == Some(&run)
+    }
+
+    /// Ends `run`'s ownership; whether it held it (a stale run did not).
+    pub fn release(&mut self, user: &str, item: &str, run: u64) -> bool {
+        let key = (user.to_owned(), item.to_owned());
+        if self.current.get(&key) == Some(&run) {
+            self.current.remove(&key);
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1179,6 +1214,22 @@ mod tests {
                 bytes: 0
             }
         );
+    }
+
+    /// An older run of an item does not own it once a newer one started.
+    #[test]
+    fn only_the_newest_run_of_an_item_owns_it() {
+        let mut runs = RunIds::default();
+        let old = runs.claim("u", "1");
+        assert!(runs.is_current("u", "1", old));
+        let new = runs.claim("u", "1");
+        assert!(!runs.is_current("u", "1", old), "a stale run kept the item");
+        assert!(runs.is_current("u", "1", new));
+        assert!(!runs.release("u", "1", old), "a stale run released it");
+        assert!(runs.is_current("u", "1", new));
+        assert!(runs.release("u", "1", new));
+        assert!(!runs.is_current("u", "1", new));
+        assert!(!runs.is_current("v", "1", new));
     }
 
     /// Outside-diff item kept_video_disk.rs:2368: the limit holds while the

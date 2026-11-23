@@ -27,7 +27,8 @@ use super::kept_video::{
     fits, insert_front, interrupted, is_retryable, is_server_failure, missing_files,
     needs_admission, new_record, progress_due, put_is_retryable, renewal, renewed_record,
     reserved_by, retry_delay_secs, stale_files, still_needed, take, url_path, used_by,
-    KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, VideoStore, CAP_KEY, RECORDS_KEY,
+    KeepVideoRefusal, KeepVideoRequest, KeptState, KeptVideo, RunIds, VideoStore, CAP_KEY,
+    RECORDS_KEY,
 };
 use super::platform::{self, info, warn};
 
@@ -42,6 +43,9 @@ thread_local! {
     /// The play session each renewed download fetches under, by user and
     /// item, when it is not the one its stored keys carry (ADR 0148).
     static LIVE: RefCell<HashMap<(String, String), String>> = RefCell::new(HashMap::new());
+    /// Which run owns each download: a stale run touches nothing of its
+    /// successor's.
+    static RUNS: RefCell<RunIds> = RefCell::new(RunIds::default());
 }
 
 /// The URL a stored key is fetched from: the key itself, or the key under
@@ -266,18 +270,29 @@ async fn fetch_once(url: &str) -> Result<web_sys::Response, FetchErr> {
     }
 }
 
-fn wanted(user: &str, item: &str) -> bool {
-    with_list(|l| {
-        find(l, user, item).is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }))
-    })
+/// Whether run `run` still owns the item.
+fn owns(user: &str, item: &str, run: u64) -> bool {
+    RUNS.with(|r| r.borrow().is_current(user, item, run))
+}
+
+fn wanted(user: &str, item: &str, run: u64) -> bool {
+    owns(user, item, run)
+        && with_list(|l| {
+            find(l, user, item).is_some_and(|v| matches!(v.state, KeptState::Downloading { .. }))
+        })
 }
 
 /// Fetches `url`, retrying with backoff while the failure is one a retry
 /// can mend, and stops once the download has been removed.
-async fn fetch_retry(user: &str, item: &str, url: &str) -> Result<web_sys::Response, Stop> {
+async fn fetch_retry(
+    user: &str,
+    item: &str,
+    run: u64,
+    url: &str,
+) -> Result<web_sys::Response, Stop> {
     let mut attempt = 0u32;
     loop {
-        if !wanted(user, item) {
+        if !wanted(user, item, run) {
             return Err(Stop::Gone);
         }
         let err = match fetch_once(&fetch_url(user, item, url)).await {
@@ -343,12 +358,13 @@ async fn fetch_put(
     cache: &web_sys::Cache,
     user: &str,
     item: &str,
+    run: u64,
     url: &str,
     read_back: bool,
 ) -> Result<(web_sys::Response, u64), Stop> {
     let mut attempt = 0u32;
     loop {
-        let response = fetch_retry(user, item, url).await?;
+        let response = fetch_retry(user, item, run, url).await?;
         let len = length_of(&response);
         let (stored, back) = if read_back {
             let copy = response.clone().map_err(|e| Stop::Failed(describe(&e)))?;
@@ -410,12 +426,13 @@ async fn playlist(
     cache: &web_sys::Cache,
     user: &str,
     item: &str,
+    run: u64,
     url: &str,
 ) -> Result<String, Stop> {
     let cached = JsFuture::from(cache.match_with_str(url)).await.ok();
     let response = match cached.and_then(|v| v.dyn_into::<web_sys::Response>().ok()) {
         Some(r) => r,
-        None => fetch_put(cache, user, item, url, true).await?.0,
+        None => fetch_put(cache, user, item, run, url, true).await?.0,
     };
     let promise = response.text().map_err(|e| Stop::Failed(describe(&e)))?;
     JsFuture::from(promise)
@@ -460,7 +477,7 @@ async fn delete_files(user: &str, files: &[String]) {
 
 /// The download, from planning to Ready. `resume` is a restart after the
 /// page closed: the size check is not repeated against bytes already kept.
-async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
+async fn download(user: &str, item: &str, run: u64, resume: bool) -> Result<u64, Stop> {
     let record = with_list(|l| find(l, user, item).cloned()).ok_or(Stop::Gone)?;
     let cache = open_cache(user).await.map_err(Stop::Failed)?;
     notify_worker();
@@ -481,7 +498,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
         ));
     }
 
-    let text = playlist(&cache, user, item, &master).await?;
+    let text = playlist(&cache, user, item, run, &master).await?;
     texts.push((master.clone(), text.clone()));
     let plan = plan_master(&master, &text)
         .map_err(|e| Stop::Failed(format!("master playlist not understood: {e}")))?;
@@ -496,7 +513,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
                 format!("{} was never stored", url_path(url)),
             ));
         }
-        let text = playlist(&cache, user, item, url).await?;
+        let text = playlist(&cache, user, item, run, url).await?;
         stored.push(url.clone());
         let media = plan_media(url, &text)
             .map_err(|e| Stop::Failed(format!("{} not understood: {e}", url_path(url))))?;
@@ -510,7 +527,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
         texts.push((url.clone(), text));
     }
     if let Some((live, kept)) = &renewing {
-        verify_renewal(&cache, user, item, &texts, &inits, kept, live).await?;
+        verify_renewal(&cache, user, item, run, &texts, &inits, kept, live).await?;
     }
     let mut all = stored.clone();
     all.extend(files);
@@ -584,12 +601,12 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     let todo = missing_files(&all, &cached);
     let mut done = all.len() - todo.len();
     let mut bytes = stored_bytes;
-    publish(user, item, done, total, bytes, true);
+    publish(user, item, run, done, total, bytes, true);
 
     let cache = &cache;
     let short_tails = &short_tails;
     let mut results = stream::iter(todo.iter().map(|url| async move {
-        let len = match fetch_put(cache, user, item, url, false).await {
+        let len = match fetch_put(cache, user, item, run, url, false).await {
             Ok((_, len)) => len,
             // B1476: the sliver of a last segment can fail to encode; the
             // copy plays without it, ending a frame early. Only the server's
@@ -609,7 +626,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
     while let Some(result) = results.next().await {
         bytes += result?;
         done += 1;
-        publish(user, item, done, total, bytes, false);
+        publish(user, item, run, done, total, bytes, false);
     }
     drop(results);
 
@@ -674,10 +691,12 @@ async fn orphan_check(
 /// stored init segment is the same bytes. Anything else is
 /// [`Halt::StreamChanged`], naming the first difference, and the queue
 /// starts the download afresh.
+#[allow(clippy::too_many_arguments)]
 async fn verify_renewal(
     cache: &web_sys::Cache,
     user: &str,
     item: &str,
+    run: u64,
     texts: &[(String, String)],
     inits: &[String],
     kept: &str,
@@ -690,7 +709,7 @@ async fn verify_renewal(
         Stop::Halted(Halt::StreamChanged, format!("the stream changed: {what}"))
     };
     for (key, stored) in texts {
-        let response = fetch_retry(user, item, key).await?;
+        let response = fetch_retry(user, item, run, key).await?;
         let renewed = JsFuture::from(response.text().map_err(|e| Stop::Failed(describe(&e)))?)
             .await
             .map_err(|e| Stop::Failed(describe(&e)))?
@@ -709,7 +728,7 @@ async fn verify_renewal(
             continue;
         };
         let stored = body_bytes(&stored).await.map_err(Stop::Failed)?;
-        let renewed = fetch_retry(user, item, key).await?;
+        let renewed = fetch_retry(user, item, run, key).await?;
         let renewed = body_bytes(&renewed).await.map_err(Stop::Failed)?;
         if stored != renewed {
             return Err(changed(format!(
@@ -729,7 +748,10 @@ async fn verify_renewal(
 }
 
 /// Records progress; saved at most once a second unless `force`.
-fn publish(user: &str, item: &str, done: usize, total: u32, bytes: u64, force: bool) {
+fn publish(user: &str, item: &str, run: u64, done: usize, total: u32, bytes: u64, force: bool) {
+    if !owns(user, item, run) {
+        return;
+    }
     let done = u32::try_from(done).unwrap_or(u32::MAX);
     let alive = update(user, item, |v| {
         // A pause landed meanwhile: it stays paused.
@@ -804,8 +826,17 @@ async fn warm_player_script() -> Result<(), String> {
     Ok(())
 }
 
-async fn run(user: String, item: String, resume: bool) {
-    let outcome = download(&user, &item, resume).await;
+async fn run(user: String, item: String, id: u64, resume: bool) {
+    let outcome = download(&user, &item, id, resume).await;
+    // An older run (the download was paused and started again) ends without
+    // touching its successor's session, progress or record.
+    if !RUNS.with(|r| r.borrow_mut().release(&user, &item, id)) {
+        info(&format!(
+            "pharos: video keep stopped item={item} run={id} reason=superseded_by_newer_run"
+        ));
+        notify_worker();
+        return;
+    }
     set_live(&user, &item, None);
     // A pause or a removal that landed while the run ended leaves its
     // record as the viewer set it.
@@ -942,7 +973,8 @@ impl VideoStore for WebVideoStore {
                 .map_or(0, |p| if renewing { p.files.len() } else { 0 })
         ));
         set_live(&user, &item, live);
-        wasm_bindgen_futures::spawn_local(run(user, item, renewing));
+        let id = RUNS.with(|r| r.borrow_mut().claim(&user, &item));
+        wasm_bindgen_futures::spawn_local(run(user, item, id, renewing));
         Ok(())
     }
 
@@ -1037,6 +1069,7 @@ pub fn register() {
             v.item,
             v.files.len()
         ));
-        wasm_bindgen_futures::spawn_local(run(v.user, v.item, true));
+        let id = RUNS.with(|r| r.borrow_mut().claim(&v.user, &v.item));
+        wasm_bindgen_futures::spawn_local(run(v.user, v.item, id, true));
     }
 }
