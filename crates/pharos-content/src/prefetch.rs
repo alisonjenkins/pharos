@@ -489,6 +489,10 @@ impl Gate {
                 let mut q = self.lock();
                 let now = Instant::now();
                 let epoch = self.online_epoch.load(Ordering::SeqCst);
+                // Playback demand for a parked track that is not yet due:
+                // it stays wanted (a pin leaving meanwhile must not lose
+                // it), behind whatever else is asked for.
+                let mut not_due: Vec<String> = Vec::new();
                 while let Some(id) = q.wanted.pop_front() {
                     if self.cache.is_complete(&id) {
                         continue;
@@ -513,15 +517,18 @@ impl Gate {
                                 p.until.saturating_duration_since(now).as_millis()
                             );
                             if !q.pinned.iter().any(|x| *x == id) {
-                                q.pinned.push_back(id);
+                                q.pinned.push_back(id.clone());
                             }
+                            not_due.push(id);
                             continue;
                         }
                     }
+                    q.wanted.extend(not_due.drain(..));
                     q.busy = true;
                     q.current = Some(id.clone());
                     return Some((id, q.generation));
                 }
+                q.wanted.extend(not_due.drain(..));
                 // A parked pin waits out its backoff at the back of the
                 // queue; the others go meanwhile.
                 let mut earliest: Option<Instant> = None;
@@ -531,6 +538,14 @@ impl Gate {
                     };
                     if self.cache.is_complete(&id) || !self.is_pin_work(&id) {
                         q.parked.remove(&id);
+                        // Still asked for by playback: it goes now, as
+                        // playback work, not when something else wakes us.
+                        if q.wanted.contains(&id) {
+                            log::info!(
+                                "cache download id={id} verdict=requeued reason=pin_gone_while_playback_deferred"
+                            );
+                            earliest = Some(now);
+                        }
                         continue;
                     }
                     // A reconnect since the park makes it due at once.
@@ -548,6 +563,7 @@ impl Gate {
                             continue;
                         }
                     }
+                    q.wanted.retain(|w| *w != id);
                     q.busy = true;
                     q.current = Some(id.clone());
                     return Some((id, q.generation));
@@ -2903,6 +2919,29 @@ mod tests {
         assert!(
             r.dl.events().iter().any(|e| e == "park_cleared:track/1"),
             "{:?}",
+            r.dl.events()
+        );
+    }
+
+    /// CR review 6018104500 (prefetch.rs:509-519): playback demand deferred
+    /// for a parked pin stays wanted. When the pin goes before the park is
+    /// due, the track still runs as playback work.
+    #[test]
+    fn deferred_playback_demand_survives_the_pin_leaving() {
+        let starve = Arc::new(AtomicBool::new(true));
+        let r = parked_pin("park-deferred-unpin", starve.clone());
+        r.dl.prefetch(&ids(&["track/1"]));
+        std::thread::sleep(Duration::from_millis(300));
+        starve.store(false, Ordering::SeqCst);
+        r.cache.unpin("album/a");
+        r.dl.gate.wake.notify_one();
+        assert!(
+            r.dl.wait_idle(Duration::from_secs(5)),
+            "the deferred request was lost"
+        );
+        assert!(
+            r.cache.is_complete("track/1"),
+            "playback demand was dropped when its pin left: {:?}",
             r.dl.events()
         );
     }
