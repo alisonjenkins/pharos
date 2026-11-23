@@ -1080,7 +1080,7 @@ impl Cache {
                 );
                 break;
             };
-            if !self.remove_locked(s, &id) {
+            if self.remove_locked(s, &id).is_none() {
                 break;
             }
             log::info!(
@@ -1197,17 +1197,21 @@ impl Cache {
     }
 
     /// Delete `id`'s file and forget it. False when the file would not go.
-    fn remove_locked(&self, s: &mut State, id: &str) -> bool {
-        match std::fs::remove_file(self.final_path(id)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+    ///
+    /// `None` when the file would not go (the entry stays indexed);
+    /// `Some(true)` when the file was removed and `Some(false)` when it was
+    /// already gone, so the entry is dropped but nothing was freed.
+    fn remove_locked(&self, s: &mut State, id: &str) -> Option<bool> {
+        let removed = match std::fs::remove_file(self.final_path(id)) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
                 log::warn!("cache evict id={id} failed: {e}; keeping it indexed");
-                return false;
+                return None;
             }
-        }
+        };
         s.entries.remove(id);
-        true
+        Some(removed)
     }
 
     /// Make room to write `need` more bytes for `downloading` and still leave
@@ -1733,14 +1737,19 @@ impl Cache {
             let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
                 break;
             };
-            if !self.remove_locked(&mut s, &id) {
+            let Some(removed) = self.remove_locked(&mut s, &id) else {
                 stopped = true;
                 break;
-            }
-            now = now.saturating_add(bytes);
+            };
+            // A file that was already gone freed nothing: its indexed
+            // length is not room.
+            let freed = if removed { bytes } else { 0 };
+            now = now.saturating_add(freed);
             evicted = true;
             evicted_n += 1;
-            log::info!("cache evict id={id} bytes={bytes} reason=low_disk free_bytes={now}");
+            log::info!(
+                "cache evict id={id} bytes={bytes} freed={freed} reason=low_disk free_bytes={now}"
+            );
         }
         // Finished tracks first; then parts no job holds, oldest first. One
         // that will not go is passed over for the next, its bytes not
@@ -2695,6 +2704,20 @@ pub(crate) mod tests {
             assert_eq!(figure, None, "a failed {what} read as a figure");
         }
         assert_eq!(c.in_progress_bytes(), Some(40));
+    }
+
+    /// An entry whose file is already gone is dropped from the index but
+    /// frees nothing: eviction does not credit its indexed length as room.
+    #[test]
+    fn an_evicted_entry_whose_file_is_gone_is_not_credited_as_room() {
+        let d = tmp("evict-gone");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(MIN_FREE_BYTES - 100)).unwrap();
+        put(&c, "track/gone", 500);
+        std::fs::remove_file(c.final_path("track/gone")).unwrap();
+        assert!(
+            c.ensure_free("track/x", 50).is_err(),
+            "a vanished file's length was counted as free space"
+        );
     }
 
     /// A directory named like a part is not part bytes: its own length
