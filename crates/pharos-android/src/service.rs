@@ -87,8 +87,8 @@ pub(crate) enum TrimVerdict {
     /// Owed, but the library is not published yet: it stays owed for the
     /// path that publishes it.
     NoLibraryYet,
-    /// Owed, the cache is not enabled: a cache enabled later trims as it
-    /// opens, so the debt is dropped.
+    /// Owed, the cache is not enabled: the debt stays until a cache opens
+    /// (which trims with the accounting) or this path runs again.
     CacheNotOpen,
     /// Owed and due now. Returned to exactly one caller.
     Trim,
@@ -151,12 +151,16 @@ impl TrimDebt {
                 TrimVerdict::NotOwed
             };
         }
-        if !std::mem::take(&mut s.owed) {
+        if !s.owed {
             return TrimVerdict::NotOwed;
         }
         if cache_enabled {
+            s.owed = false;
             TrimVerdict::Trim
         } else {
+            // Kept: a cache that opens later with the accounting installed
+            // trims itself and discharges it ([`TrimDebt::cache_opened`]);
+            // one that opens another way still finds it owed.
             TrimVerdict::CacheNotOpen
         }
     }
@@ -891,9 +895,17 @@ mod tests {
         debt.accounting_arrived();
         assert_eq!(debt.take(true, true), TrimVerdict::Trim);
         assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
-        // A cache not yet enabled trims as it opens: the debt is dropped.
+        // A cache not yet enabled keeps the debt: dropping it would skip the
+        // trim if the cache then opens a way that does not discharge it.
         debt.accounting_arrived();
         assert_eq!(debt.take(true, false), TrimVerdict::CacheNotOpen);
+        assert_eq!(debt.take(true, false), TrimVerdict::CacheNotOpen);
+        assert_eq!(debt.take(true, true), TrimVerdict::Trim);
+        assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
+        // A cache that opens with the accounting installed trims itself.
+        debt.accounting_arrived();
+        assert_eq!(debt.take(true, false), TrimVerdict::CacheNotOpen);
+        debt.cache_opened(true);
         assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
     }
 
