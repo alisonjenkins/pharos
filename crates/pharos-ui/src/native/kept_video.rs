@@ -1192,6 +1192,10 @@ pub fn apply_plan(v: &mut KeptVideo, files: Vec<String>, estimate: u64, total: u
 pub struct RunIds {
     last: u64,
     current: std::collections::HashMap<(String, String), u64>,
+    /// The cache writes in flight, per item and run: a write the browser has
+    /// started cannot be cancelled, so a successor waits for a superseded
+    /// run's before it writes the same keys.
+    puts: std::collections::HashMap<(String, String, u64), u32>,
 }
 
 impl RunIds {
@@ -1206,6 +1210,33 @@ impl RunIds {
     /// Whether `run` still owns the item.
     pub fn is_current(&self, user: &str, item: &str, run: u64) -> bool {
         self.current.get(&(user.to_owned(), item.to_owned())) == Some(&run)
+    }
+
+    /// `run` starts a cache write for its item.
+    pub fn begin_put(&mut self, user: &str, item: &str, run: u64) {
+        *self
+            .puts
+            .entry((user.to_owned(), item.to_owned(), run))
+            .or_default() += 1;
+    }
+
+    /// `run`'s cache write settled, however it ended.
+    pub fn end_put(&mut self, user: &str, item: &str, run: u64) {
+        let key = (user.to_owned(), item.to_owned(), run);
+        if let Some(n) = self.puts.get_mut(&key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.puts.remove(&key);
+            }
+        }
+    }
+
+    /// Whether another run of the item still has a cache write in flight:
+    /// `run` must not write the same keys until it settles.
+    pub fn put_in_flight_from_another(&self, user: &str, item: &str, run: u64) -> bool {
+        self.puts
+            .keys()
+            .any(|(u, i, r)| u == user && i == item && *r != run)
     }
 
     /// Ends `run`'s ownership; whether it held it (a stale run did not).
@@ -1223,6 +1254,23 @@ impl RunIds {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// CR 4666431623: a superseded run's cache write that the browser
+    /// already started cannot be cancelled; the successor waits for it
+    /// rather than being overwritten, and a settled write frees it.
+    #[test]
+    fn a_successor_waits_for_a_superseded_runs_cache_write() {
+        let mut runs = RunIds::default();
+        let old = runs.claim("u", "1");
+        runs.begin_put("u", "1", old);
+        let new = runs.claim("u", "1");
+        assert!(runs.put_in_flight_from_another("u", "1", new));
+        // Its own write never blocks it, nor does another item's.
+        assert!(!runs.put_in_flight_from_another("u", "1", old));
+        assert!(!runs.put_in_flight_from_another("u", "2", new));
+        runs.end_put("u", "1", old);
+        assert!(!runs.put_in_flight_from_another("u", "1", new));
+    }
 
     /// A plan lands on a download that was paused meanwhile without
     /// starting it again.
