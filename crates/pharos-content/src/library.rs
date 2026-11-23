@@ -1058,9 +1058,14 @@ impl Worker {
                     Ok(()) => {}
                     // The file may hold the token, but this process has not
                     // taken it up (fence, hooks): the sign-in stops here.
-                    Err(e) if token::is_store_incomplete(&e) => {
+                    Err(e) if token::is_store_incomplete(&e) || token::is_store_refused(&e) => {
+                        let reason = if token::is_store_refused(&e) {
+                            "token_store_refused"
+                        } else {
+                            "token_store_incomplete"
+                        };
                         log::warn!(
-                            "quickconnect sign-in verdict=stopped reason=token_store_incomplete auth=signed_out error={}",
+                            "quickconnect sign-in verdict=stopped reason={reason} auth=signed_out error={}",
                             e.redacted()
                         );
                         // The approved code is consumed: a Pending row
@@ -2703,6 +2708,22 @@ mod tests {
         token::tests::FAIL_READ_BACK.with(|f| f.set(false));
         assert!(w.link.is_none(), "an unconfirmed store signed in");
         assert_ne!(shared.lock().auth, AuthState::SignedIn);
+    }
+
+    /// CR review 6018104500 (library.rs:1073-1076): an approval whose token
+    /// the store refuses (here, empty) does not sign in from memory, and
+    /// the consumed code is cleared; an I/O failure still falls back.
+    #[test]
+    fn a_quickconnect_approval_the_store_refuses_does_not_sign_in() {
+        let root = test_root("qc-store-refused");
+        let (mut w, shared, _) = worker(&root);
+        let (rt, local) = local_rt();
+        shared.set_auth(AuthState::Pending {
+            code: "123456".to_owned(),
+        });
+        approve(&mut w, &rt, &local, || {}, "");
+        assert!(w.link.is_none(), "a refused credential signed in");
+        assert_eq!(shared.lock().auth, AuthState::SignedOut);
     }
 
     /// CR 4644634491: an approval whose store is incomplete, reached while
