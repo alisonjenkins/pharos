@@ -889,6 +889,28 @@ fn resume_or_owe(user: &str, seen: &TokenSeen, at: u64) {
     }
 }
 
+/// Whether the session's token pairing lets `user`'s owed resume go on, by
+/// the rule the immediate resume follows: with a token, it must be paired
+/// with `user`; with none (the web's cookie session has no device token to
+/// pair), there is nothing to check where no token decides who is signed
+/// in, so the resume goes on. Where a token decides, a session without one
+/// resumes nothing.
+fn resume_pairing_holds(user: &str, seen: &TokenSeen) -> bool {
+    if seen.0.is_none() && !token_decides_sign_in() {
+        return true;
+    }
+    paired_user(seen).as_deref() == Some(user)
+}
+
+/// Whether a device token decides who is signed in on this platform.
+fn token_decides_sign_in() -> bool {
+    #[cfg(test)]
+    if tests::PREF.with(|p| p.borrow().is_some()) {
+        return true;
+    }
+    super::platform::TOKEN_DECIDES_SIGN_IN
+}
+
 /// Called once the store of downloaded videos is published: replays a
 /// sign-in that landed before it, so a download recovery parked is resumed,
 /// only while that user is still the one signed in and the token on file is
@@ -904,7 +926,7 @@ pub fn store_published() {
         with_id(|st| (st.generation, st.identity == Identity::User(user.clone())));
     let reason = if !signed_in {
         Some("identity_changed")
-    } else if paired_user(&seen).as_deref() != Some(user.as_str()) {
+    } else if !resume_pairing_holds(&user, &seen) {
         Some("token_not_paired")
     } else {
         None
@@ -976,7 +998,7 @@ fn revalidate_resume(user: &str, seen: &TokenSeen) -> Result<u64, &'static str> 
         Err("identity_changed_since_validated")
     } else if !same_token {
         Err("credentials_changed_since_validated")
-    } else if paired_user(seen).as_deref() != Some(user) {
+    } else if !resume_pairing_holds(user, seen) {
         Err("token_not_paired")
     } else {
         Ok(at)
@@ -2621,6 +2643,60 @@ pub(crate) mod tests {
                 "bytes landed after the session end"
             );
         });
+    }
+
+    /// A tokenless session (the web's) that signed in before the store was
+    /// published has its owed resume replayed: there is no token to pair, as
+    /// the immediate resume does not need one. Where a token decides, a
+    /// session without one still resumes nothing.
+    #[test]
+    fn a_tokenless_sessions_owed_resume_is_replayed_when_the_store_is_published() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        #[derive(Default)]
+        struct Counting(AtomicUsize);
+        impl VideoStore for Counting {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                Vec::new()
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+            fn resume_user(&self, _: &str) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let store = Arc::new(Counting::default());
+        STORE.with(|s| *s.borrow_mut() = Some(store.clone()));
+        PREF.with(|p| *p.borrow_mut() = None);
+        set_identity(Identity::User("A".to_owned()));
+        with_owed(|o| *o = Some(("A".to_owned(), TokenSeen(None))));
+        store_published();
+        assert_eq!(
+            store.0.load(Ordering::SeqCst),
+            1,
+            "a tokenless session's owed resume was dropped"
+        );
+        // Where a token decides, no token is not a pairing.
+        let _ = pref();
+        set_identity(Identity::User("A".to_owned()));
+        with_owed(|o| *o = Some(("A".to_owned(), TokenSeen(None))));
+        store_published();
+        assert_eq!(store.0.load(Ordering::SeqCst), 1, "an unpaired resume ran");
+        PREF.with(|p| *p.borrow_mut() = None);
+        STORE.with(|s| *s.borrow_mut() = None);
     }
 
     /// Outside diff offline_video.rs:901 (review 5995575621), the control
