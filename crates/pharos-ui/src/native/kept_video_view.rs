@@ -380,8 +380,9 @@ fn rows_for(
         return shown.videos.clone();
     }
     platform::info(&format!(
-        "pharos: video listing verdict=reread reason=owner_changed from={:?} to={user:?}",
-        shown.owner
+        "pharos: video listing verdict=reread reason=owner_changed from_set={} to_set={}",
+        shown.owner.is_some(),
+        user.is_some()
     ));
     fresh().videos
 }
@@ -1546,6 +1547,21 @@ mod tests {
             ..Listing::default()
         });
         assert!(rows.is_empty(), "A's rows were shown to B: {rows:?}");
+        // CR review 6018104500 (kept_video_view.rs:382-385): the re-read
+        // says whether an owner was set on each side, never which account.
+        let lines = platform::take_info_lines();
+        assert!(
+            lines.iter().any(|l| l.contains("verdict=reread")
+                && l.contains("from_set=true")
+                && l.contains("to_set=true")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains("\"A\"") && !l.contains("\"B\"")),
+            "an account id was logged: {lines:?}"
+        );
         let rows = rows_for(&shown, Some("A"), || panic!("read again for the same user"));
         assert_eq!(rows, a_rows);
         let rows = rows_for(&shown, None, Listing::default);
