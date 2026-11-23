@@ -404,6 +404,31 @@ pub fn still_startable(
     }
 }
 
+/// What `record` (of queue entry `e`) still has to write, when it can write
+/// at all: not a Ready one waiting to be reconciled, a paused or failed-for-
+/// good entry, or a Failed record nothing will start (no halt to mend and
+/// no Retry). Once the store has a plan its estimate is the figure, less
+/// what the transfer holds; before that the queue's own.
+fn outstanding_write(e: &QueueEntry, r: &KeptVideo) -> Option<u64> {
+    let writes = !r.ready()
+        && !e.paused
+        && e.failed.is_none()
+        && match r.state {
+            KeptState::Downloading { .. } => true,
+            KeptState::Failed { .. } => e.retry_due || r.halt.is_some(),
+            KeptState::Ready => false,
+        };
+    if !writes {
+        return None;
+    }
+    let plan = if r.estimated_bytes > 0 {
+        r.estimated_bytes
+    } else {
+        e.estimate()
+    };
+    Some(plan.saturating_sub(r.held()))
+}
+
 /// Whether `entry` fits beside everything kept and queued: the downloads
 /// cap and the free-space floor hold for what is promised, not only what is
 /// on disk. `used` is what the store counts (its own records included).
@@ -431,10 +456,10 @@ pub fn admit(
         .iter()
         .filter(|e| e.item != entry.item || e.user != entry.user)
         .filter_map(|e| {
-            records
+            let r = records
                 .iter()
-                .find(|r| r.user == e.user && r.item == e.item)
-                .map(|r| e.estimate().saturating_sub(r.bytes()))
+                .find(|r| r.user == e.user && r.item == e.item)?;
+            outstanding_write(e, r)
         })
         .sum();
     let promised_free = promised.saturating_add(outstanding);
@@ -951,7 +976,10 @@ mod tests {
     #[test]
     fn admission_counts_the_bytes_a_started_download_has_still_to_write() {
         let q = queue(&["1"]);
-        let records = [record("1", downloading(), None)];
+        let mut started = record("1", downloading(), None);
+        // The plan the store admitted it with.
+        started.estimated_bytes = q.entries[0].estimate();
+        let records = [started];
         let second = entry("2");
         // Room for the second film beside the first's bytes on disk, but
         // not beside what the first has yet to write.
@@ -1053,6 +1081,50 @@ mod tests {
         assert_eq!(
             next_action(&q, std::slice::from_ref(&stopped), &tries, "u", 0),
             Action::Idle
+        );
+    }
+
+    /// CR 4666431593 and 4666431608: the bytes an entry still has to write
+    /// count only while it can write, and from the plan's estimate once the
+    /// store has one.
+    #[test]
+    fn outstanding_bytes_count_only_what_can_still_write_from_the_plan() {
+        let e = entry("1");
+        let mut r = record("1", KeptState::Failed { reason: "x".into() }, None);
+        r.estimated_bytes = 600;
+        // Failed with no halt and no Retry: nothing will write.
+        assert_eq!(outstanding_write(&e, &r), None);
+        // A Retry, or a halt a try mends: it writes the plan's rest.
+        let retry = QueueEntry {
+            retry_due: true,
+            ..e.clone()
+        };
+        r.transferred = Some(200);
+        assert_eq!(outstanding_write(&retry, &r), Some(400));
+        r.halt = Some(Halt::Unreachable);
+        assert_eq!(outstanding_write(&e, &r), Some(400));
+        // Not once paused, failed for good, or Ready.
+        let paused = QueueEntry {
+            paused: true,
+            ..e.clone()
+        };
+        assert_eq!(outstanding_write(&paused, &r), None);
+        r.state = KeptState::Ready;
+        assert_eq!(outstanding_write(&e, &r), None);
+        // Before the store has a plan, the queue's estimate.
+        let mut fresh = record(
+            "1",
+            KeptState::Downloading {
+                done: 0,
+                total: 2,
+                bytes: 100,
+            },
+            None,
+        );
+        fresh.estimated_bytes = 0;
+        assert_eq!(
+            outstanding_write(&e, &fresh),
+            Some(e.estimate().saturating_sub(100))
         );
     }
 }
