@@ -80,6 +80,11 @@ pub struct QueueEntry {
     /// give a downloadable stream. Cleared by Retry.
     #[serde(default)]
     pub failed: Option<String>,
+    /// The viewer asked to Retry it: due even though its record carries no
+    /// halt to say so. Kept until a run starts (or it fails for good, or is
+    /// paused), so a Retry deferred behind a closed start gate is not lost.
+    #[serde(default)]
+    pub retry_due: bool,
 }
 
 impl QueueEntry {
@@ -141,7 +146,19 @@ impl Queue {
 
     pub fn set_paused(&mut self, user: &str, item: &str, paused: bool) -> bool {
         self.find_mut(user, item)
-            .map(|e| e.paused = paused)
+            .map(|e| {
+                e.paused = paused;
+                if paused {
+                    e.retry_due = false;
+                }
+            })
+            .is_some()
+    }
+
+    /// Records (or, with `due` false, drops) the viewer's Retry of `item`.
+    pub fn set_retry_due(&mut self, user: &str, item: &str, due: bool) -> bool {
+        self.find_mut(user, item)
+            .map(|e| e.retry_due = due)
             .is_some()
     }
 
@@ -193,6 +210,7 @@ impl Queue {
                     quality_bps: r.quality_bps,
                     paused: r.halt == Some(Halt::Paused),
                     failed: None,
+                    retry_due: false,
                 });
                 changed = true;
             }
@@ -293,6 +311,18 @@ pub fn next_action(
         let t = tries.get(&e.item).copied().unwrap_or_default();
         let action = match record {
             Some(r) if r.ready() => continue,
+            // The viewer's Retry of a stopped record: due whatever halt (or
+            // none) the record carries, except a changed stream, which the
+            // files cannot survive.
+            Some(r)
+                if e.retry_due
+                    && matches!(r.state, KeptState::Failed { .. })
+                    && r.halt != Some(Halt::StreamChanged) =>
+            {
+                Action::Start {
+                    item: e.item.clone(),
+                }
+            }
             Some(r) => match (&r.state, r.halt) {
                 (KeptState::Failed { .. }, Some(Halt::StreamChanged)) => Action::Restart {
                     item: e.item.clone(),
@@ -564,6 +594,7 @@ mod tests {
             quality_bps: 2_000_000,
             paused: false,
             failed: None,
+            retry_due: false,
         }
     }
 
@@ -930,6 +961,50 @@ mod tests {
         assert_eq!(
             waiting_line(Halt::SessionEnded, 0),
             "Reconnecting to the server \u{b7} trying now"
+        );
+    }
+
+    /// A Retry deferred behind a closed start gate is started by the tick
+    /// once the gate opens, though the stopped record carries no halt.
+    #[test]
+    fn a_deferred_retry_is_started_once_the_gate_opens() {
+        let mut q = Queue {
+            entries: vec![entry("1")],
+        };
+        // The viewer's Retry: the failure is cleared, the intent recorded.
+        q.entries[0].failed = Some("gave up".into());
+        q.entries[0].failed = None;
+        assert!(q.set_retry_due("u", "1", true));
+        let stopped = record("1", KeptState::Failed { reason: "x".into() }, None);
+        let other = KeptVideo {
+            user: "u".into(),
+            ..record(
+                "2",
+                KeptState::Downloading {
+                    done: 0,
+                    total: 2,
+                    bytes: 1,
+                },
+                None,
+            )
+        };
+        let tries = HashMap::new();
+        // Gate closed (another download runs): idle, the intent stays.
+        assert_eq!(
+            next_action(&q, &[stopped.clone(), other], &tries, "u", 0),
+            Action::Idle
+        );
+        // Gate open: the tick starts it.
+        assert_eq!(
+            next_action(&q, std::slice::from_ref(&stopped), &tries, "u", 0),
+            Action::Start { item: "1".into() }
+        );
+        // A pause drops the intent; without it the halt-less record waits.
+        q.set_paused("u", "1", true);
+        q.set_paused("u", "1", false);
+        assert_eq!(
+            next_action(&q, std::slice::from_ref(&stopped), &tries, "u", 0),
+            Action::Idle
         );
     }
 }
