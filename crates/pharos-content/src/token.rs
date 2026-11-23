@@ -646,7 +646,15 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // after the rename leaves the new token refused after a restart, not
     // only fenced in this process. A marker that cannot be made durable
     // refuses the sign-in with the old token as it was.
-    let pending = !retrying;
+    // A token already on file and usable (no marker names it) is stored
+    // again with nothing pending: a marker over the active credential would
+    // refuse it after a restart if this store then failed to clear it.
+    let already_usable =
+        matches!(&previous, Some(s) if s.token == token) && matches!(found, Marker::Absent);
+    let pending = !retrying && !already_usable;
+    if already_usable {
+        log::info!("token store verdict=no_pending_marker reason=token_already_usable");
+    }
     if pending {
         if let Err(e) = write_pending_marker(path, &new) {
             log::warn!(
@@ -720,25 +728,6 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             ));
         }
     }
-    // The retry's token is on disk, durably: its marker clears last. One
-    // that will not go keeps the token refused, here by the fence and
-    // after a restart by the marker; a later retry clears it.
-    if clear_after {
-        if let Err(e) = clear_marker(path, &new) {
-            add_fence_held(path, &Fence::token(&new), "store_marker_not_cleared");
-            log::warn!(
-                "token store verdict=refused reason=revocation_marker_blocks_token step=after_write error={e}"
-            );
-            return Err(err(
-                path,
-                format!("{STORE_INCOMPLETE}: the token is written but its unconfirmed-install marker cannot be removed: {e}"),
-            ));
-        }
-        log::info!(
-            "token store verdict={} reason=install_unconfirmed marker=cleared",
-            if retrying { "retried" } else { "confirmed" }
-        );
-    }
     // The hook hears of the store only once the file is read back holding
     // the new token: a fence it lifts is for a token really gone. A store
     // that cannot confirm it is not a success: the file may have changed,
@@ -757,6 +746,25 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     };
     match back {
         Ok(Some(s)) if s.token == token => {
+            // Confirmed: the marker clears last, after the read-back. One
+            // that will not go keeps the token refused, here by the fence
+            // and after a restart by the marker; a later retry clears it.
+            if clear_after {
+                if let Err(e) = clear_marker(path, &new) {
+                    add_fence_held(path, &Fence::token(&new), "store_marker_not_cleared");
+                    log::warn!(
+                        "token store verdict=refused reason=revocation_marker_blocks_token step=after_read_back error={e}"
+                    );
+                    return Err(err(
+                        path,
+                        format!("{STORE_INCOMPLETE}: the token is written but its unconfirmed-install marker cannot be removed: {e}"),
+                    ));
+                }
+                log::info!(
+                    "token store verdict={} reason=install_unconfirmed marker=cleared step=after_read_back",
+                    if retrying { "retried" } else { "confirmed" }
+                );
+            }
             let stored = fingerprint(token);
             let next = fence_held(path).after_store(&stored, replaced.as_deref());
             replace_fence_held(path, next, "token_stored");
@@ -1363,11 +1371,37 @@ fn write_pending_marker(path: &Path, token: &str) -> std::io::Result<()> {
         f.write_all(format!("\n{token}\n{INSTALL_UNCONFIRMED}\n").as_bytes())?;
         f.sync_all()?;
         std::fs::rename(&tmp, &target)?;
-        std::fs::File::open(dir)?.sync_all()
+        match pending_dir_sync(dir) {
+            // A folder that cannot be synced at all offers nothing better
+            // (as for the token's own install): the marker is written and
+            // renamed, not claimed durable.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+                ) =>
+            {
+                log::warn!(
+                    "token store pending marker verdict=written_not_durable reason=dir_sync_unsupported error={e}"
+                );
+                Ok(())
+            }
+            other => other,
+        }
     };
     go().inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// The pending marker's folder sync (the real one: not the install's own
+/// fault hooks).
+fn pending_dir_sync(dir: &Path) -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    if faults::PENDING_DIR_UNSUPPORTED.with(std::cell::Cell::get) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
+    }
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// Writes the marker naming `token` whole: temp file, fsync, rename,
@@ -1407,6 +1441,7 @@ pub mod faults {
         pub static MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The rename that clears a marker fails.
         /// The unconfirmed-install marker written before a replacement.
+        pub static PENDING_DIR_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub static PENDING_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub static MARKER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The marker cannot be read (it is there).
@@ -2185,6 +2220,49 @@ pub(crate) mod tests {
             Some("old"),
             "a store that could not record itself replaced the token"
         );
+    }
+
+    /// CR round 3 (token.rs:661, 1365, 1366): the marker stays until the
+    /// read-back confirms the install; a token already usable gets none; a
+    /// folder whose sync is unsupported still signs in on the pending path.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_pending_marker_outlives_the_install_until_read_back() {
+        let d = dir("pending-until-read-back");
+        let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        // The read-back fails, and so does any repair write of the marker:
+        // only the marker made before the install can keep the token refused.
+        FAIL_READ_BACK.with(|f| f.set(true));
+        faults::MARKER.with(|f| f.set(true));
+        let out = store(&path, "new");
+        faults::MARKER.with(|f| f.set(false));
+        FAIL_READ_BACK.with(|f| f.set(false));
+        assert!(out.is_err(), "{out:?}");
+        assert!(
+            revoked(&path, &fingerprint("new")).is_some(),
+            "the marker was cleared before the read-back"
+        );
+        assert_eq!(after_restart(&path), None);
+        // A token already usable gets no marker: storing it again with the
+        // marker write failing leaves it as it was.
+        let p2 = dir("pending-already-usable").join("device-token");
+        store(&p2, "tok").unwrap();
+        faults::PENDING_MARKER.with(|f| f.set(true));
+        let again = store(&p2, "tok");
+        faults::PENDING_MARKER.with(|f| f.set(false));
+        assert!(again.is_ok(), "{again:?}");
+        assert_eq!(load(&p2).unwrap().as_deref(), Some("tok"));
+        assert_eq!(after_restart(&p2).as_deref(), Some("tok"));
+        // A folder whose sync is unsupported still signs in on the pending
+        // path (the install's own fallback), not claimed durable.
+        let p3 = dir("pending-dir-unsupported").join("device-token");
+        store(&p3, "old").unwrap();
+        faults::PENDING_DIR_UNSUPPORTED.with(|f| f.set(true));
+        let moved = store(&p3, "new");
+        faults::PENDING_DIR_UNSUPPORTED.with(|f| f.set(false));
+        assert!(moved.is_ok(), "{moved:?}");
+        assert_eq!(load(&p3).unwrap().as_deref(), Some("new"));
     }
 
     /// CR reply 4644656366: a retry whose marker clearing cannot be synced
