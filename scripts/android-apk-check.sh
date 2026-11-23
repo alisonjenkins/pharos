@@ -69,17 +69,29 @@ if [ -n "$leanback" ]; then pass "TV launcher entry ($leanback)"; else fail "no 
 
 # The banner: android-apk.sh points it at pharos_banner; dx points it at
 # the icon, which the TV draws as a stretched robot.
+# A release build shortens resource paths (res/WR.png), so names are looked
+# up through the resource table, not read from the path.
+res_files() {
+  printf '%s\n' "$resources" | awk -v want="$1" '
+    $1 == "resource" { in_res = ($3 == want); next }
+    in_res && /\(file\)/ { for (i = 1; i <= NF; i++) if ($i == "(file)") print $(i + 1) }'
+}
 banner=$(printf '%s\n' "$badging" | sed -n "s/^application:.* banner='\([^']*\)'.*/\1/p" | head -n 1)
-case "$banner" in
-  */pharos_banner.png) pass "banner is $banner" ;;
-  *) fail "banner is '$banner', want res/drawable*/pharos_banner.png" ;;
-esac
+banner_files=$(res_files drawable/pharos_banner)
+if [ -n "$banner" ] && printf '%s\n' "$banner_files" | grep -qxF "$banner"; then
+  pass "banner is drawable/pharos_banner ($banner)"
+else
+  fail "banner is '$banner', want drawable/pharos_banner (files: ${banner_files:-none})"
+fi
 
 # The icon: the TV (API 26+) draws the adaptive icon, whose foreground
 # drawable the overlay replaces under dx's own name. Its first path must
 # be the Pharos mark's.
 mark=$(sed -n 's/.*android:pathData="\([^"]*\)".*/\1/p' "$res/drawable-v24/ic_launcher_foreground.xml" | head -n 1)
-foreground=$("$AAPT2" dump xmltree --file res/drawable-v24/ic_launcher_foreground.xml "$apk" 2>&1)
+foreground=""
+for file in $(res_files drawable/ic_launcher_foreground); do
+  foreground+=$("$AAPT2" dump xmltree --file "$file" "$apk" 2>&1)$'\n'
+done
 if [ -n "$mark" ] && printf '%s\n' "$foreground" | grep -qF "$mark"; then
   pass "launcher icon is the Pharos mark"
 else
