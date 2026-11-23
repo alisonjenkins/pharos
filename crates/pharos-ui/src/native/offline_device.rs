@@ -15,6 +15,7 @@
 use pharos_client::api::{ItemKind, ItemRef, PharosApi};
 use pharos_client::CallInfo;
 
+use super::kept_video::{KeptState, KeptVideo};
 use super::offline_library::{Catalogue, OfflineLibrary, OnDevice, STORE_KEY};
 use super::offline_video;
 use super::platform;
@@ -158,10 +159,153 @@ pub fn forget_catalogue() {
     save_catalogue(&Catalogue::default());
 }
 
+/// Whether a downloaded video is listed in the device library, and if not
+/// why (V1512). Logged by [`VideoTally::log_line`], so a missing video
+/// reads off the log instead of being guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoVerdict {
+    /// The signed-in owner's Ready download: listed.
+    Listed,
+    /// The owner's, but not Ready: it cannot play yet.
+    NotReady,
+    /// Another account's: never listed.
+    OtherOwner,
+    /// Nobody confirmed as signed in: nothing is listed.
+    IdentityUnconfirmed,
+}
+
+impl VideoVerdict {
+    pub const ALL: [Self; 4] = [
+        Self::Listed,
+        Self::NotReady,
+        Self::OtherOwner,
+        Self::IdentityUnconfirmed,
+    ];
+
+    /// The reason string logs and dashboards carry.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Listed => "listed",
+            Self::NotReady => "not_ready",
+            Self::OtherOwner => "other_owner",
+            Self::IdentityUnconfirmed => "identity_unconfirmed",
+        }
+    }
+}
+
+/// The verdict for one video, for the confirmed `owner` (`None` until the
+/// identity is confirmed).
+pub fn judge_video(owner: Option<&str>, video: &KeptVideo) -> VideoVerdict {
+    match owner {
+        None => VideoVerdict::IdentityUnconfirmed,
+        Some(owner) if video.user != owner => VideoVerdict::OtherOwner,
+        Some(_) if video.state != KeptState::Ready => VideoVerdict::NotReady,
+        Some(_) => VideoVerdict::Listed,
+    }
+}
+
+/// How many videos got each verdict in one gathering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoTally {
+    pub listed: usize,
+    pub not_ready: usize,
+    pub other_owner: usize,
+    pub identity_unconfirmed: usize,
+    /// Whether an owner was confirmed at all: with none, there is nothing
+    /// to count and the reason is still `identity_unconfirmed`.
+    pub owner_known: bool,
+}
+
+impl VideoTally {
+    /// The first reason that kept something out, else `listed`, else `none`.
+    pub fn reason(&self) -> &'static str {
+        if !self.owner_known || self.identity_unconfirmed > 0 {
+            VideoVerdict::IdentityUnconfirmed.label()
+        } else if self.other_owner > 0 {
+            VideoVerdict::OtherOwner.label()
+        } else if self.not_ready > 0 {
+            VideoVerdict::NotReady.label()
+        } else if self.listed > 0 {
+            VideoVerdict::Listed.label()
+        } else {
+            "none"
+        }
+    }
+
+    /// The line the device library logs. Counts only: no account ids, no
+    /// titles.
+    pub fn log_line(&self) -> String {
+        format!(
+            "pharos: offline library videos reason={} listed={} not_ready={} other_owner={} identity_unconfirmed={}",
+            self.reason(),
+            self.listed,
+            self.not_ready,
+            self.other_owner,
+            self.identity_unconfirmed
+        )
+    }
+}
+
+/// The videos the device library lists: the confirmed owner's Ready ones,
+/// and the tally of every verdict. A store answers per user, but the owner
+/// is checked again here, so a row of another account cannot get in.
+pub fn listed_videos<'a>(
+    owner: Option<&str>,
+    videos: &'a [KeptVideo],
+) -> (Vec<&'a KeptVideo>, VideoTally) {
+    let mut tally = VideoTally {
+        owner_known: owner.is_some(),
+        ..VideoTally::default()
+    };
+    let mut listed = Vec::new();
+    for video in videos {
+        match judge_video(owner, video) {
+            VideoVerdict::Listed => {
+                tally.listed += 1;
+                listed.push(video);
+            }
+            VideoVerdict::NotReady => tally.not_ready += 1,
+            VideoVerdict::OtherOwner => tally.other_owner += 1,
+            VideoVerdict::IdentityUnconfirmed => tally.identity_unconfirmed += 1,
+        }
+    }
+    (listed, tally)
+}
+
+thread_local! {
+    /// The last videos line logged: gathering runs on every refresh, a line
+    /// is for a change.
+    static LAST_VIDEOS_LINE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Logs `tally` when it differs from the last one logged; true if it did.
+fn log_videos(tally: &VideoTally) -> bool {
+    let line = tally.log_line();
+    let new = LAST_VIDEOS_LINE.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.as_deref() == Some(line.as_str()) {
+            false
+        } else {
+            *l = Some(line.clone());
+            true
+        }
+    });
+    if new {
+        platform::info(&line);
+    }
+    new
+}
+
 /// The user whose things are on this device, and the things.
 pub fn on_device() -> Option<(String, Vec<OnDevice>)> {
     let mut user = offline_video::last_user();
-    let mut kept: Vec<OnDevice> = offline_video::ready_for_last_user()
+    // One read of the owner's Ready downloads, judged against the owner
+    // confirmed now.
+    let snapshot = offline_video::ready_snapshot();
+    let (listed, tally) = listed_videos(user.as_deref(), &snapshot.videos);
+    log_videos(&tally);
+    let mut kept: Vec<OnDevice> = listed
         .into_iter()
         .filter_map(|v| {
             let id = v.item.parse::<ItemRef>().ok()?;
@@ -172,7 +316,7 @@ pub fn on_device() -> Option<(String, Vec<OnDevice>)> {
                 } else {
                     ItemKind::Movie
                 },
-                title: v.title,
+                title: v.title.clone(),
                 runtime_ms: v.runtime_ms,
                 position_ms: v.position_ms,
             })
@@ -560,5 +704,173 @@ mod tests {
             filled.log_line(12.4),
             "pharos: offline notes kept=4 noted=2 failed=1 partial=1 pruned=3 refreshed=true signed_out=false ms=12"
         );
+    }
+    fn kept(item: &str, user: &str, state: KeptState) -> KeptVideo {
+        KeptVideo {
+            item: item.into(),
+            version: String::new(),
+            user: user.into(),
+            title: "Invented Film".into(),
+            kind: "movie".into(),
+            runtime_ms: 5_400_000,
+            master_url: "/m.m3u8".into(),
+            audio: None,
+            subtitles: vec![],
+            files: vec![],
+            quality_bps: 2_000_000,
+            estimated_bytes: 1_572_864,
+            state,
+            position_ms: 0,
+            saved_at: "2026-11-16T09:00:00Z".into(),
+            estimate_from_adoption: false,
+            stale_on_disk: 0,
+        }
+    }
+
+    fn downloading() -> KeptState {
+        KeptState::Downloading {
+            done: 1,
+            total: 4,
+            bytes: 10,
+        }
+    }
+
+    /// V1512: only the confirmed owner's Ready videos are listed; each
+    /// other row gets the reason it was kept out.
+    #[test]
+    fn only_the_owners_ready_videos_are_listed() {
+        let rows = [
+            kept("7", "A", KeptState::Ready),
+            kept("8", "A", downloading()),
+            kept("9", "B", KeptState::Ready),
+            kept("10", "A", KeptState::Failed { reason: "x".into() }),
+        ];
+        let (listed, tally) = listed_videos(Some("A"), &rows);
+        assert_eq!(
+            listed.iter().map(|v| v.item.as_str()).collect::<Vec<_>>(),
+            vec!["7"]
+        );
+        assert_eq!(
+            (tally.listed, tally.not_ready, tally.other_owner),
+            (1, 2, 1)
+        );
+        // Nobody confirmed: nothing is listed, whoever owns the rows.
+        let (listed, tally) = listed_videos(None, &rows);
+        assert!(listed.is_empty());
+        assert_eq!(tally.identity_unconfirmed, 4);
+        assert_eq!(tally.reason(), "identity_unconfirmed");
+        // B is signed in: A's rows are never listed.
+        let (listed, _) = listed_videos(Some("B"), &rows);
+        assert_eq!(
+            listed.iter().map(|v| v.item.as_str()).collect::<Vec<_>>(),
+            vec!["9"]
+        );
+    }
+
+    /// The reason strings are a log contract: four, distinct, stable.
+    #[test]
+    fn the_video_verdict_labels_are_distinct_and_stable() {
+        let labels: Vec<_> = VideoVerdict::ALL.iter().map(|v| v.label()).collect();
+        assert_eq!(
+            labels,
+            ["listed", "not_ready", "other_owner", "identity_unconfirmed"]
+        );
+        let tally = |rows: &[KeptVideo], owner| listed_videos(owner, rows).1;
+        let a = kept("7", "A", KeptState::Ready);
+        assert_eq!(
+            tally(std::slice::from_ref(&a), Some("A")).reason(),
+            "listed"
+        );
+        assert_eq!(
+            tally(std::slice::from_ref(&a), Some("B")).reason(),
+            "other_owner"
+        );
+        assert_eq!(
+            tally(&[kept("8", "A", downloading())], Some("A")).reason(),
+            "not_ready"
+        );
+        assert_eq!(tally(&[a], None).reason(), "identity_unconfirmed");
+        assert_eq!(tally(&[], Some("A")).reason(), "none");
+        let line = tally(&[kept("8", "A", downloading())], Some("A")).log_line();
+        assert_eq!(
+            line,
+            "pharos: offline library videos reason=not_ready listed=0 not_ready=1 other_owner=0 identity_unconfirmed=0"
+        );
+        assert!(!line.contains("Invented"), "a title reached the log");
+    }
+
+    /// One line per change, not one per refresh.
+    #[test]
+    fn a_repeated_video_verdict_is_logged_once() {
+        let rows = [kept("7", "A", KeptState::Ready)];
+        let tally = listed_videos(Some("A"), &rows).1;
+        assert!(log_videos(&tally));
+        assert!(!log_videos(&tally));
+        let other = listed_videos(Some("B"), &rows).1;
+        assert!(log_videos(&other));
+    }
+
+    /// End to end through the gathering the device library is built from:
+    /// a store that answers every account's rows still lists only the
+    /// signed-in owner's Ready ones, as `OnDevice::Video` items.
+    #[test]
+    fn the_device_library_lists_the_signed_in_owners_ready_videos() {
+        use super::super::kept_video::{KeepVideoRefusal, KeepVideoRequest, VideoStore};
+        use super::super::ports::{use_test_video_slot, Slot};
+        struct Leaky;
+        impl VideoStore for Leaky {
+            fn videos(&self, _: &str) -> Vec<KeptVideo> {
+                vec![
+                    kept("7", "A", KeptState::Ready),
+                    kept("8", "A", downloading()),
+                    kept("9", "B", KeptState::Ready),
+                ]
+            }
+            fn ready_videos(&self, user: &str) -> Vec<KeptVideo> {
+                self.videos(user)
+            }
+            fn start(&self, _: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+                Ok(())
+            }
+            fn remove(&self, _: &str, _: &str) {}
+            fn save_position(&self, _: &str, _: &str, _: u64) {}
+            fn cap_bytes(&self) -> u64 {
+                0
+            }
+            fn used_bytes(&self, _: &str) -> u64 {
+                0
+            }
+            fn free_bytes(&self) -> u64 {
+                0
+            }
+        }
+        static SLOT: Slot<dyn VideoStore> = Slot::new();
+        SLOT.set(std::sync::Arc::new(Leaky)).ok();
+        use_test_video_slot(Some(&SLOT));
+        // Nobody is signed in: nothing, so no library.
+        offline_video::forget_user();
+        assert!(device_library().is_none());
+        let _ = platform::take_info_lines();
+        offline_video::remember_user("A");
+        let (user, kept) = on_device().expect("A's video is on the device");
+        // The verdict is logged with its reason and the counts behind it.
+        let lines = platform::take_info_lines();
+        assert!(
+            lines.iter().any(|l| l
+                == "pharos: offline library videos reason=other_owner listed=1 not_ready=1 other_owner=1 identity_unconfirmed=0"),
+            "{lines:?}"
+        );
+        assert_eq!(user, "A");
+        let ids: Vec<_> = kept
+            .iter()
+            .filter_map(|k| match k {
+                OnDevice::Video { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![ItemRef::Real(7)]);
+        assert!(device_library().is_some());
+        offline_video::forget_user();
+        use_test_video_slot(None);
     }
 }

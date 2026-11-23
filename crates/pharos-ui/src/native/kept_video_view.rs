@@ -865,84 +865,6 @@ pub fn VideoCapSetting(cap: u64, notice: Option<String>, on_pick: EventHandler<S
     }
 }
 
-/// Bumped when the ready videos differ from the snapshot the offline start
-/// rendered: the start reads it ([`shown_ready_snapshot`]), so it reads,
-/// logs and renders a new snapshot.
-static OFFLINE_READY_CHANGED: GlobalSignal<u32> = Signal::global(|| 0);
-
-thread_local! {
-    /// The snapshot the offline start last rendered from, empty included:
-    /// what [`check_offline_ready`] compares the store with.
-    static LAST_READY: RefCell<Option<offline_video::ReadyVideos>> = const { RefCell::new(None) };
-}
-
-/// The ready videos for the offline start, read once per render: it renders
-/// again when they change or a store is published.
-pub fn shown_ready_snapshot() -> offline_video::ReadyVideos {
-    let _ = OFFLINE_READY_CHANGED.read();
-    let _ = shown_video_store();
-    let snap = offline_video::ready_snapshot();
-    LAST_READY.with(|l| *l.borrow_mut() = Some(snap.clone()));
-    snap
-}
-
-/// One poll of the ready videos against the snapshot the offline start
-/// last rendered, an empty one included: when they differ (the first video
-/// turning Ready, say), the start renders again with a new read. True
-/// then. Nothing before the start has rendered once.
-pub fn check_offline_ready() -> bool {
-    let now = offline_video::ready_snapshot();
-    let was = LAST_READY.with(|l| {
-        let mut l = l.borrow_mut();
-        match l.as_ref() {
-            Some(was) if *was != now => l.replace(now.clone()),
-            _ => None,
-        }
-    });
-    let Some(was) = was else {
-        return false;
-    };
-    platform::info(&format!(
-        "pharos: offline videos verdict=changed from={} to={} owner={:?}",
-        was.videos.len(),
-        now.videos.len(),
-        now.owner
-    ));
-    *OFFLINE_READY_CHANGED.write() += 1;
-    true
-}
-
-/// The offline start's list of videos: the ready ones, which play with no
-/// server. `ready` is the snapshot the parent read, logged and chose this
-/// screen by, and the rows render from it; nothing when it is empty. Not
-/// read again for the render: a poll that finds the videos changed has the
-/// parent take a new snapshot instead. Mounted with an empty snapshot too
-/// (the waiting page, the books' list), so the first video turning Ready
-/// is seen there.
-#[component]
-pub fn OfflineVideos(ready: offline_video::ReadyVideos) -> Element {
-    use_future(move || async move {
-        poll_every(
-            platform::SLEEP_IS_REAL,
-            || platform::sleep_ms(POLL_MS),
-            || {
-                check_offline_ready();
-                true
-            },
-        )
-        .await;
-    });
-    if ready.videos.is_empty() {
-        return rsx! {};
-    }
-    rsx! {
-        section { class: "pharos-offline", id: "pharos-offline-videos",
-            h2 { "Offline: videos on this device" }
-            VideoDownloads { settings: false, rows: Some(ready) }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1276,34 +1198,6 @@ mod tests {
         );
         assert!(!html.contains("disabled"), "a retry is not offered: {html}");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a second discard ran");
-    }
-
-    /// The offline start's video section renders from the count its parent
-    /// read and logged, not a later read: a video gone in between leaves
-    /// the section the verdict named, never a blank screen.
-    #[test]
-    fn the_offline_videos_render_from_the_parents_read() {
-        assert!(offline_video::ready_for_last_user().is_empty());
-        fn root() -> Element {
-            rsx! {
-                OfflineVideos {
-                    ready: offline_video::ReadyVideos {
-                        owner: Some("A".into()),
-                        videos: vec![video("7", KeptState::Ready)],
-                    },
-                }
-            }
-        }
-        let mut dom = VirtualDom::new(root);
-        dom.rebuild_in_place();
-        let html = dioxus_ssr::render(&dom);
-        assert!(html.contains("Offline: videos on this device"), "{html}");
-        fn none() -> Element {
-            rsx! { OfflineVideos { ready: offline_video::ReadyVideos::default() } }
-        }
-        let mut dom = VirtualDom::new(none);
-        dom.rebuild_in_place();
-        assert_eq!(dioxus_ssr::render(&dom), "");
     }
 
     /// CR 4638524434: the offline start renders the rows of the snapshot its
