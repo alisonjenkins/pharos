@@ -6209,6 +6209,14 @@ impl Playing {
             .save_position(&save.user, &self.detail.item.id.to_string(), at_ms);
     }
 
+    /// Whether the player takes no more media events or lifecycle changes:
+    /// it is handing over (`retiring`), or a reconnect retired its owner
+    /// ([`Self::retire_if_owner_lost`]), after which a `timeupdate` must not
+    /// set the carried position again.
+    fn is_retired(&self, retiring: bool) -> bool {
+        retiring || self.owner_gone.get()
+    }
+
     /// After a reconnect: when this downloaded copy's owner is no longer
     /// the authorized one, keeps their place, retires the player from
     /// saving anything more (its own stop carries the reset zero) and says
@@ -7985,7 +7993,7 @@ fn Player(
         move || {
             Rc::new(platform::on_page_lifecycle(
                 move || {
-                    if retiring.get() {
+                    if p.is_retired(retiring.get()) {
                         return;
                     }
                     let here = io.read().position_ms(VIDEO_ID);
@@ -8669,7 +8677,7 @@ fn Player(
         let autoplays = autoplay_after(grouped, start_paused);
         let autoplay_checked = Rc::clone(&autoplay_checked);
         move |event: MediaEvent| {
-            if retiring.get() {
+            if p.is_retired(retiring.get()) {
                 return;
             }
             // The `autoplay` attribute fails silently when the browser
@@ -10319,7 +10327,9 @@ mod tests {
         assert!(p.0.save_offline(0));
         let id: ItemRef = "7".parse().unwrap();
         let carried = Cell::new(90_000u64);
+        assert!(!p.0.is_retired(false), "an active player was retired");
         assert!(p.0.retire_if_owner_lost(id, Some("B"), &carried));
+        assert!(p.0.is_retired(false), "a retired player took time updates");
         // The player's stop, after the reset.
         assert!(p.0.save_offline(carried.get()));
         assert_eq!(
