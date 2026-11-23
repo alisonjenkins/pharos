@@ -3768,7 +3768,7 @@ async fn plan_and_admit(
     emit(
         false,
         format!(
-            "pharos: video keep start item={item} quality={} files={} estimate={estimate} resume={resume}",
+            "pharos: video keep start item={item} quality_bps={} files={} estimate={estimate} resume={resume}",
             record.quality_bps,
             all.len()
         ),
@@ -7193,6 +7193,11 @@ pub(crate) mod tests {
         assert_eq!(start.len(), 1);
         assert!(
             start[0].contains("item=1") && start[0].contains("files=5"),
+            "{start:?}"
+        );
+        // CR review 6018104500 (kept_video_disk.rs:3771): V1465's field name.
+        assert!(
+            start[0].contains(&format!("quality_bps={DEFAULT_QUALITY_BPS} ")),
             "{start:?}"
         );
         let ready = lines("pharos: video keep ready");
