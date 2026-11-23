@@ -5947,6 +5947,7 @@ impl VideoStore for DiskVideoStore {
                 KeepVideoRefusal::Host(format!("the download's record could not be saved: {e}"));
             #[cfg(test)]
             tests::before_start_rollback();
+            let mut partial = None::<String>;
             let rolled_back = {
                 let _admission = budget.admission_guard();
                 let mut st = lock(&self.inner.state);
@@ -5973,9 +5974,27 @@ impl VideoStore for DiskVideoStore {
                         // The folder is the tombstone's again, as it was
                         // measured.
                         let dir = self.inner.item_dir(&user, &item);
+                        // The failed write may have left a partial manifest
+                        // in the folder the tombstone is measured as: the
+                        // figure does not count it. It goes first, only while
+                        // this start owns the item; when that cannot be
+                        // confirmed the folder stays unknown until a sweep
+                        // measures it whole.
+                        let outcome = match std::fs::remove_file(dir.join("manifest.json.part")) {
+                            Ok(()) => "removed".to_owned(),
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                "absent".to_owned()
+                            }
+                            Err(e) => format!("not_removed error={e}"),
+                        };
+                        let exact = outcome == "removed" || outcome == "absent";
+                        partial = Some(outcome);
                         let epoch = st.epoch(&dir);
                         st.tombstones.push((dir.clone(), left));
-                        st.measured.insert(dir, (epoch, true));
+                        // Exact only with the partial manifest gone.
+                        if exact {
+                            st.measured.insert(dir, (epoch, true));
+                        }
                     }
                 }
                 ours
@@ -5983,7 +6002,8 @@ impl VideoStore for DiskVideoStore {
             emit(
                 true,
                 format!(
-                    "pharos: video keep refused item={item} reason={refusal} verdict={} run={run_id}",
+                    "pharos: video keep refused item={item} reason={refusal} partial_manifest={} verdict={} run={run_id}",
+                    partial.as_deref().unwrap_or("not_applicable"),
                     if rolled_back {
                         "rolled_back"
                     } else {
@@ -14141,6 +14161,54 @@ pub(crate) mod tests {
         store.settled().await;
         FAIL_REMOVE.with(|f| f.set(false));
         assert_eq!(store.videos("u1").len(), 2);
+    }
+
+    /// A start that absorbed a tombstone and could not save its record puts
+    /// the tombstone back as it was measured, but the failed write may have
+    /// left a partial manifest the figure does not count: it is removed
+    /// first. One that cannot be confirmed gone leaves the folder unknown.
+    #[tokio::test]
+    async fn a_rolled_back_takeover_clears_the_partial_manifest_before_it_is_exact() {
+        for (name, as_dir) in [("rollback-part", false), ("rollback-part-stuck", true)] {
+            let rig = Rig::new(name);
+            let store = rig.open();
+            store.start(request("1")).unwrap();
+            store.settled().await;
+            FAIL_REMOVE.with(|f| f.set(true));
+            store.remove("u1", "1");
+            assert!(store.kept_bytes() > 0, "{name}: no tombstone");
+            let dir = rig.dir.join("u1").join("1");
+            let part = dir.join("manifest.json.part");
+            if as_dir {
+                // Cannot be removed as a file, and fails the write.
+                std::fs::create_dir_all(&part).unwrap();
+            } else {
+                // The write gets as far as the partial file, then fails at
+                // the rename over a folder.
+                std::fs::create_dir_all(dir.join("manifest.json")).unwrap();
+            }
+            let Err(KeepVideoRefusal::Host(_)) = store.start(request("1")) else {
+                panic!("{name}: started without a durable record");
+            };
+            FAIL_REMOVE.with(|f| f.set(false));
+            if as_dir {
+                // Read without a sweep, which would measure it whole at once.
+                assert!(
+                    lock(&store.inner.state).unknown_folder().is_some(),
+                    "{name}: an unconfirmed partial left the folder exact"
+                );
+            } else {
+                assert!(!part.exists(), "{name}: the partial manifest stayed");
+                assert!(!store.size_unknown(), "{name}: the folder is unknown");
+            }
+            assert!(
+                lines("pharos: video keep refused")
+                    .iter()
+                    .any(|l| l.contains("partial_manifest=")),
+                "{name}: {:?}",
+                captured()
+            );
+        }
     }
 
     /// A listing that comes back short at the prune never shrinks the
