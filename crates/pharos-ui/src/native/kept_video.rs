@@ -207,6 +207,29 @@ impl KeptVideo {
     }
 }
 
+/// Drops from `tails` every short last segment that `files` (every playlist's
+/// list, together) names more than once: a sliver one playlist may go without
+/// is a file another needs whole, and its failed fetch is never excused.
+/// Returns the keys dropped.
+pub fn keep_only_unshared_tails(
+    tails: &mut std::collections::HashSet<String>,
+    files: &[String],
+) -> Vec<String> {
+    let mut listed: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in files {
+        *listed.entry(f.as_str()).or_default() += 1;
+    }
+    let shared: Vec<String> = tails
+        .iter()
+        .filter(|t| listed.get(t.as_str()).copied().unwrap_or(0) != 1)
+        .cloned()
+        .collect();
+    for t in &shared {
+        tails.remove(t);
+    }
+    shared
+}
+
 /// What the Download control hands the store to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeepVideoRequest {
@@ -1270,6 +1293,21 @@ mod tests {
         assert!(!runs.put_in_flight_from_another("u", "2", new));
         runs.end_put("u", "1", old);
         assert!(!runs.put_in_flight_from_another("u", "1", new));
+    }
+
+    /// CR outside-diff (kept_video_web.rs:524): a short tail another playlist
+    /// lists too is a file it needs whole, so it is not excused.
+    #[test]
+    fn a_short_tail_another_playlist_lists_is_not_excused() {
+        let files = |u: &[&str]| u.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut tails: std::collections::HashSet<String> =
+            ["a.m4s".to_owned(), "b.m4s".to_owned()].into();
+        let dropped = keep_only_unshared_tails(
+            &mut tails,
+            &files(&["0.m4s", "a.m4s", "0.m4s", "a.m4s", "b.m4s"]),
+        );
+        assert_eq!(dropped, vec!["a.m4s".to_owned()]);
+        assert_eq!(tails, ["b.m4s".to_owned()].into());
     }
 
     /// A plan lands on a download that was paused meanwhile without
