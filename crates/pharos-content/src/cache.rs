@@ -1733,6 +1733,9 @@ impl Cache {
         }
         let mut stopped = false;
         let mut parts_evicted = false;
+        // The measured room fell short of what the lengths claimed: the
+        // refusal, if no part is left, is `confirm`'s (reclaim_short).
+        let mut measured_short = false;
         while now < want {
             let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
                 break;
@@ -1773,13 +1776,30 @@ impl Cache {
                 now = now.saturating_add(bytes);
                 evicted_n += 1;
                 parts_evicted = true;
+                // A part's length is no measure of what it freed (it may be
+                // sparse): once the lengths claim enough, the room is
+                // measured, and a shortfall goes on to the next part
+                // instead of refusing with parts still to give. A probe
+                // that fails changes nothing here: `confirm` refuses it.
+                if now >= want {
+                    if let Ok(f) = (self.free)(&self.dir) {
+                        let measured = f.saturating_add(reclaim.bytes());
+                        if measured < want {
+                            log::info!(
+                                "cache admission id={downloading} verdict=continue reason=measured_short after=part_evicted free_bytes={f} estimated={now} want={want} evicted={evicted_n}"
+                            );
+                            now = measured;
+                            measured_short = true;
+                        }
+                    }
+                }
             }
         }
         if evicted {
             self.persist_locked(&s);
         }
         let room = now.saturating_sub(outstanding);
-        if now < want {
+        if now < want && !(parts_evicted && measured_short) {
             if replacing {
                 // Counted as enough, but a victim would not go. Evicted
                 // tracks are gone; the part is kept as it was.
@@ -2436,6 +2456,40 @@ pub(crate) mod tests {
             }),
             "{lines:?}"
         );
+    }
+
+    /// CR review 6018104500 (cache.rs:1758-1760): a victim part that freed
+    /// less than its length (sparse) does not end the eviction while other
+    /// parts remain: the next goes, and the replacement is admitted once the
+    /// measured room is enough.
+    #[test]
+    fn a_sparse_victim_does_not_stop_eviction_while_parts_remain() {
+        let d = tmp("replace-evict-sparse-then-real");
+        let c = Cache::open_with_probe(&d, 1 << 30, disk_of(&d, MIN_FREE_BYTES + 20_000)).unwrap();
+        std::fs::write(c.part_path("track/x"), vec![1u8; 600]).unwrap();
+        // The oldest retained part is sparse (1000 long, holding nothing);
+        // the next holds its 1000 bytes.
+        std::fs::File::create(c.part_path("track/y"))
+            .unwrap()
+            .set_len(1000)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(c.part_path("track/z"), vec![2u8; 1000]).unwrap();
+        let free = (c.free)(&d).unwrap();
+        // Y's length alone would cover this; the room y frees (nothing, plus
+        // x's 600) does not.
+        let need = (free + 700).saturating_sub(MIN_FREE_BYTES);
+        crate::testlog::start();
+        let verdict = c.ensure_free_replacing_part("track/x", need, true);
+        let lines = crate::testlog::lines();
+        assert!(verdict.is_ok(), "{verdict:?} {lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("verdict=continue reason=measured_short")),
+            "{lines:?}"
+        );
+        assert!(!c.part_path("track/z").exists(), "the next part was kept");
     }
 
     /// CR 4644634482: a replacement that eviction could not make room for
