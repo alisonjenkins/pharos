@@ -1292,6 +1292,20 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
     }
 }
 
+/// The task that gives a write's count back: it waits for the browser's
+/// write (`settled`) and only then drops `guard`. It runs on its own, so a
+/// caller dropped while the write is pending (a sibling failed) does not
+/// release the count early: the write still runs, and a successor stays
+/// fenced until it settles. Generic over the future so the host tests it.
+pub async fn release_when_settled<S, F>(settled: S, guard: OnDrop<F>)
+where
+    S: std::future::Future,
+    F: FnOnce(),
+{
+    let _ = settled.await;
+    drop(guard);
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1315,6 +1329,57 @@ mod tests {
         assert!(runs.borrow().put_in_flight_from_another("u", "1", new));
         // The independent task finishes with the browser's write.
         drop(guard);
+        assert!(!runs.borrow().put_in_flight_from_another("u", "1", new));
+    }
+
+    /// A write that settles when the test says so: the browser's promise.
+    #[derive(Clone, Default)]
+    struct Settle(std::rc::Rc<std::cell::Cell<bool>>);
+
+    impl std::future::Future for Settle {
+        type Output = ();
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if self.0.get() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    /// CR (kept_video_web.rs:405): the real settle task holds the count
+    /// after its caller is dropped mid-write, and gives it back only once
+    /// the write settles, so the successor is released then and not before.
+    #[test]
+    fn a_successor_is_released_only_after_the_write_settles() {
+        use std::future::Future as _;
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let runs = std::rc::Rc::new(std::cell::RefCell::new(RunIds::default()));
+        let old = runs.borrow_mut().claim("u", "1");
+        runs.borrow_mut().begin_put("u", "1", old);
+        let guard = OnDrop::new({
+            let runs = runs.clone();
+            move || runs.borrow_mut().end_put("u", "1", old)
+        });
+        let write = Settle::default();
+        let mut task = Box::pin(release_when_settled(write.clone(), guard));
+        // The caller awaits the same write, is polled, then dropped because
+        // a sibling file failed.
+        let mut caller = Box::pin(write.clone());
+        assert!(caller.as_mut().poll(&mut cx).is_pending());
+        drop(caller);
+        let new = runs.borrow_mut().claim("u", "1");
+        assert!(task.as_mut().poll(&mut cx).is_pending());
+        assert!(
+            runs.borrow().put_in_flight_from_another("u", "1", new),
+            "the successor ran while the write was pending"
+        );
+        // The browser settles the write; the task releases the successor.
+        write.0.set(true);
+        assert!(task.as_mut().poll(&mut cx).is_ready());
         assert!(!runs.borrow().put_in_flight_from_another("u", "1", new));
     }
 
