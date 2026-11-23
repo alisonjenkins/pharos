@@ -586,6 +586,9 @@ pub trait Resumer {
 pub enum TokenDropped {
     /// Removed, or marked revoked on disk: it never resumes again.
     Gone,
+    /// Removed, so refused in this process, but the folder's entry could
+    /// not be made durable: a restart may bring the token back.
+    GoneNotDurable,
     /// A sign-in replaced it since: the replacement is kept, and resumed.
     Replaced,
     /// Neither removed nor marked: this process refuses it (fenced), but
@@ -606,6 +609,10 @@ pub enum Resumed<A, E> {
     /// marked revoked: signed out in this process, but a restart may
     /// resume the account. Never retried.
     RefusedNotForgotten,
+    /// The server refused the token and it was removed, but the removal
+    /// may not be on disk: signed out in this process, and a restart may
+    /// resume the account. Never retried.
+    RefusedNotDurable,
     /// Each token read was replaced by a sign-in before its refusal came
     /// back, [`RESUME_TRIES`] times: the latest is kept, for the next
     /// attempt.
@@ -630,6 +637,12 @@ pub async fn resume_session<R: Resumer>(r: &R) -> Resumed<R::Api, R::Error> {
             Ok(api) => return Resumed::Opened(Session::opened(api, Some(token))),
             Err(ResumeError::Refused) => match r.forget_token(&token) {
                 TokenDropped::Gone => return Resumed::Refused,
+                TokenDropped::GoneNotDurable => {
+                    super::platform::warn(&format!(
+                        "pharos: resume verdict=refused_not_durable reason=token_removal_not_synced attempt={attempt}"
+                    ));
+                    return Resumed::RefusedNotDurable;
+                }
                 TokenDropped::Unsafe => {
                     super::platform::warn(&format!(
                         "pharos: resume verdict=refused_not_forgotten reason=token_neither_removed_nor_marked attempt={attempt}"
@@ -2893,6 +2906,24 @@ pub(crate) mod tests {
             Resumed::RefusedNotForgotten
         ));
         assert_eq!(*r.sent.borrow(), ["tokX"], "an unsafe end was retried");
+    }
+
+    /// A refused token whose removal could not be made durable is
+    /// its own outcome, not a plain refusal: the caller can warn that a
+    /// restart may resume it. It is never retried.
+    #[test]
+    fn a_refused_token_removed_but_not_durably_is_its_own_outcome() {
+        use super::super::token_file;
+        let d = TmpDir::new("resume-not-durable");
+        let path = d.path().join("device-token");
+        let r = FakeResumer::new(&path);
+        token_file::store(&path, "tokX").unwrap();
+        r.forget_ends.set(Some(TokenDropped::GoneNotDurable));
+        assert!(matches!(
+            run(resume_session(&r)),
+            Resumed::RefusedNotDurable
+        ));
+        assert_eq!(*r.sent.borrow(), ["tokX"], "a not-durable end was retried");
     }
 
     /// A sign-in that stores B's token while a refusal of the old token is
