@@ -447,10 +447,16 @@ mod tests {
 
     /// Reads what the server sends until the hold is reached, then a moment
     /// more: the body bytes received by then.
+    ///
+    /// The server and socket stay up past the check: `release` is set, and
+    /// the rest of the response must arrive (`complete` says when it has),
+    /// or the hold never let go.
     fn body_at_hold(
         script: Script,
         path: &str,
         reached: &std::sync::atomic::AtomicBool,
+        release: &std::sync::atomic::AtomicBool,
+        complete: fn(&[u8]) -> bool,
     ) -> Vec<u8> {
         let server = TestServer::start(script);
         let mut sock = std::net::TcpStream::connect(server.addr).unwrap();
@@ -472,8 +478,29 @@ mod tests {
             reached.load(std::sync::atomic::Ordering::SeqCst),
             "the hold was never reached"
         );
+        let held = got.len();
+        release.store(true, std::sync::atomic::Ordering::SeqCst);
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let mut waited = 0;
+        while !complete(&got) && waited < 50 {
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(_) => waited += 1,
+            }
+        }
+        assert!(
+            complete(&got),
+            "the response never completed after the hold was released ({} bytes)",
+            got.len()
+        );
         let head = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-        got.split_off(head)
+        let mut body = got.split_off(head);
+        // Only what had arrived at the hold, as before.
+        body.truncate(held.saturating_sub(head));
+        drop(server);
+        body
     }
 
     /// A hold stops after exactly the bytes asked for, on a known-length
@@ -484,7 +511,11 @@ mod tests {
         let (script, release, reached) = Script::default()
             .file("/f", vec![7; 10_000])
             .hold_after(9_999);
-        let body = body_at_hold(script, "/f", &reached);
+        let body = body_at_hold(script, "/f", &reached, &release, |b| {
+            b.windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .is_some_and(|h| b.len() - (h + 4) >= 10_000)
+        });
         assert_eq!(
             body.len(),
             9_999,
@@ -497,7 +528,9 @@ mod tests {
             .chunked()
             .chunk_bytes(4096)
             .hold_after(5_000);
-        let body = body_at_hold(script, "/c", &reached);
+        let body = body_at_hold(script, "/c", &reached, &release, |b| {
+            b.ends_with(b"0\r\n\r\n")
+        });
         // Chunk framing: 4096 bytes, then the split 904.
         let data: usize = String::from_utf8_lossy(&body)
             .split("\r\n")
@@ -512,7 +545,11 @@ mod tests {
         // A hold at 0: the headers, and no body byte.
         let (script, release, reached) =
             Script::default().file("/z", vec![7; 10_000]).hold_after(0);
-        let body = body_at_hold(script, "/z", &reached);
+        let body = body_at_hold(script, "/z", &reached, &release, |b| {
+            b.windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .is_some_and(|h| b.len() - (h + 4) >= 10_000)
+        });
         assert!(
             body.is_empty(),
             "{} body bytes went past a hold at 0",
