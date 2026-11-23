@@ -629,8 +629,8 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // restart. Any other marker naming this token names one not on file:
     // cleared first, durably, so a write that fails leaves nothing
     // readable and the old token as it was.
-    let clear_after = same && retry;
-    if clear_after {
+    let retrying = same && retry;
+    if retrying {
         // Nothing to remove before the write.
     } else if let Err(e) = clear_marker(path, &new) {
         log::warn!(
@@ -641,6 +641,24 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             format!("the revocation marker refuses the new token and cannot be removed: {e}"),
         ));
     }
+    // The install is pending until it is confirmed: its own marker is made
+    // durable BEFORE the token is replaced, so a crash or a failed write
+    // after the rename leaves the new token refused after a restart, not
+    // only fenced in this process. A marker that cannot be made durable
+    // refuses the sign-in with the old token as it was.
+    let pending = !retrying;
+    if pending {
+        if let Err(e) = write_pending_marker(path, &new) {
+            log::warn!(
+                "token store verdict=refused reason=pending_install_not_recorded step=before_write error={e}"
+            );
+            return Err(refused(
+                path,
+                format!("the install cannot be recorded before the token is replaced: {e}"),
+            ));
+        }
+    }
+    let clear_after = retrying || pending;
     // A pairing that survived from an earlier install of this very token
     // (A, then B, then A again, its unlink failing each time) would name
     // a user this sign-in has not confirmed once the file holds A again:
@@ -716,7 +734,10 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
                 format!("{STORE_INCOMPLETE}: the token is written but its unconfirmed-install marker cannot be removed: {e}"),
             ));
         }
-        log::info!("token store verdict=retried reason=install_unconfirmed marker=cleared");
+        log::info!(
+            "token store verdict={} reason=install_unconfirmed marker=cleared",
+            if retrying { "retried" } else { "confirmed" }
+        );
     }
     // The hook hears of the store only once the file is read back holding
     // the new token: a fence it lifts is for a token really gone. A store
@@ -1314,6 +1335,41 @@ fn write_marker(
     put_marker(path, token, format!("{user}\n{token}\n{kind}\n").as_bytes())
 }
 
+/// The unconfirmed-install marker written before a token is replaced
+/// ([`store`]): whole and durable (fsync, rename, the folder's real sync),
+/// so a crash after the rename cannot keep the token and lose the record
+/// that refuses it. It is the one marker write that does not go through
+/// [`sync_dir`]'s fault hooks, which model the install's own folder.
+fn write_pending_marker(path: &Path, token: &str) -> std::io::Result<()> {
+    #[cfg(debug_assertions)]
+    if faults::PENDING_MARKER.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("pending marker write failed"));
+    }
+    let target = revoked_path(path, token);
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("no directory"))?;
+    let mut tmp_name = target.as_os_str().to_owned();
+    tmp_name.push(".new");
+    let tmp = PathBuf::from(tmp_name);
+    let go = || -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(format!("\n{token}\n{INSTALL_UNCONFIRMED}\n").as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &target)?;
+        std::fs::File::open(dir)?.sync_all()
+    };
+    go().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
 /// Writes the marker naming `token` whole: temp file, fsync, rename,
 /// folder sync.
 fn put_marker(path: &Path, token: &str, contents: &[u8]) -> std::io::Result<()> {
@@ -1350,6 +1406,8 @@ pub mod faults {
         pub static REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub static MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The rename that clears a marker fails.
+        /// The unconfirmed-install marker written before a replacement.
+        pub static PENDING_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         pub static MARKER_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// The marker cannot be read (it is there).
         pub static MARKER_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2090,6 +2148,43 @@ pub(crate) mod tests {
         assert!(crate::testlog::lines()
             .iter()
             .any(|l| l.contains("verdict=retried reason=install_unconfirmed marker=cleared")));
+    }
+
+    /// CR outside-diff (token.rs:777): the install's own marker is made
+    /// durable before the token is replaced. With the post-install marker
+    /// write failing too (the folder will not sync), the token on file is
+    /// still refused after a restart; and a marker that cannot be made
+    /// durable refuses the sign-in with the old token as it was.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_unconfirmed_install_stays_refused_when_the_later_marker_write_fails() {
+        let d = dir("pending-marker");
+        let path = d.join("device-token");
+        store(&path, "old").unwrap();
+        FAIL_DIR_SYNC.with(|f| f.set(true));
+        faults::MARKER.with(|f| f.set(true));
+        let out = store(&path, "new");
+        faults::MARKER.with(|f| f.set(false));
+        FAIL_DIR_SYNC.with(|f| f.set(false));
+        assert!(out.is_err(), "{out:?}");
+        assert_eq!(
+            after_restart(&path),
+            None,
+            "the unconfirmed token became readable after a restart"
+        );
+        // No marker, no replacement: the old token stays.
+        let d2 = dir("pending-marker-refused");
+        let p2 = d2.join("device-token");
+        store(&p2, "old").unwrap();
+        faults::PENDING_MARKER.with(|f| f.set(true));
+        let refused = store(&p2, "new");
+        faults::PENDING_MARKER.with(|f| f.set(false));
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(
+            load(&p2).unwrap().as_deref(),
+            Some("old"),
+            "a store that could not record itself replaced the token"
+        );
     }
 
     /// CR reply 4644656366: a retry whose marker clearing cannot be synced
