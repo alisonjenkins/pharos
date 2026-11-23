@@ -1031,6 +1031,9 @@ struct SessionEnded {
     /// token, so its owner comes from the token's pairing alone.
     token_user: Option<String>,
     token: Option<TokenSeen>,
+    /// Nobody was signed in: an earlier session end already fenced and
+    /// parked, and nothing can have started since.
+    already_ended: bool,
 }
 
 /// The first step of every sign-out and session end: fence first, then
@@ -1050,6 +1053,7 @@ fn fence_signed_out(take_token: bool) -> SessionEnded {
         } else {
             None
         };
+        let already_ended = st.identity == Identity::SignedOut;
         st.identity = Identity::SignedOut;
         st.refusal_logged = false;
         st.generation = st.generation.wrapping_add(1);
@@ -1058,6 +1062,7 @@ fn fence_signed_out(take_token: bool) -> SessionEnded {
                 user,
                 token_user,
                 token,
+                already_ended,
             },
             st.generation,
         )
@@ -1071,7 +1076,13 @@ fn fence_signed_out(take_token: bool) -> SessionEnded {
 /// The second step: the ended user's downloads stop (all of them when it
 /// is not known), after the fence, before any token is removed.
 fn park_ended(end: &SessionEnded) {
-    with_store(|store| store.park_runs(end.user.as_deref()));
+    if end.already_ended {
+        super::platform::info(
+            "pharos: video park verdict=skipped reason=already_ended_by_earlier_session_end",
+        );
+    } else {
+        with_store(|store| store.park_runs(end.user.as_deref()));
+    }
     #[cfg(test)]
     tests::AFTER_PARK.with(|h| {
         if let Some(f) = h.borrow_mut().take() {
@@ -1722,7 +1733,8 @@ pub(crate) mod tests {
         STORE.with(|s| *s.borrow_mut() = None);
         assert_eq!(
             *runs.0.lock().unwrap(),
-            ["resume A", "park A", "park all", "resume B"]
+            ["resume A", "park A", "resume B"],
+            "a second sign-out parked again"
         );
     }
 
