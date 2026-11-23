@@ -215,12 +215,37 @@ pub fn same_playlist(
             (x, y) => {
                 return Err(PlanMismatch {
                     at,
-                    kept: x.map(redact_session).unwrap_or_default(),
-                    renewed: y.map(redact_session).unwrap_or_default(),
+                    kept: x.map(redact_line).unwrap_or_default(),
+                    renewed: y.map(redact_line).unwrap_or_default(),
                 })
             }
         }
     }
+}
+
+/// A playlist `line` with every `PlaySessionId` value hidden, wherever it
+/// sits: a URI line's query, a `URI="…"` attribute (`#EXT-X-MAP`, keys,
+/// renditions) or any other text. A playlist line is not one URL, so the
+/// fragment rule of `redact_session` does not apply: a `#` opens a tag
+/// here, and what follows it is searched too.
+fn redact_line(line: &str) -> String {
+    let key = format!("{SESSION_KEY}=").to_ascii_lowercase();
+    let lower = line.to_ascii_lowercase();
+    let mut out = String::with_capacity(line.len());
+    let mut at = 0;
+    while let Some(found) = lower[at..].find(&key) {
+        let value_at = at + found + key.len();
+        let value_end = line[value_at..]
+            .find(['&', '#', '"', ' ', ','])
+            .map_or(line.len(), |n| value_at + n);
+        out.push_str(&line[at..value_at]);
+        if value_end > value_at {
+            out.push('~');
+        }
+        at = value_end;
+    }
+    out.push_str(&line[at..]);
+    out
 }
 
 /// `line` with the session put back to `kept` where the line names a URI:
@@ -597,6 +622,35 @@ mod tests {
         assert_eq!(
             redact_session("/v/0.m4s?PlaySessionId=secret"),
             "/v/0.m4s?PlaySessionId=~"
+        );
+    }
+
+    #[test]
+    fn a_playlist_mismatch_never_logs_the_session() {
+        let stored =
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4?PlaySessionId=kS9old\",BYTERANGE=\"1@0\"\n";
+        let renewed =
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init2.mp4?PlaySessionId=lS9new\",BYTERANGE=\"1@0\"\n";
+        let err = same_playlist(stored, renewed, "kS9old", "lS9new").expect_err("init differs");
+        let shown = format!("{err} {err:?}");
+        assert!(
+            !shown.contains("kS9old") && !shown.contains("lS9new"),
+            "{shown}"
+        );
+        assert!(err.kept.contains("PlaySessionId=~"), "{}", err.kept);
+        assert!(err.renewed.contains("init2.mp4"), "{}", err.renewed);
+        // A URI line and a tag text carrying the id are hidden too.
+        let err = same_playlist(
+            "a.m4s?PlaySessionId=kS9old\n",
+            "b.m4s?PlaySessionId=lS9new\n",
+            "kS9old",
+            "lS9new",
+        )
+        .expect_err("segment differs");
+        assert!(!format!("{err}").contains("kS9old"));
+        assert_eq!(
+            redact_line("#EXTINF:1,PlaySessionId=x&y"),
+            "#EXTINF:1,PlaySessionId=~&y"
         );
     }
 
