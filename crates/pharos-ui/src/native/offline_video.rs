@@ -519,14 +519,23 @@ pub fn last_user() -> Option<String> {
     // every install uses, against the generation of the snapshot above, so
     // a sign-in, a sign-out or a session published since (each advances the
     // generation) wins.
-    let found = cold_start_identity(session_token);
+    let found = cold_start_identity(session_token.clone());
     #[cfg(test)]
     tests::AFTER_COLD_READ.with(|h| {
         if let Some(f) = h.borrow_mut().take() {
             f();
         }
     });
-    if found == Identity::Unknown {
+    // A token stored since the read (a Quick Connect sign-in writes it before
+    // it records its user, so no generation moved yet) must not be installed
+    // under who the old one named: what decided is read again, and the
+    // install goes ahead only if it still says the same.
+    let confirmed = found == Identity::Unknown || cold_start_identity(session_token) == found;
+    if !confirmed {
+        super::platform::info(&format!(
+            "pharos: video user verdict=not_installed reason=token_changed_during_cold_start asked_at={asked_at}"
+        ));
+    } else if found == Identity::Unknown {
         with_id(|s| {
             if s.generation == asked_at {
                 s.cold_tried = true;
@@ -3147,6 +3156,28 @@ pub(crate) mod tests {
             "a new session kept the empty read"
         );
         assert_eq!(last_user().as_deref(), Some("A"));
+    }
+
+    /// A token stored while the cold start read (a Quick Connect sign-in
+    /// writes the token first, and moves no generation yet) is not installed
+    /// under the user the old token named.
+    #[test]
+    fn a_cold_start_whose_token_changed_under_it_installs_nobody() {
+        let p = pref();
+        *p.value.borrow_mut() = Some("A".to_owned());
+        *p.token_user.borrow_mut() = Some("A".to_owned());
+        let p2 = p.clone();
+        AFTER_COLD_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                *p2.token_user.borrow_mut() = Some("B".to_owned());
+            }));
+        });
+        assert_eq!(last_user(), None, "A was installed over B's new token");
+        assert_eq!(identity(), Identity::Unknown);
+        assert!(
+            !with_id(|s| s.cold_tried),
+            "the changed read was remembered as empty"
+        );
     }
 
     #[test]
