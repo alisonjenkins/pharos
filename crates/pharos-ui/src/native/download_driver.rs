@@ -150,6 +150,7 @@ pub(super) async fn enqueue(
         quality_bps,
         paused: false,
         failed: None,
+        retry_due: false,
     };
     // The detail call above awaited: the owner is read again right before
     // anything is written, on the versioned path and the unversioned one.
@@ -238,12 +239,22 @@ pub(super) fn retry(ctx: Ctx, user: &str, item: &str) {
         return;
     }
     resume(user, item);
+    // The intent outlives a closed start gate: the tick starts it once open.
+    set_retry_due(user, item, true);
     let (user, item) = (user.to_owned(), item.to_owned());
     spawn_forever(async move {
         if let Some(store) = video_store() {
             start(ctx, &*store, &user, &item, "retry").await;
         }
     });
+}
+
+/// Records or drops the viewer's Retry intent on the queued entry.
+fn set_retry_due(user: &str, item: &str, due: bool) {
+    let mut queue = load();
+    if queue.set_retry_due(user, item, due) {
+        save(&queue);
+    }
 }
 
 /// Moves a queued download one place.
@@ -320,11 +331,19 @@ async fn tick(ctx: Ctx) {
             store.remove(&user, &item);
         }
         Action::Start { item } => {
-            let why = records
-                .iter()
-                .find(|r| r.item == item)
-                .and_then(|r| r.halt)
-                .map_or("next", Halt::label);
+            let intent = queue.find(&user, &item).is_some_and(|e| e.retry_due);
+            let why = if intent {
+                platform::info(&format!(
+                    "pharos: video queue action=start verdict=retry_intent item={item} reason=viewer_retry_due"
+                ));
+                "retry_intent"
+            } else {
+                records
+                    .iter()
+                    .find(|r| r.item == item)
+                    .and_then(|r| r.halt)
+                    .map_or("next", Halt::label)
+            };
             start(ctx, &*store, &user, &item, why).await;
         }
     }
@@ -364,6 +383,7 @@ fn fail_for_good(user: &str, item: &str, reason: String) {
         .find(|e| e.user == user && e.item == item)
     {
         e.failed = Some(reason);
+        e.retry_due = false;
         save(&queue);
     }
 }
@@ -437,6 +457,7 @@ fn settle<G>(
                 platform::info(&format!(
                     "pharos: video queue action=start item={item} reason={why} attempt={attempt}"
                 ));
+                set_retry_due(user, item, false);
                 return Some(grant);
             }
             Err(refusal) => fail_for_good(user, item, refusal.to_string()),
