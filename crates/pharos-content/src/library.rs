@@ -1304,6 +1304,11 @@ impl Worker {
     ) -> Result<Option<Link>, ContentError> {
         #[cfg(test)]
         tests::RESUMED_WITH.with(|r| r.borrow_mut().push(device_token.clone()));
+        // A test stands in for the server's side of a successful resume.
+        #[cfg(test)]
+        if let Some(link) = tests::RESUME_LINK.with(|r| r.borrow_mut().take()) {
+            return Ok(self.adopt_resumed(link, &device_token));
+        }
         let (bootstrap, closed) = net::open(&self.base).await?;
         let session = match net::resume(&bootstrap, &closed, &device_token).await {
             Ok(s) => s,
@@ -1331,15 +1336,19 @@ impl Worker {
             }
             Err(e) => return Err(e),
         };
-        // A sign-out may have fenced the token while the resume was out:
-        // no link opens with it.
-        if self.fenced_after(&device_token, "resume") {
-            return Ok(None);
+        Ok(self.adopt_resumed(Link::new(cat, media, device_token.clone()), &device_token))
+    }
+
+    /// Takes up a resumed `link`: none when a sign-out fenced the token while
+    /// the resume was out. Otherwise it is the link, the QuickConnect
+    /// poller is disowned and `SignedIn` is reported.
+    fn adopt_resumed(&mut self, link: Link, device_token: &str) -> Option<Link> {
+        if self.fenced_after(device_token, "resume") {
+            return None;
         }
-        let link = Link::new(cat, media, device_token);
         self.link = Some(link.clone());
         self.signed_in_by_resume();
-        Ok(Some(link))
+        Some(link)
     }
 
     /// A stored session resumed: the sign-in this process was offering is
@@ -1595,6 +1604,9 @@ mod tests {
         /// The device token each resume was sent with, in order.
         pub(super) static RESUMED_WITH: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        /// The link a resume yields instead of asking the server.
+        pub(super) static RESUME_LINK: std::cell::RefCell<Option<super::Link>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     fn dead_server() -> String {
@@ -2155,20 +2167,43 @@ mod tests {
     /// stops the QuickConnect poller and disowns its queued events.
     #[test]
     fn a_resumed_stored_session_disowns_the_quickconnect_poller() {
+        struct Boot;
+        impl pharos_api::server::bootstrap::Handler for Boot {}
+        let approval = |token: &str| Event::Approved {
+            bootstrap: pharos_api::server::bootstrap::client(Boot, &pharos_api::Connection::new()),
+            closed: std::rc::Rc::new(std::cell::Cell::new(false)),
+            session: pharos_api::server::session::client(
+                HookSession(|| {}),
+                &pharos_api::Connection::new(),
+            ),
+            token: token.to_owned(),
+        };
         let root = test_root("resume-disowns-qc");
         let (mut w, shared, _) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
+            // A link as the stored session's resume yields it.
+            w.on_event(approval("tokA")).await;
+            let link = w.link.take().expect("the approval opened no link");
+            shared.lock().auth = AuthState::SignedOut;
+            // QuickConnect is offering a sign-in, and its approval is queued.
             w.start_sign_in(&events);
             let polling_as = w.qc_gen;
             assert!(w.qc.is_some());
-            w.signed_in_by_resume();
+            RESUME_LINK.with(|r| *r.borrow_mut() = Some(link));
+            let resumed = w.resume_link(&events, "tokA".to_owned()).await;
+            assert!(matches!(resumed, Ok(Some(_))), "the resume did not link");
             assert!(w.qc.is_none(), "the poller kept running");
             assert_ne!(w.qc_gen, polling_as, "its queued events still match");
-            // A code queued before the resume is ignored.
-            w.on_event_if_current(polling_as, Event::Code("stale".into()))
-                .await;
+            // The approval queued before the resume is rejected: the resumed
+            // link stays.
+            w.on_event_if_current(polling_as, approval("tokB")).await;
+            assert_eq!(
+                w.link.as_ref().map(|l| l.token.as_str()),
+                Some("tokA"),
+                "a stale approval replaced the resumed session"
+            );
         });
         assert_eq!(shared.lock().auth, AuthState::SignedIn);
     }
