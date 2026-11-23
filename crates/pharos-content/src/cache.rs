@@ -1623,8 +1623,14 @@ impl Cache {
                 meta
             };
             match meta {
-                Ok(m) => {
+                Ok(m) if m.is_file() => {
                     lens.insert(entry.file_name(), m.len());
+                }
+                Ok(_) => {
+                    log::info!(
+                        "cache part scan skipped a non-file entry name={:?} reason=not_a_regular_file",
+                        entry.file_name()
+                    );
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
@@ -2688,6 +2694,17 @@ pub(crate) mod tests {
             PART_SCAN_FAULT.with(|f| f.set(0));
             assert_eq!(figure, None, "a failed {what} read as a figure");
         }
+        assert_eq!(c.in_progress_bytes(), Some(40));
+    }
+
+    /// A directory named like a part is not part bytes: its own length
+    /// (a block, on most file systems) is no download.
+    #[test]
+    fn a_directory_named_like_a_part_is_not_counted_as_part_bytes() {
+        let d = tmp("part-scan-dir");
+        let c = Cache::open_with_probe(&d, 1 << 30, fixed_free(u64::MAX)).unwrap();
+        std::fs::write(c.part_path("track/a"), vec![0u8; 40]).unwrap();
+        std::fs::create_dir(d.join(format!("stray{PART_EXT}"))).unwrap();
         assert_eq!(c.in_progress_bytes(), Some(40));
     }
 
