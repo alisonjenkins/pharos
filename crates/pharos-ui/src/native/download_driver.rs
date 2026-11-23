@@ -16,7 +16,8 @@ use pharos_client::ClientError;
 
 use super::app::{call, Ctx};
 use super::download_queue::{
-    admit, next_action, start_gate, Action, Halt, Queue, QueueEntry, Tries, QUEUE_KEY,
+    admit, next_action, start_gate, still_startable, Action, Halt, Queue, QueueEntry, Tries,
+    QUEUE_KEY,
 };
 use super::kept_video::{KeepVideoRequest, KeptState, KeptVideo, VideoStore};
 use super::offline_video;
@@ -346,6 +347,14 @@ async fn start(ctx: Ctx, store: &dyn VideoStore, user: &str, item: &str, why: &s
     let outcome = negotiate(ctx, &entry).await;
     STARTING.set(false);
     let attempt = tries.map_or(0, |t| t.tries);
+    // The viewer may have removed or paused it while the negotiation was
+    // out: its grant is dropped, nothing is started.
+    if let (Ok(_), Err(gone)) = (&outcome, still_startable(&load(), user, item)) {
+        platform::info(&format!(
+            "pharos: video queue action=start verdict=dropped item={item} reason={gone}"
+        ));
+        return;
+    }
     match outcome {
         Ok((request, grant)) => match store.start(request) {
             Ok(()) => {

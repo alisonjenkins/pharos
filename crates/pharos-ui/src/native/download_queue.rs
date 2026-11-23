@@ -344,6 +344,17 @@ pub fn start_gate(starting: bool, records: &[KeptVideo], user: &str) -> Result<(
     Ok(())
 }
 
+/// Whether `item` is still due after its negotiation returned: its entry is
+/// still queued and not paused. One removed or paused meanwhile must not be
+/// started with the grant that arrived late.
+pub fn still_startable(queue: &Queue, user: &str, item: &str) -> Result<(), &'static str> {
+    match queue.find(user, item) {
+        None => Err("removed_during_negotiation"),
+        Some(e) if e.paused => Err("paused_during_negotiation"),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Whether `entry` fits beside everything kept and queued: the downloads
 /// cap and the free-space floor hold for what is promised, not only what is
 /// on disk. `used` is what the store counts (its own records included).
@@ -787,10 +798,11 @@ mod tests {
         assert!(admit(&Queue::default(), &[], &third, 0, cap, u64::MAX).is_ok());
     }
 
-    /// CR review 6018104500 (download_driver.rs:195-197): a start
-    /// waits for the gates the tick keeps.
+    /// CR review 6018104500 (download_driver.rs:195-197 and :342): a start
+    /// waits for the gates the tick keeps, and an entry removed or paused
+    /// while its negotiation was out is not started.
     #[test]
-    fn a_start_keeps_the_ticks_gates() {
+    fn a_start_keeps_the_ticks_gates_and_rechecks_the_entry() {
         let records = [record("1", downloading(), None)];
         assert_eq!(start_gate(true, &[], "u"), Err("another_start_in_progress"));
         assert_eq!(
@@ -799,6 +811,17 @@ mod tests {
         );
         assert_eq!(start_gate(false, &records, "other"), Ok(()));
         assert_eq!(start_gate(false, &[], "u"), Ok(()));
+        let mut q = queue(&["1"]);
+        assert_eq!(still_startable(&q, "u", "1"), Ok(()));
+        q.set_paused("u", "1", true);
+        assert_eq!(
+            still_startable(&q, "u", "1"),
+            Err("paused_during_negotiation")
+        );
+        assert_eq!(
+            still_startable(&q, "u", "2"),
+            Err("removed_during_negotiation")
+        );
     }
 
     /// CR review 6018104500 (download_queue.rs:344): a download already
