@@ -1130,10 +1130,56 @@ pub fn renewed_record(old: &KeptVideo, request: &KeepVideoRequest, saved_at: Str
     record
 }
 
+/// Puts a planned download's files and estimate on its record, and its
+/// progress at zero, only while it is still downloading: a pause that landed
+/// while the plan was made stays paused. Whether it is still downloading.
+pub fn apply_plan(v: &mut KeptVideo, files: Vec<String>, estimate: u64, total: u32) -> bool {
+    v.files = files;
+    v.estimated_bytes = estimate;
+    let running = matches!(v.state, KeptState::Downloading { .. });
+    if running {
+        v.state = KeptState::Downloading {
+            done: 0,
+            total,
+            bytes: 0,
+        };
+    }
+    running
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// A plan lands on a download that was paused meanwhile without
+    /// starting it again.
+    #[test]
+    fn a_plan_keeps_a_pause_that_landed_while_it_was_made() {
+        let mut v = video("u", "1", KeptState::Ready);
+        v.state = KeptState::Failed {
+            reason: "paused".into(),
+        };
+        v.halt = Some(super::super::download_queue::Halt::Paused);
+        assert!(!apply_plan(&mut v, vec!["a".into()], 9, 1));
+        assert_eq!(v.halt, Some(super::super::download_queue::Halt::Paused));
+        assert!(matches!(v.state, KeptState::Failed { .. }), "{:?}", v.state);
+        assert_eq!((v.files.len(), v.estimated_bytes), (1, 9));
+        v.state = KeptState::Downloading {
+            done: 5,
+            total: 9,
+            bytes: 5,
+        };
+        assert!(apply_plan(&mut v, vec!["a".into()], 9, 1));
+        assert_eq!(
+            v.state,
+            KeptState::Downloading {
+                done: 0,
+                total: 1,
+                bytes: 0
+            }
+        );
+    }
 
     /// Outside-diff item kept_video_disk.rs:2368: the limit holds while the
     /// rewrite is built. One byte short of the whole rewrite is `None`,
