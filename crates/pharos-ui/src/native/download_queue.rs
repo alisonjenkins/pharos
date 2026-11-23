@@ -85,6 +85,10 @@ pub struct QueueEntry {
     /// paused), so a Retry deferred behind a closed start gate is not lost.
     #[serde(default)]
     pub retry_due: bool,
+    /// Which add of this item it is (`Queue::generation` at that add): a
+    /// negotiation that returns for another generation is not this entry's.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl QueueEntry {
@@ -107,6 +111,11 @@ pub fn queued_estimate(quality_bps: u64, runtime_ms: u64) -> u64 {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Queue {
     pub entries: Vec<QueueEntry>,
+    /// The last generation handed to an entry: every entry added or put
+    /// back with new settings takes the next, so a result computed for an
+    /// entry that was removed and queued again is told from the new one.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl Queue {
@@ -131,7 +140,9 @@ impl Queue {
 
     /// Adds `entry` at the end, or puts a queued one back in its place
     /// with its new settings (a Retry, a new quality).
-    pub fn push(&mut self, entry: QueueEntry) {
+    pub fn push(&mut self, mut entry: QueueEntry) {
+        self.generation += 1;
+        entry.generation = self.generation;
         match self.find_mut(&entry.user, &entry.item) {
             Some(e) => *e = entry,
             None => self.entries.push(entry),
@@ -199,7 +210,9 @@ impl Queue {
         let mut changed = before != self.entries.len();
         for r in records.iter().filter(|r| r.user == user && !r.ready()) {
             if self.find(user, &r.item).is_none() {
+                self.generation += 1;
                 self.entries.push(QueueEntry {
+                    generation: self.generation,
                     user: r.user.clone(),
                     item: r.item.clone(),
                     version: r.version.clone(),
@@ -377,9 +390,15 @@ pub fn start_gate(starting: bool, records: &[KeptVideo], user: &str) -> Result<(
 /// Whether `item` is still due after its negotiation returned: its entry is
 /// still queued and not paused. One removed or paused meanwhile must not be
 /// started with the grant that arrived late.
-pub fn still_startable(queue: &Queue, user: &str, item: &str) -> Result<(), &'static str> {
+pub fn still_startable(
+    queue: &Queue,
+    user: &str,
+    item: &str,
+    generation: u64,
+) -> Result<(), &'static str> {
     match queue.find(user, item) {
         None => Err("removed_during_negotiation"),
+        Some(e) if e.generation != generation => Err("replaced_during_negotiation"),
         Some(e) if e.paused => Err("paused_during_negotiation"),
         Some(_) => Ok(()),
     }
@@ -595,6 +614,7 @@ mod tests {
             paused: false,
             failed: None,
             retry_due: false,
+            generation: 0,
         }
     }
 
@@ -625,6 +645,7 @@ mod tests {
     fn queue(items: &[&str]) -> Queue {
         Queue {
             entries: items.iter().map(|i| entry(i)).collect(),
+            ..Queue::default()
         }
     }
 
@@ -897,15 +918,30 @@ mod tests {
         assert_eq!(start_gate(false, &records, "other"), Ok(()));
         assert_eq!(start_gate(false, &[], "u"), Ok(()));
         let mut q = queue(&["1"]);
-        assert_eq!(still_startable(&q, "u", "1"), Ok(()));
+        let g = q.entries[0].generation;
+        assert_eq!(still_startable(&q, "u", "1", g), Ok(()));
         q.set_paused("u", "1", true);
         assert_eq!(
-            still_startable(&q, "u", "1"),
+            still_startable(&q, "u", "1", g),
             Err("paused_during_negotiation")
         );
         assert_eq!(
-            still_startable(&q, "u", "2"),
+            still_startable(&q, "u", "2", g),
             Err("removed_during_negotiation")
+        );
+        // Removed and queued again while the negotiation was out: the new
+        // entry is not the one it was for.
+        let mut q = queue(&["1"]);
+        let g = q.entries[0].generation;
+        q.remove("u", "1");
+        q.push(entry("1"));
+        assert_eq!(
+            still_startable(&q, "u", "1", g),
+            Err("replaced_during_negotiation")
+        );
+        assert_eq!(
+            still_startable(&q, "u", "1", q.entries[0].generation),
+            Ok(())
         );
     }
 
@@ -981,6 +1017,7 @@ mod tests {
     fn a_deferred_retry_is_started_once_the_gate_opens() {
         let mut q = Queue {
             entries: vec![entry("1")],
+            ..Queue::default()
         };
         // The viewer's Retry: the failure is cleared, the intent recorded.
         q.entries[0].failed = Some("gave up".into());
