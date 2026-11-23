@@ -65,6 +65,15 @@ pub const SHORT_TAIL_MS: u64 = 1000;
 /// The files the media playlist `text` (at `url`) names.
 pub fn plan_media(url: &str, text: &str) -> Result<MediaPlan, ParseError> {
     let media = parse_media(text, url)?;
+    // A key the download would not store: a copy that names it cannot play
+    // offline, so it is refused here, as the player refuses it
+    // (`Unsupported::Encrypted`), rather than reaching Ready.
+    if media
+        .unsupported
+        .contains(&crate::playlist::Unsupported::Encrypted)
+    {
+        return Err(ParseError::Encrypted);
+    }
     let duration_ms = media
         .segments
         .last()
@@ -394,6 +403,22 @@ mod tests {
     #[test]
     fn an_hour_at_two_megabits_is_about_900_mb() {
         assert_eq!(estimate_bytes(2_000_000, 3_600_000), 900_000_000);
+    }
+
+    /// CR review 6018104500 (kept_video.rs:813): an encrypted media playlist
+    /// is refused, not planned: its key would not be stored.
+    #[test]
+    fn an_encrypted_media_playlist_is_not_planned() {
+        let text = MEDIA.replace(
+            "#EXT-X-MAP",
+            "#EXT-X-KEY:METHOD=AES-128,URI=\"k?PlaySessionId=p\"\n#EXT-X-MAP",
+        );
+        assert_eq!(
+            plan_media("https://h/videos/9/h264cmaf/main.m3u8?p=1", &text),
+            Err(ParseError::Encrypted)
+        );
+        let clear = MEDIA.replace("#EXT-X-MAP", "#EXT-X-KEY:METHOD=NONE\n#EXT-X-MAP");
+        assert!(plan_media("https://h/videos/9/h264cmaf/main.m3u8?p=1", &clear).is_ok());
     }
 
     /// CR review 6018104500 (offline.rs:192): only the session parameter is
