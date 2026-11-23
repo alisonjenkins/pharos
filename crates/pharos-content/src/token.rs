@@ -947,6 +947,30 @@ pub fn end_session_retrying(
     retained: Option<&str>,
 ) -> Ended {
     let _held = hold();
+    end_session_locked(path, seen, user, retained)
+}
+
+/// A sign-out of whatever token is on file, in one hold of the file's lock:
+/// every token is fenced first (a reader that has the token cached stops
+/// serving it), then the token is removed or revoked, and the fence of
+/// the token that was ended is added. A store of a new token lands before
+/// this (and is the token ended) or after it (and is kept, its own store
+/// lifting the fence for it): never between the fence and the removal. The
+/// caller clears its caches and runs its callbacks once this returns, with
+/// the lock released.
+pub fn sign_out_fenced(path: &Path) -> Ended {
+    let _held = hold();
+    add_fence_held(path, &Fence::Every, "sign_out_started");
+    end_session_locked(path, None, None, None)
+}
+
+/// [`end_session_retrying`]'s work, under the lock its caller holds.
+fn end_session_locked(
+    path: &Path,
+    seen: Option<&str>,
+    user: Option<&str>,
+    retained: Option<&str>,
+) -> Ended {
     let (ended, ended_token) = end_session_held(path, seen, user, retained);
     match &ended {
         Ended::Unsafe { target, .. } => {
@@ -2426,6 +2450,27 @@ pub(crate) mod tests {
 
     /// A sign-out retried after an unlink whose folder sync failed is
     /// durable only once the folder syncs: the absence alone is not.
+    /// A sign-out fences every token and removes the one on file in one
+    /// operation; a token stored after it is not the one it ended: its own
+    /// store lifts the fence for it, and the ended one stays refused.
+    #[test]
+    fn a_fenced_sign_out_ends_the_token_and_keeps_a_later_store() {
+        let d = dir("fenced-sign-out");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        let ended = sign_out_fenced(&p);
+        assert!(
+            matches!(ended, Ended::Forgotten(Forgotten::Durable)),
+            "{ended:?}"
+        );
+        assert_eq!(load(&p).unwrap(), None);
+        assert!(fence(&p).refuses("tokA") && fence(&p).refuses("tokB"));
+        store(&p, "tokB").unwrap();
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokB"));
+        assert!(fence(&p).refuses("tokA"), "the ended token was let back");
+        assert!(!fence(&p).refuses("tokB"));
+    }
+
     #[test]
     fn a_retried_sign_out_marks_the_token_an_earlier_one_left_when_the_absence_is_not_durable() {
         let d = dir("absent-retained");
