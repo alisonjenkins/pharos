@@ -1213,9 +1213,9 @@ impl Gate {
             // The wait for the headers may have outlived the job: a
             // replacement no longer wanted evicts nothing and truncates
             // nothing, whether its length is known or not.
-            // A resumed body (206) is the same: it appends to the kept part
-            // only while it is still wanted.
-            if (replacing || append) && !self.still_wanted(id, generation) {
+            // A resumed body (206) and a fresh one (200) are the same: nothing
+            // is evicted or written for a track no longer wanted.
+            if !self.still_wanted(id, generation) {
                 log::info!(
                     "cache download id={id} verdict=cancelled reason=not_wanted_after_headers part=kept unknown_len={unknown_len} resumed={append}"
                 );
@@ -3899,6 +3899,39 @@ mod tests {
         r.dl.prefetch(&ids(&["track/1"]));
         assert!(r.dl.wait_idle(Duration::from_secs(10)), "never ended");
         assert!(!r.cache.is_complete("track/1"), "the dropped resume ran");
+        assert!(
+            r.dl.events()
+                .iter()
+                .any(|e| e == "cancelled_after_headers:track/1"),
+            "{:?}",
+            r.dl.events()
+        );
+    }
+
+    /// CR 4668479926 (prefetch.rs:1218): a fresh 200 for a track dropped
+    /// while its headers came writes nothing either.
+    #[test]
+    fn a_fresh_body_dropped_while_its_headers_came_writes_nothing() {
+        let r = rig_with_free(
+            "fresh-dropped-headers",
+            Script::default().file("/audio/1", body(400, 2)).no_etag(),
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(|_| Ok(u64::MAX)),
+        );
+        let gate = Arc::downgrade(&r.dl.gate);
+        *r.dl.gate.after_headers.lock().unwrap() = Some(Box::new(move || {
+            if let Some(gate) = gate.upgrade() {
+                gate.lock().generation += 1;
+            }
+        }));
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(10)), "never ended");
+        assert!(
+            !r.cache.is_complete("track/1"),
+            "an unwanted body was written"
+        );
         assert!(
             r.dl.events()
                 .iter()
