@@ -1334,8 +1334,20 @@ impl Worker {
         }
         let link = Link::new(cat, media, device_token);
         self.link = Some(link.clone());
-        self.shared.set_auth(AuthState::SignedIn);
+        self.signed_in_by_resume();
         Ok(Some(link))
+    }
+
+    /// A stored session resumed: the sign-in this process was offering is
+    /// moot. Its poller is stopped and what it already queued is disowned
+    /// before `SignedIn` is reported, so a stale event cannot change the
+    /// live session.
+    fn signed_in_by_resume(&mut self) {
+        let polling = self.stop_sign_in();
+        if polling {
+            log::info!("quickconnect stopped: reason=stored_session_resumed");
+        }
+        self.shared.set_auth(AuthState::SignedIn);
     }
 
     /// Drop the connection and any QuickConnect, then resume from the token
@@ -2133,6 +2145,28 @@ mod tests {
                 .await;
         });
         assert_eq!(shared.lock().auth, AuthState::SignedOut);
+    }
+
+    /// CR outside-diff (library.rs:1458): a stored session that resumes
+    /// stops the QuickConnect poller and disowns its queued events.
+    #[test]
+    fn a_resumed_stored_session_disowns_the_quickconnect_poller() {
+        let root = test_root("resume-disowns-qc");
+        let (mut w, shared, _) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        local.block_on(&rt, async {
+            w.start_sign_in(&events);
+            let polling_as = w.qc_gen;
+            assert!(w.qc.is_some());
+            w.signed_in_by_resume();
+            assert!(w.qc.is_none(), "the poller kept running");
+            assert_ne!(w.qc_gen, polling_as, "its queued events still match");
+            // A code queued before the resume is ignored.
+            w.on_event_if_current(polling_as, Event::Code("stale".into()))
+                .await;
+        });
+        assert_eq!(shared.lock().auth, AuthState::SignedIn);
     }
 
     /// A sign-out whose removal the folder could not make durable still
