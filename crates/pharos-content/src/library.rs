@@ -2365,12 +2365,12 @@ mod tests {
     #[test]
     fn a_quickconnect_session_refused_leaves_a_replacement_token() {
         struct Session(std::cell::Cell<u32>);
-        impl session::Server for Session {
+        impl pharos_api::server::session::Handler for Session {
             fn media_token(
-                self: capnp::capability::Rc<Self>,
+                self: std::rc::Rc<Self>,
                 _: session::MediaTokenParams,
-                mut results: session::MediaTokenResults,
-            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                results: &mut session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> {
                 let n = self.0.get();
                 self.0.set(n + 1);
                 let r = results.get().init_result();
@@ -2386,16 +2386,22 @@ mod tests {
             }
         }
         struct Boot;
-        impl bootstrap::Server for Boot {}
+        impl pharos_api::server::bootstrap::Handler for Boot {}
         let root = test_root("qc-revoked-own");
         let (mut w, _shared, token_path) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
             w.on_event(Event::Approved {
-                bootstrap: capnp_rpc::new_client(Boot),
+                bootstrap: pharos_api::server::bootstrap::client(
+                    Boot,
+                    &pharos_api::Connection::new(),
+                ),
                 closed: std::rc::Rc::new(std::cell::Cell::new(false)),
-                session: capnp_rpc::new_client(Session(std::cell::Cell::new(0))),
+                session: pharos_api::server::session::client(
+                    Session(std::cell::Cell::new(0)),
+                    &pharos_api::Connection::new(),
+                ),
                 token: "tokA".to_owned(),
             })
             .await;
@@ -2442,12 +2448,12 @@ mod tests {
     #[test]
     fn a_fenced_token_is_not_used_through_an_open_link() {
         struct Session;
-        impl session::Server for Session {
+        impl pharos_api::server::session::Handler for Session {
             fn media_token(
-                self: capnp::capability::Rc<Self>,
+                self: std::rc::Rc<Self>,
                 _: session::MediaTokenParams,
-                mut results: session::MediaTokenResults,
-            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                results: &mut session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> {
                 let mut t = results.get().init_result().init_token();
                 t.set_token("media");
                 t.set_expires_at_ms(u64::MAX);
@@ -2455,16 +2461,22 @@ mod tests {
             }
         }
         struct Boot;
-        impl bootstrap::Server for Boot {}
+        impl pharos_api::server::bootstrap::Handler for Boot {}
         let root = test_root("fence-open-link");
         let (mut w, _shared, token_path) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
             w.on_event(Event::Approved {
-                bootstrap: capnp_rpc::new_client(Boot),
+                bootstrap: pharos_api::server::bootstrap::client(
+                    Boot,
+                    &pharos_api::Connection::new(),
+                ),
                 closed: std::rc::Rc::new(std::cell::Cell::new(false)),
-                session: capnp_rpc::new_client(Session),
+                session: pharos_api::server::session::client(
+                    Session,
+                    &pharos_api::Connection::new(),
+                ),
                 token: "tokA".to_owned(),
             })
             .await;
@@ -2491,12 +2503,12 @@ mod tests {
                 const { std::cell::RefCell::new(None) };
         }
         struct Session;
-        impl session::Server for Session {
+        impl pharos_api::server::session::Handler for Session {
             fn media_token(
-                self: capnp::capability::Rc<Self>,
+                self: std::rc::Rc<Self>,
                 _: session::MediaTokenParams,
-                mut results: session::MediaTokenResults,
-            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+                results: &mut session::MediaTokenResults,
+            ) -> impl std::future::Future<Output = Result<(), capnp::Error>> {
                 if let Some(path) = FENCE_AT.with(|f| f.borrow_mut().take()) {
                     token::add_fence(&path, &token::Fence::for_token(Some("tokA")), "test");
                 }
@@ -2508,16 +2520,22 @@ mod tests {
             }
         }
         struct Boot;
-        impl bootstrap::Server for Boot {}
+        impl pharos_api::server::bootstrap::Handler for Boot {}
         let root = test_root("fence-during-refresh");
         let (mut w, _shared, token_path) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
             w.on_event(Event::Approved {
-                bootstrap: capnp_rpc::new_client(Boot),
+                bootstrap: pharos_api::server::bootstrap::client(
+                    Boot,
+                    &pharos_api::Connection::new(),
+                ),
                 closed: std::rc::Rc::new(std::cell::Cell::new(false)),
-                session: capnp_rpc::new_client(Session),
+                session: pharos_api::server::session::client(
+                    Session,
+                    &pharos_api::Connection::new(),
+                ),
                 token: "tokA".to_owned(),
             })
             .await;
@@ -2551,16 +2569,22 @@ mod tests {
     #[test]
     fn a_stay_signed_out_over_a_fenced_link_resumes_the_stored_token() {
         struct Boot;
-        impl bootstrap::Server for Boot {}
+        impl pharos_api::server::bootstrap::Handler for Boot {}
         let root = test_root("stay-signed-out-resumes");
         let (mut w, shared, token_path) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
             w.on_event(Event::Approved {
-                bootstrap: capnp_rpc::new_client(Boot),
+                bootstrap: pharos_api::server::bootstrap::client(
+                    Boot,
+                    &pharos_api::Connection::new(),
+                ),
                 closed: std::rc::Rc::new(std::cell::Cell::new(false)),
-                session: capnp_rpc::new_client(HookSession(|| {})),
+                session: pharos_api::server::session::client(
+                    HookSession(|| {}),
+                    &pharos_api::Connection::new(),
+                ),
                 token: "tokA".to_owned(),
             })
             .await;
@@ -2602,16 +2626,22 @@ mod tests {
     #[test]
     fn a_stay_signed_out_whose_token_lookup_fails_signs_out() {
         struct Boot;
-        impl bootstrap::Server for Boot {}
+        impl pharos_api::server::bootstrap::Handler for Boot {}
         let root = test_root("stay-signed-out-lookup-fails");
         let (mut w, shared, token_path) = worker(&root);
         let (events, _rx) = unbounded_channel::<(u64, Event)>();
         let (rt, local) = local_rt();
         local.block_on(&rt, async {
             w.on_event(Event::Approved {
-                bootstrap: capnp_rpc::new_client(Boot),
+                bootstrap: pharos_api::server::bootstrap::client(
+                    Boot,
+                    &pharos_api::Connection::new(),
+                ),
                 closed: std::rc::Rc::new(std::cell::Cell::new(false)),
-                session: capnp_rpc::new_client(HookSession(|| {})),
+                session: pharos_api::server::session::client(
+                    HookSession(|| {}),
+                    &pharos_api::Connection::new(),
+                ),
                 token: "tokA".to_owned(),
             })
             .await;
@@ -2670,12 +2700,12 @@ mod tests {
 
     /// A session whose media token call runs `on_call` first.
     struct HookSession(fn());
-    impl session::Server for HookSession {
+    impl pharos_api::server::session::Handler for HookSession {
         fn media_token(
-            self: capnp::capability::Rc<Self>,
+            self: std::rc::Rc<Self>,
             _: session::MediaTokenParams,
-            mut results: session::MediaTokenResults,
-        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> + 'static {
+            results: &mut session::MediaTokenResults,
+        ) -> impl std::future::Future<Output = Result<(), capnp::Error>> {
             (self.0)();
             let mut t = results.get().init_result().init_token();
             t.set_token("media");
@@ -2684,7 +2714,7 @@ mod tests {
         }
     }
     struct HookBoot;
-    impl bootstrap::Server for HookBoot {}
+    impl pharos_api::server::bootstrap::Handler for HookBoot {}
 
     thread_local! {
         /// The token file a hook session fences, once armed.
@@ -2701,9 +2731,15 @@ mod tests {
     ) {
         local.block_on(rt, async {
             w.on_event(Event::Approved {
-                bootstrap: capnp_rpc::new_client(HookBoot),
+                bootstrap: pharos_api::server::bootstrap::client(
+                    HookBoot,
+                    &pharos_api::Connection::new(),
+                ),
                 closed: std::rc::Rc::new(std::cell::Cell::new(false)),
-                session: capnp_rpc::new_client(HookSession(on_call)),
+                session: pharos_api::server::session::client(
+                    HookSession(on_call),
+                    &pharos_api::Connection::new(),
+                ),
                 token: token.to_owned(),
             })
             .await;
