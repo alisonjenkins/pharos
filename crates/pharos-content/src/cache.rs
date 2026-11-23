@@ -1736,6 +1736,10 @@ impl Cache {
         // The measured room fell short of what the lengths claimed: the
         // refusal, if no part is left, is `confirm`'s (reclaim_short).
         let mut measured_short = false;
+        // The room the last in-loop probe measured once it met `want`: the
+        // admission's decision, with nothing evicted since. No second probe
+        // is made after eviction to decide it again.
+        let mut probed: Option<(u64, u64)> = None;
         while now < want {
             let Some((id, bytes)) = Self::victim(&s, Some(downloading)) else {
                 break;
@@ -1784,7 +1788,9 @@ impl Cache {
                 if now >= want {
                     if let Ok(f) = (self.free)(&self.dir) {
                         let measured = f.saturating_add(reclaim.bytes());
-                        if measured < want {
+                        if measured >= want {
+                            probed = Some((f, measured));
+                        } else {
                             log::info!(
                                 "cache admission id={downloading} verdict=continue reason=measured_short after=part_evicted free_bytes={f} estimated={now} want={want} evicted={evicted_n}"
                             );
@@ -1813,17 +1819,24 @@ impl Cache {
         // be sparse): the room is measured, before a replacement's own part
         // is touched, with that part's held blocks still to come. A
         // shortfall refuses with the part as it was.
-        let room = if parts_evicted {
-            self.confirm(
+        let room = match (parts_evicted, probed) {
+            // The probe that stopped the eviction is the measure: it ran
+            // after the last part went, so it is not taken again.
+            (true, Some((f, measured))) => {
+                log::info!(
+                    "cache admission id={downloading} verdict=approved reason=measured_after_reclaim after=part_evicted free_bytes={f} estimated={now} want={want} probe=reused"
+                );
+                measured.saturating_sub(outstanding)
+            }
+            (true, None) => self.confirm(
                 downloading,
                 want,
                 outstanding,
                 now,
                 reclaim.bytes(),
                 "part_evicted",
-            )?
-        } else {
-            room
+            )?,
+            (false, _) => room,
         };
         if let Some(f) = part_file {
             if let Err(e) = empty_opened(&f) {
@@ -2490,6 +2503,38 @@ pub(crate) mod tests {
             "{lines:?}"
         );
         assert!(!c.part_path("track/z").exists(), "the next part was kept");
+    }
+
+    /// CR outside-diff (cache.rs:1784): the probe that stopped the eviction
+    /// is the admission's measure; it is not taken a second time after
+    /// the parts are gone (a second probe that fails would refuse a room
+    /// already measured).
+    #[test]
+    fn the_probe_that_stopped_eviction_decides_the_admission() {
+        let d = tmp("evict-probe-reused");
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let inner = disk_of(&d, MIN_FREE_BYTES + 20_000);
+        let seen = calls.clone();
+        let c = Cache::open_with_probe(
+            &d,
+            1 << 30,
+            Box::new(move |p| {
+                // The probe after the eviction's own: unreadable.
+                if seen.fetch_add(1, Ordering::SeqCst) >= 2u64 {
+                    return Err(std::io::Error::other("probe failed"));
+                }
+                inner(p)
+            }),
+        )
+        .unwrap();
+        std::fs::write(c.part_path("track/x"), vec![1u8; 600]).unwrap();
+        std::fs::write(c.part_path("track/z"), vec![2u8; 1000]).unwrap();
+        calls.store(0, Ordering::SeqCst);
+        let free = (c.free)(&d).unwrap();
+        calls.store(0, Ordering::SeqCst);
+        let need = (free + 700).saturating_sub(MIN_FREE_BYTES);
+        let verdict = c.ensure_free_replacing_part("track/x", need, true);
+        assert!(verdict.is_ok(), "{verdict:?}");
     }
 
     /// CR 4644634482: a replacement that eviction could not make room for
