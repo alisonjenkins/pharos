@@ -16,7 +16,7 @@ use pharos_client::ClientError;
 
 use super::app::{call, Ctx};
 use super::download_queue::{
-    admit, next_action, Action, Halt, Queue, QueueEntry, Tries, QUEUE_KEY,
+    admit, next_action, start_gate, Action, Halt, Queue, QueueEntry, Tries, QUEUE_KEY,
 };
 use super::kept_video::{KeepVideoRequest, KeptState, KeptVideo, VideoStore};
 use super::offline_video;
@@ -325,6 +325,14 @@ async fn start(ctx: Ctx, store: &dyn VideoStore, user: &str, item: &str, why: &s
     let Some(entry) = load().find(user, item).cloned() else {
         return;
     };
+    // The tick's gates hold for a viewer's Retry too: with one open the
+    // item stays due, and the tick starts it once both are.
+    if let Err(gate) = start_gate(STARTING.get(), &store.videos(user), user) {
+        platform::info(&format!(
+            "pharos: video queue action=start verdict=deferred item={item} reason={gate} trigger={why}"
+        ));
+        return;
+    }
     let resumed_halt = store
         .videos(user)
         .iter()
