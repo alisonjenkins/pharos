@@ -83,6 +83,58 @@ pub(crate) fn trim_after_retry(verdict: InitRetry, cache_enabled: bool) -> bool 
     verdict == InitRetry::Done && cache_enabled
 }
 
+/// How long the background retry waits between tries, and how many it
+/// makes in one run (about ten minutes): a later connect or prefetch starts
+/// another run.
+const INIT_RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+const INIT_RETRY_TRIES: u32 = 20;
+
+/// Calls `step` until it reports the init done, waiting `every` between
+/// calls (`sleep`), at most `tries` times. Returns the number of calls.
+/// Writes stay refused meanwhile: the accounting reads unknown until the
+/// store registers.
+pub(crate) fn retry_until_done(
+    tries: u32,
+    mut step: impl FnMut() -> InitRetry,
+    mut sleep: impl FnMut(),
+) -> u32 {
+    for made in 1..=tries {
+        if matches!(step(), InitRetry::Done | InitRetry::AlreadyDone) {
+            return made;
+        }
+        if made < tries {
+            sleep();
+        }
+    }
+    tries
+}
+
+/// Retries the init on a thread of its own until it is done, even when no
+/// playback ever starts, sharing the single-flight guard with
+/// [`retry_init_in_background`].
+pub(crate) fn schedule_init_retries(when: &'static str) {
+    if INIT_DONE.load(Ordering::Acquire) {
+        return;
+    }
+    let verdict = spawn_once(&RETRY_RUNNING, move || {
+        let made = retry_until_done(
+            INIT_RETRY_TRIES,
+            || retry_init(when),
+            || std::thread::sleep(INIT_RETRY_EVERY),
+        );
+        log(&format!(
+            "video accounting retry when={when} loop=ended tries={made} done={}",
+            INIT_DONE.load(Ordering::Acquire)
+        ));
+    });
+    if verdict != Background::Started {
+        log(&format!(
+            "video accounting retry when={when} loop={}",
+            verdict.label()
+        ));
+    }
+}
+
 /// Whether a background `retry_init` is running now.
 static RETRY_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -298,7 +350,11 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
     // Before the cache is enabled or anything prefetches: the app's video
     // accounting, in a process that never ran the app's own start-up.
     let _ = FILES.set(files.clone());
-    retry_init("first_connect");
+    // Run again in the background while the first try fails, so a car-only
+    // process that never plays still registers its video store.
+    if retry_init("first_connect") == InitRetry::StillMissing {
+        schedule_init_retries("first_connect");
+    }
     lib.on_auth_change(|_| notify_changed());
     let auth = match lib.auth_state() {
         content::AuthState::SignedOut => "signed_out",
@@ -695,8 +751,8 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 #[cfg(test)]
 mod tests {
     use super::{
-        access, outside_bytes, rerun_init, spawn_once, trim_after_retry, Background, Caller,
-        InitRetry,
+        access, outside_bytes, rerun_init, retry_until_done, spawn_once, trim_after_retry,
+        Background, Caller, InitRetry,
     };
     use pharos_content as content;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -711,6 +767,39 @@ mod tests {
         assert!(!trim_after_retry(InitRetry::AlreadyDone, true));
         assert!(!trim_after_retry(InitRetry::StillMissing, true));
         assert!(!trim_after_retry(InitRetry::NothingToRun, true));
+    }
+
+    /// CR review 6018104500 (service.rs:280): the background retry keeps
+    /// trying at an interval until the init is done, and stops there; it is
+    /// bounded when it never is.
+    #[test]
+    fn the_background_retry_runs_until_done_and_is_bounded() {
+        let mut answers = vec![
+            InitRetry::StillMissing,
+            InitRetry::StillMissing,
+            InitRetry::Done,
+        ]
+        .into_iter();
+        let (mut sleeps, mut calls) = (0, 0);
+        let made = retry_until_done(
+            20,
+            || {
+                calls += 1;
+                answers.next().unwrap_or(InitRetry::Done)
+            },
+            || sleeps += 1,
+        );
+        assert_eq!((made, calls, sleeps), (3, 3, 2), "it did not stop at done");
+        let (mut calls, mut sleeps) = (0, 0);
+        let made = retry_until_done(
+            4,
+            || {
+                calls += 1;
+                InitRetry::StillMissing
+            },
+            || sleeps += 1,
+        );
+        assert_eq!((made, calls, sleeps), (4, 4, 3), "it was not bounded");
     }
 
     /// The playback path's retry returns at once while the store opens, and
