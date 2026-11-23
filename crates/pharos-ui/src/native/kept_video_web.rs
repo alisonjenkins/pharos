@@ -367,13 +367,10 @@ async fn put(
         move || RUNS.with(|r| r.borrow_mut().end_put(&user, &item, run))
     });
     let promise = cache.put_with_str(url, response);
-    wasm_bindgen_futures::spawn_local({
-        let settled = promise.clone();
-        async move {
-            let _ = JsFuture::from(settled).await;
-            drop(guard);
-        }
-    });
+    wasm_bindgen_futures::spawn_local(super::kept_video::release_when_settled(
+        JsFuture::from(promise.clone()),
+        guard,
+    ));
     let written = JsFuture::from(promise).await;
     written.map(|_| ()).map_err(|e| {
         let name = js_sys::Reflect::get(&e, &"name".into())
