@@ -1663,7 +1663,7 @@ impl PlaybackEngine for PageEngine {
         run(tv_page::engine_start_js(&tv_page::EngineStart {
             video_id: &id,
             generation: self.generation,
-            url: &direct_url(&server(), url),
+            url: &hls_source(url),
             start_ms,
             device: super::app::this_device().label(),
             token: token.as_deref(),
