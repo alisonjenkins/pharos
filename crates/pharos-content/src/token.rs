@@ -757,8 +757,12 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
             // store that could not sync its folder refuses it, until a
             // store confirms it.
             add_fence_held(path, &Fence::token(&new), "store_incomplete");
+            // The fence is this process's: after a restart only a marker
+            // keeps the unconfirmed token refused, as for an unsynced folder.
+            let marked = write_marker(path, None, &new, true);
             log::warn!(
-                "token store verdict=incomplete reason=read_back_differs found={found} fenced=new_token"
+                "token store verdict=incomplete reason=read_back_differs found={found} fenced=new_token marker={}",
+                if marked.is_ok() { "written" } else { "attempted" }
             );
             // The rename may have landed: a cached token is stale now, and
             // reloads through the fence above.
@@ -770,8 +774,10 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
         }
         Err(e) => {
             add_fence_held(path, &Fence::token(&new), "store_incomplete");
+            let marked = write_marker(path, None, &new, true);
             log::warn!(
-                "token store verdict=incomplete reason=read_back_failed fenced=new_token error={}",
+                "token store verdict=incomplete reason=read_back_failed fenced=new_token marker={} error={}",
+                if marked.is_ok() { "written" } else { "attempted" },
                 e.redacted()
             );
             changed("store_incomplete");
@@ -2855,6 +2861,28 @@ pub(crate) mod tests {
         );
         assert!(!is_store_incomplete(&store(&p, "").unwrap_err()));
         clear_fence(&p);
+    }
+
+    /// CR review 6018104500 (token.rs:757-767): a store whose rename landed
+    /// but whose read-back failed leaves the token refused after a restart
+    /// too (a marker, not only the process's fence), and the same approved
+    /// token installs again once it can be read.
+    #[test]
+    fn an_unconfirmed_read_back_keeps_the_token_refused_after_a_restart() {
+        let d = dir("read-back-restart");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        FAIL_READ_BACK.with(|f| f.set(true));
+        let stored = store(&p, "tokB");
+        FAIL_READ_BACK.with(|f| f.set(false));
+        assert!(is_store_incomplete(&stored.unwrap_err()));
+        assert!(
+            revoked(&p, &fingerprint("tokB")).is_some_and(|r| r.install_unconfirmed),
+            "nothing but the fence refuses the token"
+        );
+        assert_eq!(after_restart(&p), None, "the token became readable");
+        store(&p, "tokB").expect("the same approved token was not retried");
+        assert_eq!(after_restart(&p).as_deref(), Some("tokB"));
     }
 
     /// CR 4642574336: a store that cannot read its token back fences that
