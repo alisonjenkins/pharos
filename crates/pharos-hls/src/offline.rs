@@ -231,25 +231,57 @@ fn restore_session(line: &str, live: &str, kept: &str) -> String {
     if !line.starts_with('#') {
         return restore_in(line, live, kept);
     }
+    // Only the tags that define a URI attribute carry one.
+    let tag = line.split([':', ',']).next().unwrap_or("");
+    if !URI_TAGS.iter().any(|t| tag.eq_ignore_ascii_case(t)) {
+        return line.to_owned();
+    }
     let lower = line.to_ascii_lowercase();
     let mut out = String::with_capacity(line.len());
     let mut at = 0;
-    while let Some(found) = lower[at..].find("uri=\"") {
-        let start = at + found + "uri=\"".len();
+    let mut from = 0;
+    while let Some(found) = lower[from..].find("uri=\"") {
+        let name_at = from + found;
+        let start = name_at + "uri=\"".len();
+        // A whole attribute name: `URI` follows the tag's colon or a comma,
+        // never part of another name (`GROUP-URI`, `X-URI`).
+        if !matches!(line.as_bytes()[name_at.saturating_sub(1)], b':' | b',') {
+            from = start;
+            continue;
+        }
         let end = line[start..].find('"').map_or(line.len(), |n| start + n);
         out.push_str(&line[at..start]);
         out.push_str(&restore_in(&line[start..end], live, kept));
         at = end;
+        from = end;
     }
     out.push_str(&line[at..]);
     out
 }
+
+/// The tags whose `URI="…"` attribute names a file or playlist.
+const URI_TAGS: [&str; 9] = [
+    "#EXT-X-MAP",
+    "#EXT-X-KEY",
+    "#EXT-X-SESSION-KEY",
+    "#EXT-X-MEDIA",
+    "#EXT-X-I-FRAME-STREAM-INF",
+    "#EXT-X-PART",
+    "#EXT-X-PRELOAD-HINT",
+    "#EXT-X-RENDITION-REPORT",
+    "#EXT-X-SESSION-DATA",
+];
 
 /// `text` with each `PlaySessionId=<live>` parameter put back to `kept`.
 /// Only that parameter's value moves: a path, another parameter or any
 /// other text that happens to contain `live` is left as it is, so a changed
 /// path still shows up as a difference.
 fn restore_in(line: &str, live: &str, kept: &str) -> String {
+    // The fragment is not part of the request: it is kept as it is on both
+    // sides, and only the URI before it is restored.
+    if let Some((head, fragment)) = line.split_once('#') {
+        return format!("{}#{fragment}", restore_in(head, live, kept));
+    }
     if live.is_empty() {
         return line.to_owned();
     }
@@ -332,6 +364,32 @@ mod tests {
     const MEDIA: &str = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:6\n\
         #EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"init.mp4?PlaySessionId=p\"\n\
         #EXTINF:6.0,\n0.m4s?PlaySessionId=p\n#EXTINF:4.5,\n1.m4s?PlaySessionId=p\n#EXT-X-ENDLIST\n";
+
+    /// CR 4667... (offline.rs:237, 252): `URI` is matched as a whole
+    /// attribute name inside URI-bearing tags only, and the fragment is not
+    /// rewritten: a renewed URI with a changed query and an identical
+    /// fragment is accepted.
+    #[test]
+    fn only_whole_uri_attributes_and_the_query_are_restored() {
+        // `GROUP-URI` and a title are not a URI attribute.
+        let stored = "#EXT-X-MEDIA:GROUP-URI=\"a?PlaySessionId=new\",URI=\"b?PlaySessionId=old\"\n\
+            #EXTINF:6,URI=\"t?PlaySessionId=new\"\n";
+        let renewed =
+            "#EXT-X-MEDIA:GROUP-URI=\"a?PlaySessionId=new\",URI=\"b?PlaySessionId=new\"\n\
+            #EXTINF:6,URI=\"t?PlaySessionId=new\"\n";
+        assert_eq!(same_playlist(stored, renewed, "old", "new"), Ok(()));
+        let wrongly = stored.replace(
+            "GROUP-URI=\"a?PlaySessionId=new",
+            "GROUP-URI=\"a?PlaySessionId=old",
+        );
+        assert!(same_playlist(&wrongly, renewed, "old", "new").is_err());
+        // The fragment stays as it is on both sides.
+        let stored = "0.m4s?PlaySessionId=old#f?PlaySessionId=new\n";
+        let renewed = "0.m4s?PlaySessionId=new#f?PlaySessionId=new\n";
+        assert_eq!(same_playlist(stored, renewed, "old", "new"), Ok(()));
+        let other = "0.m4s?PlaySessionId=new#f?PlaySessionId=old\n";
+        assert!(same_playlist(stored, other, "old", "new").is_err());
+    }
 
     /// CR 4666431560: the session rewrite touches URI lines and `URI="…"`
     /// attributes only; a title or comment that names the session is text.
