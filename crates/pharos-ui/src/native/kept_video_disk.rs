@@ -2653,7 +2653,17 @@ async fn verify_renewal(
         texts.push((key, text));
     }
     for (key, text) in &texts {
-        let renewed = fetch_compare(inner, user, item, key, PLAYLIST_MAX_BYTES).await?;
+        // One byte past the limit tells a playlist that ends at it from one
+        // that goes on: the second is not the stored stream, whatever its
+        // first PLAYLIST_MAX_BYTES say.
+        let renewed =
+            fetch_compare(inner, user, item, key, PLAYLIST_MAX_BYTES.saturating_add(1)).await?;
+        if renewed.len() as u64 > PLAYLIST_MAX_BYTES {
+            return Err(changed(format!(
+                "url_path={} renewed_over_limit limit={PLAYLIST_MAX_BYTES}",
+                url_path(key)
+            )));
+        }
         let renewed = String::from_utf8_lossy(&renewed);
         // Stored copies are localized as they are written: the renewed text
         // is put the same way before it is compared.
@@ -8958,6 +8968,43 @@ pub(crate) mod tests {
         assert!(
             !changed.iter().any(|l| l.contains("PlaySessionId=q")),
             "session hidden"
+        );
+    }
+
+    /// CR review 6018104500 (kept_video_disk.rs:2579-2582): a renewed
+    /// playlist that goes past the size limit is a changed stream, named as
+    /// such, not compared on its truncated prefix.
+    #[tokio::test]
+    async fn a_renewed_playlist_past_the_limit_is_a_changed_stream() {
+        let rig = Rig::new("renew-oversized");
+        let gate = rig.server.slow_first_open(SEG1);
+        rig.server.fail(SEG1, &[410]);
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        wait_indexed(&store, INIT).await;
+        gate.store(true, Ordering::SeqCst);
+        store.settled().await;
+        let renamed = renew_server(&rig, "q");
+        let padded = format!(
+            "{}#{}\n",
+            renamed(MEDIA),
+            "x".repeat(usize::try_from(PLAYLIST_MAX_BYTES).unwrap())
+        );
+        rig.server
+            .files
+            .lock()
+            .unwrap()
+            .insert(renamed(MEDIA_KEY), padded.into_bytes());
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_eq!(v.halt, Some(Halt::StreamChanged), "{v:?}");
+        let changed = lines("pharos: video keep renewed");
+        assert!(
+            changed.iter().any(|l| l.contains("renewed_over_limit")),
+            "{changed:?}"
         );
     }
 
