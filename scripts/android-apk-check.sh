@@ -88,14 +88,25 @@ fi
 # drawable the overlay replaces under dx's own name. Its first path must
 # be the Pharos mark's.
 mark=$(sed -n 's/.*android:pathData="\([^"]*\)".*/\1/p' "$res/drawable-v24/ic_launcher_foreground.xml" | head -n 1)
-foreground=""
+# Each XML variant is checked on its own: the device picks one by its
+# configuration, so one carrying the mark cannot vouch for another.
+checked=0
+wrong=""
 for file in $(res_files drawable/ic_launcher_foreground); do
-  foreground+=$("$AAPT2" dump xmltree --file "$file" "$apk" 2>&1)$'\n'
+  case "$file" in *.xml) ;; *) continue ;; esac
+  checked=$((checked + 1))
+  if ! tree=$("$AAPT2" dump xmltree --file "$file" "$apk" 2>&1); then
+    wrong+=" $file (unreadable)"
+  elif [ -z "$mark" ] || ! printf '%s\n' "$tree" | grep -qF "$mark"; then
+    wrong+=" $file"
+  fi
 done
-if [ -n "$mark" ] && printf '%s\n' "$foreground" | grep -qF "$mark"; then
-  pass "launcher icon is the Pharos mark"
+if [ "$checked" -gt 0 ] && [ -z "$wrong" ]; then
+  pass "launcher icon is the Pharos mark ($checked variant(s))"
+elif [ "$checked" -eq 0 ]; then
+  fail "no XML drawable/ic_launcher_foreground in the APK (dx's default icon?)"
 else
-  fail "launcher icon foreground lacks the Pharos mark path '$mark' (dx's default icon?)"
+  fail "launcher icon foreground lacks the Pharos mark path '$mark' in:$wrong (dx's default icon?)"
 fi
 
 # The theme: the manifest's android:theme must be AppTheme, and AppTheme's
