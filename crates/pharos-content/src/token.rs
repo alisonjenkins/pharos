@@ -931,8 +931,23 @@ impl Ended {
 /// every token when it could not be named. No store can land between the
 /// operation and its fence, so the fence names what the operation saw.
 pub fn end_session(path: &Path, seen: Option<&str>, user: Option<&str>) -> Ended {
+    end_session_retrying(path, seen, user, None)
+}
+
+/// [`end_session`] for a caller that retries a sign-out whose token it can
+/// no longer name: `retained` is the fingerprint an earlier, unfinished end
+/// of this session reported as its target ([`Ended::Unsafe`]). With no token
+/// on file and its absence not yet durable, that token is marked revoked,
+/// so the retry ends as the first would have, instead of reporting an
+/// absence that a crash may undo with nothing refusing the token.
+pub fn end_session_retrying(
+    path: &Path,
+    seen: Option<&str>,
+    user: Option<&str>,
+    retained: Option<&str>,
+) -> Ended {
     let _held = hold();
-    let (ended, ended_token) = end_session_held(path, seen, user);
+    let (ended, ended_token) = end_session_held(path, seen, user, retained);
     match &ended {
         Ended::Unsafe { target, .. } => {
             // Added to what is already refused, never in its place: an
@@ -967,9 +982,10 @@ fn end_session_held(
     path: &Path,
     seen: Option<&str>,
     user: Option<&str>,
+    retained: Option<&str>,
 ) -> (Ended, Option<String>) {
     let seen_fp = seen.map(|t| fingerprint(t.trim()));
-    let ended = end_session_inner(path, seen, user);
+    let ended = end_session_inner(path, seen, user, retained);
     match ended {
         (e @ Ended::Changed, _) => (e, None),
         (e, read) => (e, read.or(seen_fp)),
@@ -982,6 +998,7 @@ fn end_session_inner(
     path: &Path,
     seen: Option<&str>,
     user: Option<&str>,
+    retained: Option<&str>,
 ) -> (Ended, Option<String>) {
     let read = {
         #[cfg(debug_assertions)]
@@ -1004,14 +1021,22 @@ fn end_session_inner(
                 // Gone, but its absence may not be on disk yet (an earlier
                 // unlink whose sync failed): the token the session ended
                 // with is marked, when one is named.
-                Forgotten::NotDurable(why) => match seen {
-                    Some(seen) => mark(
+                Forgotten::NotDurable(why) => match (seen, retained) {
+                    (Some(seen), _) => mark(
                         path,
                         user,
                         &fingerprint(seen),
                         format!("absence not durable: {why}"),
                     ),
-                    None => Ended::Forgotten(Forgotten::NotDurable(why)),
+                    // An unnamed retry marks the token an earlier end of
+                    // this session left.
+                    (None, Some(fp)) => {
+                        log::info!(
+                            "token forget verdict=retry reason=absence_not_durable target=retained"
+                        );
+                        mark(path, user, fp, format!("absence not durable: {why}"))
+                    }
+                    (None, None) => Ended::Forgotten(Forgotten::NotDurable(why)),
                 },
             };
             return (ended, None);
@@ -2401,6 +2426,48 @@ pub(crate) mod tests {
 
     /// A sign-out retried after an unlink whose folder sync failed is
     /// durable only once the folder syncs: the absence alone is not.
+    #[test]
+    fn a_retried_sign_out_marks_the_token_an_earlier_one_left_when_the_absence_is_not_durable() {
+        let d = dir("absent-retained");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        let fp = fingerprint("tokA");
+        // The first end: removed, the folder will not sync, and the marker
+        // fails too: unsafe, naming the token.
+        DIR_SYNC_ERRORS.with(|q| {
+            q.borrow_mut()
+                .extend([std::io::ErrorKind::Other, std::io::ErrorKind::Other]);
+        });
+        faults::MARKER.with(|f| f.set(true));
+        let first = end_session(&p, None, None);
+        faults::MARKER.with(|f| f.set(false));
+        DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+        let Ended::Unsafe { target, .. } = first else {
+            panic!("{first:?}");
+        };
+        assert_eq!(target.as_deref(), Some(fp.as_str()));
+        // Retried unnamed: with nothing retained the absence is all it can
+        // report; with the target it marks the token.
+        DIR_SYNC_ERRORS.with(|q| {
+            q.borrow_mut()
+                .extend([std::io::ErrorKind::Other, std::io::ErrorKind::Other]);
+        });
+        let bare = end_session_retrying(&p, None, None, None);
+        assert!(
+            matches!(bare, Ended::Forgotten(Forgotten::NotDurable(_))),
+            "{bare:?}"
+        );
+        assert_eq!(marker(&p, &fp), Marker::Absent);
+        DIR_SYNC_ERRORS.with(|q| {
+            q.borrow_mut()
+                .extend([std::io::ErrorKind::Other, std::io::ErrorKind::Other]);
+        });
+        let retried = end_session_retrying(&p, None, None, Some(&fp));
+        DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+        assert!(matches!(retried, Ended::Marked(_)), "{retried:?}");
+        assert_ne!(marker(&p, &fp), Marker::Absent, "the token was not marked");
+    }
+
     #[test]
     fn a_retried_sign_out_is_durable_only_once_the_folder_syncs() {
         let d = dir("absent-durable");
