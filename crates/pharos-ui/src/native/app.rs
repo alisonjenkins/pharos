@@ -2161,6 +2161,16 @@ pub(crate) fn use_me<A: Clone + 'static, M: Clone + 'static>(
     })
 }
 
+/// What the device effect remembers when the device's library could not be
+/// read: not a verdict, so the same standing is decided again later.
+const WAITING_FOR_DEVICE: &str = "waiting_for_device";
+
+/// Whether the standing's `reason` is the one already decided: a wait for
+/// the device's library is never "decided".
+fn device_reason_unchanged(remembered: &str, reason: &str) -> bool {
+    remembered != WAITING_FOR_DEVICE && remembered == reason
+}
+
 #[component]
 fn NativeApp(route: Route) -> Element {
     super::kept_video_view::use_video_store_watch();
@@ -2277,6 +2287,9 @@ fn NativeApp(route: Route) -> Element {
     let mut back_online = use_signal(|| false);
     let mut device_reason = use_signal(|| "connecting");
     use_effect(move || {
+        // A video store published after the device library was found
+        // missing (it lists the stores' videos) asks again.
+        let _ = super::kept_video_view::shown_video_store();
         let standing = {
             let m = machine.read();
             Standing {
@@ -2290,7 +2303,7 @@ fn NativeApp(route: Route) -> Element {
             }
         };
         let (device, reason) = device_verdict(standing);
-        if *device_reason.peek() == reason {
+        if device_reason_unchanged(*device_reason.peek(), reason) {
             return;
         }
         device_reason.set(reason);
@@ -2305,9 +2318,14 @@ fn NativeApp(route: Route) -> Element {
                     super::offline_device::library_switched();
                     offline.set(Some(Rc::new(lib)));
                 }
-                None => platform::info(&format!(
-                    "pharos: offline library verdict=waiting reason={reason} items=0"
-                )),
+                None => {
+                    // Not remembered as decided: the same standing must
+                    // look again once a store is published.
+                    device_reason.set(WAITING_FOR_DEVICE);
+                    platform::info(&format!(
+                        "pharos: offline library verdict=waiting reason={reason} items=0 retry=on_store_published"
+                    ));
+                }
             }
             return;
         }
@@ -9884,6 +9902,22 @@ fn Player(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// CR review 6018104500 (app.rs:2166): a standing whose device library
+    /// could not be read is not remembered as decided, so a store published
+    /// afterwards decides it again; a decided one still is.
+    #[test]
+    fn a_waiting_device_standing_is_decided_again() {
+        assert!(super::device_reason_unchanged("no_network", "no_network"));
+        assert!(!super::device_reason_unchanged(
+            "no_network",
+            "slow_connect"
+        ));
+        assert!(!super::device_reason_unchanged(
+            super::WAITING_FOR_DEVICE,
+            "no_network"
+        ));
+    }
 
     /// CR 4640611420: A's revoked socket shows sign-in before A's sign-out
     /// reply lands. If B has started signing in since, or is Ready, A's
