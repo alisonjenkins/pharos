@@ -2105,6 +2105,35 @@ pub(crate) mod tests {
         );
     }
 
+    /// The Android service may trim twice for one accounting: the cache's
+    /// own open counted it, and a retry landing between the service's
+    /// accounting check and that open still owes one (a trim it cannot tell
+    /// is covered). The second finds the cache already within the cap with
+    /// the same bytes and evicts nothing.
+    #[test]
+    fn a_second_trim_under_the_same_accounting_evicts_nothing() {
+        let d = tmp("twice");
+        let c = Cache::open(&d, 1000).unwrap();
+        for id in ["track/a", "track/b", "track/c"] {
+            put(&c, id, 100);
+        }
+        c.protect(&[]);
+        let hook = || -> OutsideUsed {
+            std::sync::Arc::new(|| OutsideBytes {
+                held: 900,
+                outstanding: 0,
+                ..OutsideBytes::default()
+            })
+        };
+        // 900 of video leaves room for one track exactly: the cap is met.
+        assert_eq!(c.set_outside_used(hook()), ids(&["track/a", "track/b"]));
+        assert_eq!(c.used_bytes(), 100);
+        // The owed trim finds nothing more to do.
+        assert!(c.set_outside_used(hook()).is_empty());
+        assert_eq!(c.used_bytes(), 100);
+        assert!(c.is_complete("track/c"));
+    }
+
     /// Adding a track and trimming is one step against a host's admission:
     /// it waits for whoever holds the shared lock.
     #[test]
