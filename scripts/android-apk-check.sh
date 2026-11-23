@@ -88,13 +88,17 @@ fi
 # drawable the overlay replaces under dx's own name. Its first path must
 # be the Pharos mark's.
 mark=$(sed -n 's/.*android:pathData="\([^"]*\)".*/\1/p' "$res/drawable-v24/ic_launcher_foreground.xml" | head -n 1)
-# Each XML variant is checked on its own: the device picks one by its
-# configuration, so one carrying the mark cannot vouch for another.
+# Each variant is checked on its own: the device picks one by its
+# configuration, so one carrying the mark cannot vouch for another. Ours is
+# a vector, so a bitmap variant (which a TV may pick) is not ours.
 checked=0
 wrong=""
 for file in $(res_files drawable/ic_launcher_foreground); do
-  case "$file" in *.xml) ;; *) continue ;; esac
   checked=$((checked + 1))
+  case "$file" in
+    *.xml) ;;
+    *) wrong+=" $file (a bitmap, not the Pharos vector)"; continue ;;
+  esac
   if ! tree=$("$AAPT2" dump xmltree --file "$file" "$apk" 2>&1); then
     wrong+=" $file (unreadable)"
   elif [ -z "$mark" ] || ! printf '%s\n' "$tree" | grep -qF "$mark"; then
@@ -104,7 +108,7 @@ done
 if [ "$checked" -gt 0 ] && [ -z "$wrong" ]; then
   pass "launcher icon is the Pharos mark ($checked variant(s))"
 elif [ "$checked" -eq 0 ]; then
-  fail "no XML drawable/ic_launcher_foreground in the APK (dx's default icon?)"
+  fail "no drawable/ic_launcher_foreground in the APK (dx's default icon?)"
 else
   fail "launcher icon foreground lacks the Pharos mark path '$mark' in:$wrong (dx's default icon?)"
 fi
