@@ -28,9 +28,6 @@ pub enum Verdict {
     Normal,
     /// Cut off with downloads to play: the offline home.
     OfflineHome,
-    /// Cut off with only downloaded video to play: the list of videos,
-    /// with no music or book home above it.
-    VideosOnly,
     /// Cut off with nothing to play: the waiting page.
     Waiting,
 }
@@ -40,62 +37,55 @@ impl Verdict {
         match self {
             Self::Normal => "normal",
             Self::OfflineHome => "offline_home",
-            Self::VideosOnly => "videos_only",
             Self::Waiting => "waiting_page",
         }
     }
 }
 
-/// The verdict, why, and how many downloaded items and videos it counted.
+/// The verdict, why, and how many downloaded items it counted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Decision {
     pub verdict: Verdict,
     pub reason: &'static str,
     pub items: usize,
-    pub videos: usize,
 }
 
 impl Decision {
     /// The line the phone logs for the decision.
     pub fn log_line(&self) -> String {
         format!(
-            "pharos: offline start verdict={} reason={} items={} videos={}",
+            "pharos: offline start verdict={} reason={} items={}",
             self.verdict.label(),
             self.reason,
-            self.items,
-            self.videos
+            self.items
         )
     }
 }
 
 /// Which screen a start gets (V1413). `cut_off` is the app's own verdict that the
 /// server cannot be reached; `can_play` says the phone has both ports;
-/// `items` is how many downloaded music or book items could play, and
-/// `videos` how many downloaded videos (which play with no audio port).
-pub fn decide(cut_off: bool, can_play: bool, items: usize, videos: usize) -> Decision {
+/// `items` is how many downloaded items could play.
+pub fn decide(cut_off: bool, can_play: bool, items: usize) -> Decision {
     let (verdict, reason) = if !cut_off {
         (Verdict::Normal, "connected")
-    } else if can_play && items > 0 {
-        (Verdict::OfflineHome, "downloads_available")
-    } else if videos > 0 {
-        (Verdict::VideosOnly, "videos_available")
     } else if !can_play {
         (Verdict::Waiting, "no_offline_store")
-    } else {
+    } else if items == 0 {
         (Verdict::Waiting, "nothing_downloaded")
+    } else {
+        (Verdict::OfflineHome, "downloads_available")
     };
     Decision {
         verdict,
         reason,
         items,
-        videos,
     }
 }
 
 /// Whether `now` differs from the decision last logged, and records it. The
 /// start screen redraws on every retry of the server; one line per change.
-pub fn is_new(last: &mut Option<(Verdict, usize, usize)>, now: &Decision) -> bool {
-    let key = (now.verdict, now.items, now.videos);
+pub fn is_new(last: &mut Option<(Verdict, usize)>, now: &Decision) -> bool {
+    let key = (now.verdict, now.items);
     if *last == Some(key) {
         return false;
     }
@@ -103,7 +93,7 @@ pub fn is_new(last: &mut Option<(Verdict, usize, usize)>, now: &Decision) -> boo
     true
 }
 
-static LAST_LOGGED: Mutex<Option<(Verdict, usize, usize)>> = Mutex::new(None);
+static LAST_LOGGED: Mutex<Option<(Verdict, usize)>> = Mutex::new(None);
 
 fn log_decision(decision: &Decision) {
     let mut last = LAST_LOGGED.lock().unwrap_or_else(PoisonError::into_inner);
@@ -311,7 +301,8 @@ pub fn OfflineSong(id: String, ids: Vec<String>, at: usize) -> Element {
     rsx! { OfflineStart {} }
 }
 
-/// Whether anything is downloaded on this phone, for the slow-connect timer.
+/// Whether anything is downloaded on this phone, music, book or video, for
+/// the slow-connect timer.
 pub fn any_downloaded() -> bool {
     offline_store().is_some_and(|store| {
         store
@@ -322,25 +313,16 @@ pub fn any_downloaded() -> bool {
 }
 
 /// The offline home, or `None` for the waiting page. Logs the decision.
-/// `videos` is the ready-video count the caller's render shows (V1465), so
-/// the logged verdict describes that render, not a later read of a store
-/// published in between.
-pub fn start(videos: usize) -> Option<Element> {
-    let decision = start_decision(videos);
-    log_decision(&decision);
-    (decision.verdict == Verdict::OfflineHome).then(|| rsx! { OfflineStart {} })
-}
-
-/// The cut-off decision over the registered ports and the caller's
-/// `videos` count.
-fn start_decision(videos: usize) -> Decision {
+pub fn start() -> Option<Element> {
     let store = offline_store();
     let can_play = store.is_some() && native_audio().is_some();
     let items = match (&store, can_play) {
         (Some(store), true) => current_items(&**store).1.len(),
         _ => 0,
     };
-    decide(true, can_play, items, videos)
+    let decision = decide(true, can_play, items);
+    log_decision(&decision);
+    (decision.verdict == Verdict::OfflineHome).then(|| rsx! { OfflineStart {} })
 }
 
 #[derive(Clone)]
@@ -544,21 +526,21 @@ mod tests {
 
     #[test]
     fn connected_is_normal_whatever_is_downloaded() {
-        let d = decide(false, true, 3, 0);
+        let d = decide(false, true, 3);
         assert_eq!(d.verdict, Verdict::Normal);
         assert_eq!(d.reason, "connected");
     }
 
     #[test]
     fn cut_off_with_an_empty_store_keeps_the_waiting_page() {
-        let d = decide(true, true, 0, 0);
+        let d = decide(true, true, 0);
         assert_eq!(d.verdict, Verdict::Waiting);
         assert_eq!(d.reason, "nothing_downloaded");
     }
 
     #[test]
     fn cut_off_with_downloads_shows_the_offline_home() {
-        let d = decide(true, true, 2, 0);
+        let d = decide(true, true, 2);
         assert_eq!(d.verdict, Verdict::OfflineHome);
         assert_eq!(d.reason, "downloads_available");
         assert_eq!(d.items, 2);
@@ -566,7 +548,7 @@ mod tests {
 
     #[test]
     fn cut_off_without_the_phone_ports_keeps_the_waiting_page() {
-        let d = decide(true, false, 2, 0);
+        let d = decide(true, false, 2);
         assert_eq!(d.verdict, Verdict::Waiting);
         assert_eq!(d.reason, "no_offline_store");
     }
@@ -574,49 +556,13 @@ mod tests {
     #[test]
     fn the_log_line_names_verdict_reason_and_count() {
         assert_eq!(
-            decide(true, true, 2, 0).log_line(),
-            "pharos: offline start verdict=offline_home reason=downloads_available items=2 videos=0"
+            decide(true, true, 2).log_line(),
+            "pharos: offline start verdict=offline_home reason=downloads_available items=2"
         );
         assert_eq!(
-            decide(true, true, 0, 0).log_line(),
-            "pharos: offline start verdict=waiting_page reason=nothing_downloaded items=0 videos=0"
+            decide(true, true, 0).log_line(),
+            "pharos: offline start verdict=waiting_page reason=nothing_downloaded items=0"
         );
-    }
-
-    #[test]
-    fn downloaded_video_alone_lists_the_videos() {
-        let d = decide(true, true, 0, 2);
-        assert_eq!(d.verdict, Verdict::VideosOnly);
-        assert_eq!(d.reason, "videos_available");
-        assert_eq!(d.videos, 2);
-        assert_eq!(
-            d.log_line(),
-            "pharos: offline start verdict=videos_only reason=videos_available items=0 videos=2"
-        );
-        // Video needs no audio port, so it lists without one too.
-        assert_eq!(decide(true, false, 0, 1).verdict, Verdict::VideosOnly);
-    }
-
-    #[test]
-    fn music_and_video_together_keep_the_music_home_and_count_both() {
-        let d = decide(true, true, 2, 3);
-        assert_eq!(d.verdict, Verdict::OfflineHome);
-        assert_eq!(d.reason, "downloads_available");
-        assert_eq!((d.items, d.videos), (2, 3));
-        assert_eq!(decide(false, true, 2, 3).verdict, Verdict::Normal);
-        let d = decide(true, false, 2, 0);
-        assert_eq!(
-            (d.verdict, d.reason),
-            (Verdict::Waiting, "no_offline_store")
-        );
-    }
-
-    #[test]
-    fn a_change_in_the_video_count_is_logged_again() {
-        let mut last = None;
-        assert!(is_new(&mut last, &decide(true, true, 0, 1)));
-        assert!(!is_new(&mut last, &decide(true, true, 0, 1)));
-        assert!(is_new(&mut last, &decide(true, true, 0, 2)));
     }
 
     #[test]
@@ -624,22 +570,21 @@ mod tests {
         let mut labels = vec![
             Verdict::Normal.label(),
             Verdict::OfflineHome.label(),
-            Verdict::VideosOnly.label(),
             Verdict::Waiting.label(),
         ];
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 3);
     }
 
     #[test]
     fn a_repeated_decision_is_logged_once_and_a_change_again() {
         let mut last = None;
-        assert!(is_new(&mut last, &decide(true, true, 0, 0)));
-        assert!(!is_new(&mut last, &decide(true, true, 0, 0)));
-        assert!(is_new(&mut last, &decide(true, true, 2, 0)));
-        assert!(!is_new(&mut last, &decide(true, true, 2, 0)));
-        assert!(is_new(&mut last, &decide(false, true, 2, 0)));
+        assert!(is_new(&mut last, &decide(true, true, 0)));
+        assert!(!is_new(&mut last, &decide(true, true, 0)));
+        assert!(is_new(&mut last, &decide(true, true, 2)));
+        assert!(!is_new(&mut last, &decide(true, true, 2)));
+        assert!(is_new(&mut last, &decide(false, true, 2)));
     }
 
     #[test]
@@ -874,19 +819,9 @@ mod tests {
         );
     }
 
-    /// The decision counts the videos the caller's render read, not a read
-    /// of its own: with no store published here, a second read finds none.
-    #[test]
-    fn the_start_decision_counts_the_videos_its_caller_shows() {
-        assert!(super::super::offline_video::ready_for_last_user().is_empty());
-        let d = start_decision(2);
-        assert_eq!((d.verdict, d.videos), (Verdict::VideosOnly, 2));
-        assert_eq!(start_decision(0).verdict, Verdict::Waiting);
-    }
-
     #[test]
     fn without_registered_ports_the_start_falls_back_to_the_waiting_page() {
-        assert!(start(0).is_none());
+        assert!(start().is_none());
         let mut dom = VirtualDom::new(|| rsx! { OfflineStart {} });
         dom.rebuild_in_place();
         assert_eq!(dioxus_ssr::render(&dom), "");
