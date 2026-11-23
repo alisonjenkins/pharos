@@ -5952,6 +5952,7 @@ fn offline_reconnect_stops(
     owner: &str,
     authorized: Option<&str>,
     last_ms: &Cell<u64>,
+    keep: impl FnOnce(u64),
 ) -> bool {
     if !offline_owner_lost(owner, authorized) {
         platform::info(&format!(
@@ -5960,9 +5961,16 @@ fn offline_reconnect_stops(
         return false;
     }
     let carried = last_ms.replace(0);
+    // The place belongs to the owner who reached it: it goes to their own
+    // saved position, not to whoever is authorized now, and not nowhere.
+    let kept = carried > 0;
+    if kept {
+        keep(carried);
+    }
     platform::info(&format!(
-        "pharos: playback offline item={id} verdict=stopped reason=owner_not_authorized authorized_user={} carried_ms={carried} carried=dropped",
-        authorized.is_some()
+        "pharos: playback offline item={id} verdict=stopped reason=owner_not_authorized authorized_user={} carried_ms={carried} carried={}",
+        authorized.is_some(),
+        if kept { "saved_for_departed_owner" } else { "none" }
     ));
     true
 }
@@ -6728,7 +6736,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         // the start is decided again for whoever is authorized now.
         if let Some(save) = &p.0.offline {
             let authorized = offline_video::last_user();
-            if offline_reconnect_stops(id, &save.user, authorized.as_deref(), &owner_last_ms) {
+            let keep = |ms| {
+                p.0.save_offline(ms);
+            };
+            if offline_reconnect_stops(id, &save.user, authorized.as_deref(), &owner_last_ms, keep)
+            {
                 playing.restart();
             }
             return;
@@ -10091,16 +10103,24 @@ mod tests {
     fn an_owner_change_drops_the_carried_position() {
         let id: ItemRef = "7".parse().unwrap();
         let carried = std::cell::Cell::new(90_000u64);
-        assert!(!offline_reconnect_stops(id, "A", Some("A"), &carried));
+        let saved = std::cell::RefCell::new(Vec::new());
+        let keep = |ms| saved.borrow_mut().push(ms);
+        assert!(!offline_reconnect_stops(id, "A", Some("A"), &carried, keep));
+        assert!(saved.borrow().is_empty(), "a same-owner reconnect saved");
         assert_eq!(
             carried.get(),
             90_000,
             "a same-owner reconnect lost its place"
         );
-        assert!(offline_reconnect_stops(id, "A", Some("B"), &carried));
+        assert!(offline_reconnect_stops(id, "A", Some("B"), &carried, keep));
         assert_eq!(carried.get(), 0, "B's start carried on from A's position");
+        assert_eq!(
+            *saved.borrow(),
+            vec![90_000],
+            "A's place was lost on the owner change"
+        );
         carried.set(5);
-        assert!(offline_reconnect_stops(id, "A", None, &carried));
+        assert!(offline_reconnect_stops(id, "A", None, &carried, keep));
         assert_eq!(carried.get(), 0, "a signed-out start carried A's position");
     }
 
