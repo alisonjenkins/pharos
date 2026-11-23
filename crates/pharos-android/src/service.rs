@@ -383,6 +383,13 @@ pub(crate) fn accounting_installed() -> bool {
     OUTSIDE_USED.get().is_some()
 }
 
+/// Whether the installed accounting counts the video's bytes: the hook is
+/// in AND it reports known usage (its store is published). A hook installed
+/// before the video folder could be made reports unknown, and is not usable.
+pub(crate) fn accounting_usable(used: Option<&content::OutsideUsed>) -> bool {
+    used.is_some() && !outside_bytes(used).unknown
+}
+
 /// What the library's hook reports. With no accounting installed nothing is
 /// known of what the app's downloads hold, so the size is unknown and the
 /// music cache admits nothing, as prefetch (`prefetch_refusal`) does; it is
@@ -454,6 +461,9 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
         if let Some(files) = FILES.get() {
             ensure_cache(lib, files, "connect");
         }
+        // Accounting that arrived before this cache was published owes its
+        // trim to whoever publishes the last piece.
+        settle_trim("connect");
         return Ok(());
     }
     if ::log::set_logger(&CONTENT_LOG).is_ok() {
@@ -507,8 +517,14 @@ pub(crate) fn ensure_cache(lib: &content::Library, files: &str, when: &str) -> C
         return CacheSetup::AlreadyEnabled;
     }
     let cache_dir = Path::new(files).join("audio-cache");
-    // Opening trims with whatever accounting is installed now.
-    let had_accounting = accounting_installed();
+    // Opening trims with the accounting only when it can count: a hook
+    // installed ahead of a video store that never opened reports usage
+    // unknown, and covers nothing.
+    let had_accounting = accounting_usable(OUTSIDE_USED.get());
+    log(&format!(
+        "cache open when={when} accounting_installed={} accounting_usable={had_accounting}",
+        accounting_installed()
+    ));
     match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
         Ok(()) => {
             TRIM.cache_opened(had_accounting);
@@ -878,8 +894,8 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 #[cfg(test)]
 mod tests {
     use super::{
-        access, outside_bytes, rerun_init, retry_until_done, spawn_once, Background, Caller,
-        InitRetry, TrimDebt, TrimVerdict,
+        access, accounting_usable, outside_bytes, rerun_init, retry_until_done, spawn_once,
+        Background, Caller, InitRetry, TrimDebt, TrimVerdict,
     };
     use pharos_content as content;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -961,6 +977,50 @@ mod tests {
     fn an_init_done_before_the_cache_opens_trims_once() {
         assert_eq!(startup_trims(&["retry_done", "open", "publish"]), 1);
         assert_eq!(startup_trims(&["open", "retry_done", "publish"]), 1);
+    }
+
+    /// CR 4667501130 (service.rs:61, 105, 511): a hook installed before its
+    /// video store exists reports unknown usage and covers nothing, so the
+    /// cache that opens beside it still owes the trim when the store is
+    /// published later; a store known at the open covers it.
+    #[test]
+    fn a_hook_with_no_store_does_not_cover_the_trim() {
+        let known = std::sync::atomic::AtomicBool::new(false);
+        let known = std::sync::Arc::new(known);
+        let seen = known.clone();
+        let hook: content::OutsideUsed = std::sync::Arc::new(move || content::OutsideBytes {
+            unknown: !seen.load(Ordering::SeqCst),
+            ..content::OutsideBytes::default()
+        });
+        assert!(!accounting_usable(None));
+        // Registration failed after the hook went in: installed, unknown.
+        assert!(!accounting_usable(Some(&hook)));
+        let debt = TrimDebt::new();
+        debt.cache_opened(accounting_usable(Some(&hook)));
+        // The retry then succeeds: the store is known, the trim is owed and
+        // settled once the library is published and the cache is open.
+        known.store(true, Ordering::SeqCst);
+        assert!(accounting_usable(Some(&hook)));
+        debt.accounting_arrived();
+        assert_eq!(debt.take(true, true), TrimVerdict::Trim);
+        assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
+        // A hook whose store is known at the open covers it.
+        let debt = TrimDebt::new();
+        debt.cache_opened(accounting_usable(Some(&hook)));
+        debt.accounting_arrived();
+        assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
+    }
+
+    /// CR 4667503016 (b): accounting that arrives after the cache opened
+    /// but before it is published is settled by the publish.
+    #[test]
+    fn accounting_between_the_open_and_the_publish_is_settled_by_the_publish() {
+        assert_eq!(startup_trims(&["open", "retry_done", "publish"]), 1);
+        let debt = TrimDebt::new();
+        debt.cache_opened(false);
+        debt.accounting_arrived();
+        assert_eq!(debt.take(false, true), TrimVerdict::NoLibraryYet);
+        assert_eq!(debt.take(true, true), TrimVerdict::Trim);
     }
 
     /// CR 4666325440: a retry and a connect that both reach the init at once
