@@ -133,8 +133,10 @@ pub const SESSION_KEY: &str = "PlaySessionId";
 /// The `PlaySessionId` value `url`'s query carries, if any (key matched
 /// without regard to case, as the server does).
 pub fn play_session(url: &str) -> Option<&str> {
+    // The fragment ends the URL for a server: a `?` inside it opens no
+    // query, so a session parameter cannot be supplied from there.
+    let url = without_fragment(url);
     let (_, query) = url.split_once('?')?;
-    let query = query.split('#').next().unwrap_or(query);
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=')?;
         (k.eq_ignore_ascii_case(SESSION_KEY) && !v.is_empty()).then_some(v)
@@ -155,12 +157,16 @@ pub fn redact_session(url: &str) -> String {
 }
 
 fn swap_session(url: &str, with: impl Fn(&str) -> String) -> String {
-    let Some((head, rest)) = url.split_once('?') else {
-        return url.to_owned();
+    // The fragment is cut off first: a `?` inside it is not a query.
+    let (url, fragment) = match url.split_once('#') {
+        Some((u, f)) => (u, Some(f)),
+        None => (url, None),
     };
-    let (query, fragment) = match rest.split_once('#') {
-        Some((q, f)) => (q, Some(f)),
-        None => (rest, None),
+    let Some((head, query)) = url.split_once('?') else {
+        return match fragment {
+            Some(f) => format!("{url}#{f}"),
+            None => url.to_owned(),
+        };
     };
     let query = query
         .split('&')
@@ -386,6 +392,25 @@ mod tests {
 
     /// Disarm check: a `rebind` that also touched `VideoBitrate` fails the
     /// first assertion.
+    #[test]
+    fn a_fragment_never_supplies_a_play_session() {
+        assert_eq!(play_session("/v/0.m4s#x?PlaySessionId=evil"), None);
+        assert_eq!(play_session("/v/0.m4s?a=1#x?PlaySessionId=evil"), None);
+        assert_eq!(
+            play_session("/v/0.m4s?PlaySessionId=p#t=1?PlaySessionId=evil"),
+            Some("p")
+        );
+        // Rebinding and redacting leave a fragment's text as it is.
+        assert_eq!(
+            rebind("/v/0.m4s#x?PlaySessionId=a", "new"),
+            "/v/0.m4s#x?PlaySessionId=a"
+        );
+        assert_eq!(
+            redact_session("/v/0.m4s?PlaySessionId=a#x?PlaySessionId=b"),
+            "/v/0.m4s?PlaySessionId=~#x?PlaySessionId=b"
+        );
+    }
+
     #[test]
     fn rebinding_swaps_only_the_play_session() {
         assert_eq!(
