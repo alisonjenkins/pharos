@@ -172,25 +172,12 @@ fn token_lock() -> std::sync::MutexGuard<'static, Option<Option<String>>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The sign-out fence is the token file's own ([`token_file::fence`]): set
-/// by the sign-out operation that left its token on file, under the file's
-/// lock, so that token is not loaded again here. Every token store replaces
-/// it in the same lock, the car's QuickConnect included.
-fn fence(path: &std::path::Path) -> token_file::SignOutFence {
-    token_file::fence(path)
-}
-
 /// `load_token`, read from disk only the first time. Never log the value.
 pub fn token() -> Option<String> {
     let mut cached = token_lock();
     // A store since (the car's QuickConnect writes the file itself) may
     // have put another token there: read it again.
-    if let Some(token) = &*cached {
-        if !token_file::take_stale() {
-            return token.clone();
-        }
-    }
-    load_locked(&mut cached)
+    token_file::token_cached(&mut cached, || token_path().ok(), token_file::take_stale)
 }
 
 /// The stored device token, if any. Never log the value.
@@ -200,17 +187,7 @@ pub fn load_token() -> Option<String> {
 
 /// Reads the token behind the fence and caches it, under the cache's lock.
 fn load_locked(cached: &mut Option<Option<String>>) -> Option<String> {
-    let path = token_path().ok();
-    let fence = path.as_deref().map(fence).unwrap_or_default();
-    // The read goes through the fence itself (`token_file::read`).
-    let token = path
-        .and_then(|path| token_file::read(&path).ok().flatten())
-        .map(|s| s.token);
-    if token.is_none() && fence != token_file::SignOutFence::Open {
-        log::info!("pharos: token load verdict=refused reason=signed_out_token_not_removed");
-    }
-    *cached = Some(token.clone());
-    token
+    token_file::load_into(cached, token_path().ok().as_deref())
 }
 
 /// The token for a download request of `owner`'s run, from one uncached
@@ -263,9 +240,7 @@ pub fn store_token(token: &str) -> Result<(), String> {
 pub fn forget_token() -> token_file::SignedOut {
     token_file::forget_token_with(
         token_path,
-        |_| {
-            *token_lock() = Some(None);
-        },
+        |_| token_file::invalidate_after_sign_out(&mut token_lock()),
         |notice| match notice {
             token_file::ServiceNotice::StaySignedOut => note_credentials_kept(),
             token_file::ServiceNotice::Reload => note_credentials_changed("forgotten"),

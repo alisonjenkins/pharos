@@ -130,6 +130,53 @@ fn after_store(_stored: &str, _replaced: Option<&str>) {
     STALE.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// Reads the token behind the fence and caches it (`cached` is the caller's
+/// cache, under the caller's lock). Never log the value.
+pub fn load_into(cached: &mut Option<Option<String>>, path: Option<&Path>) -> Option<String> {
+    let fence = path.map(fence).unwrap_or_default();
+    // The read goes through the fence itself ([`read`]).
+    let token = path
+        .and_then(|path| read(path).ok().flatten())
+        .map(|s| s.token);
+    if token.is_none() && fence != SignOutFence::Open {
+        log::info!("pharos: token load verdict=refused reason=signed_out_token_not_removed");
+    }
+    *cached = Some(token.clone());
+    token
+}
+
+/// The cached token, read again when nothing is cached or `stale` says the
+/// file changed since.
+pub fn token_cached(
+    cached: &mut Option<Option<String>>,
+    path: impl FnOnce() -> Option<PathBuf>,
+    stale: impl FnOnce() -> bool,
+) -> Option<String> {
+    if let Some(token) = &*cached {
+        if !stale() {
+            return token.clone();
+        }
+    }
+    load_into(cached, path().as_deref())
+}
+
+/// What the sign-out's cache clear leaves: nothing known, so the next read
+/// goes to the file. Not "no token": a store that landed after the
+/// operation released the file's lock (a Quick Connect sign-in, the
+/// phone's own) may have cached its token, and the file still holds it.
+/// The fence the operation published refuses the token it left.
+pub fn invalidate_after_sign_out(cached: &mut Option<Option<String>>) {
+    log::info!(
+        "pharos: token cache action=invalidate reason=sign_out_clear held={}",
+        match cached {
+            None => "unknown",
+            Some(None) => "absent",
+            Some(Some(_)) => "token",
+        }
+    );
+    *cached = None;
+}
+
 /// Removes the token and its user, under the file's lock; absent is fine.
 /// Signed out once it returns Ok, whether or not the removal is durable yet
 /// (`Forgotten::NotDurable` says why not).
@@ -221,11 +268,16 @@ pub enum ServiceNotice {
 /// caller cached (with the path, when there is one), and `notifier` tells
 /// the media service.
 ///
-/// Lock order: the token file's lock is held only inside [`sign_out_fenced`] (the
-/// content layer's one operation: every token fenced, then the token on
-/// file removed or revoked), and nothing is called while it is held. `clear`
-/// and `notifier` run after it, so neither can sit behind, nor be run under,
-/// the file's lock, and no other lock is taken inside it. The fence is
+/// Lock order, outermost first: the caller's cache lock (android.rs `TOKEN`,
+/// held across a store, a refused-token end or a cached read), then the
+/// token file's lock (`pharos_content::token` `FILE`), then the fence
+/// table's mutex (`FENCES`, taken under the file's lock when a fence is
+/// added or read). The only call made under those is the change hook, which
+/// sets an atomic flag and takes no lock. [`sign_out_fenced`] takes the
+/// file's lock and then `FENCES`, and holds neither cache lock: `clear` and
+/// `notifier` run after it has returned, so `clear` takes the cache lock
+/// only with the file's lock released. Nothing takes the cache lock while
+/// holding the file's lock or `FENCES`, so there is no inversion. The fence is
 /// published before `clear` runs on every exit: every token at the file's
 /// path, or at every path when the path cannot be found. The sign-out
 /// itself never narrows that fence: when the token can be neither removed
@@ -306,6 +358,31 @@ mod sign_out_tests {
     /// CR 4644634569: a sign-out whose folder would not sync is not
     /// answered as a plain 204: the sign-in screen is told it may come
     /// back after a restart. Durable removals and revocations stay 204.
+    /// CR 4666307257: a store of B that lands after the sign-out released
+    /// the file's lock, then a read that caches B, then the sign-out's cache
+    /// clear: B must still be read. The clear leaves the cache unknown, not
+    /// "no token".
+    #[test]
+    fn a_store_between_the_sign_out_and_its_cache_clear_is_not_lost() {
+        let d = super::super::test_dir::TmpDir::new("clear-after-store");
+        let path = d.path().join("device-token");
+        store(&path, "tokA").unwrap();
+        assert_eq!(sign_out_fenced(&path), SignedOut::Saved);
+        // The phone's own store of B (it caches B under its lock) ...
+        store(&path, "tokB").unwrap();
+        let mut cached = Some(Some("tokB".to_owned()));
+        // ... a read that serves it ...
+        let at = || Some(path.clone());
+        assert_eq!(token_cached(&mut cached, at, || false), Some("tokB".into()));
+        // ... and then the sign-out's clear.
+        invalidate_after_sign_out(&mut cached);
+        assert_eq!(
+            token_cached(&mut cached, at, || false),
+            Some("tokB".into()),
+            "the clear hid the token a later sign-in stored"
+        );
+    }
+
     #[test]
     fn a_sign_out_not_durable_is_not_answered_as_done() {
         use super::super::machine::SignOutReply;
