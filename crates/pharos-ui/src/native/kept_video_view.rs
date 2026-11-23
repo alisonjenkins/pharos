@@ -111,9 +111,11 @@ pub fn VideoKeepControl(
     on_quality: EventHandler<u64>,
     on_download: EventHandler<()>,
     on_remove: EventHandler<()>,
-    /// The queue's word for a download not started yet ("Queued · 3rd").
+    /// The queue's word for a download not started yet ("Queued · 3rd"), and
+    /// whether it failed for good: then Retry is offered, in place of
+    /// Download.
     #[props(default)]
-    queued: Option<String>,
+    queued: Option<QueuedKeep>,
 ) -> Element {
     // Only a failure no later try mends offers Retry (ADR 0148).
     let state = video
@@ -124,7 +126,7 @@ pub fn VideoKeepControl(
                 matches!(v.state, KeptState::Failed { .. }) && v.halt.is_none(),
             )
         })
-        .or_else(|| queued.map(|line| (line, false)));
+        .or_else(|| queued.map(|q| (q.line, q.failed)));
     let idle = !matches!(&state, Some((_, false)));
     let label = match (&state, busy) {
         (_, true) => "Starting\u{2026}",
@@ -474,9 +476,11 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
     let remove_store = store.clone();
     let _ = download_driver::QUEUE_CHANGED.read();
     let queued = match (&video, user.as_deref()) {
-        (None, Some(u)) => queued_line(&download_driver::load(), u, &item),
+        (None, Some(u)) => queued_status(&download_driver::load(), u, &item),
         _ => None,
     };
+    let retry_queued = queued.as_ref().is_some_and(|q| q.failed);
+    let retry_item = item.clone();
     rsx! {
         VideoKeepControl {
             video,
@@ -489,6 +493,14 @@ pub fn VideoKeep(detail: Detail, version: String) -> Element {
                 let (detail, version, store) = (detail.clone(), version.clone(), store.clone());
                 let bps = *quality.peek();
                 let rendered = download_owner.clone();
+                // A queue entry that failed for good is carried on by the
+                // queue's own Retry, not queued a second time.
+                if retry_queued {
+                    if let Some(u) = rendered.as_deref() {
+                        download_driver::retry(ctx, u, &retry_item);
+                    }
+                    return;
+                }
                 busy.set(true);
                 message.set(None);
                 spawn(async move {
@@ -537,17 +549,28 @@ pub fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
+/// What the title page says of a queued download with no record yet, and
+/// whether it failed for good (Retry is offered; a queued or paused one
+/// offers neither Download nor Retry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedKeep {
+    pub line: String,
+    pub failed: bool,
+}
+
 /// What the title page says of `item` while it is queued with no record
 /// yet: its place, paused, or why it could not start.
-fn queued_line(queue: &download_queue::Queue, user: &str, item: &str) -> Option<String> {
+fn queued_status(queue: &download_queue::Queue, user: &str, item: &str) -> Option<QueuedKeep> {
     let mine: Vec<_> = queue.entries.iter().filter(|e| e.user == user).collect();
     let at = mine.iter().position(|e| e.item == item)?;
     let e = mine[at];
-    Some(match (&e.failed, e.paused) {
+    let failed = e.failed.is_some();
+    let line = match (&e.failed, e.paused) {
         (Some(reason), _) => format!("Failed: {reason}"),
         (None, true) => "Paused".to_owned(),
         (None, false) => format!("Queued \u{b7} {}", ordinal(at + 1)),
-    })
+    };
+    Some(QueuedKeep { line, failed })
 }
 
 /// A queue row's state in words.
@@ -1089,16 +1112,28 @@ mod tests {
             entries: vec![entry("u", "1"), entry("other", "9"), entry("u", "2")],
         };
         assert_eq!(
-            queued_line(&queue, "u", "2").as_deref(),
-            Some("Queued \u{b7} 2nd")
+            queued_status(&queue, "u", "2"),
+            Some(QueuedKeep {
+                line: "Queued \u{b7} 2nd".into(),
+                failed: false
+            })
         );
-        assert_eq!(queued_line(&queue, "u", "9"), None);
+        assert_eq!(queued_status(&queue, "u", "9"), None);
         queue.set_paused("u", "2", true);
-        assert_eq!(queued_line(&queue, "u", "2").as_deref(), Some("Paused"));
+        assert_eq!(
+            queued_status(&queue, "u", "2"),
+            Some(QueuedKeep {
+                line: "Paused".into(),
+                failed: false
+            })
+        );
         queue.entries[2].failed = Some("no room".into());
         assert_eq!(
-            queued_line(&queue, "u", "2").as_deref(),
-            Some("Failed: no room")
+            queued_status(&queue, "u", "2"),
+            Some(QueuedKeep {
+                line: "Failed: no room".into(),
+                failed: true
+            })
         );
     }
 
@@ -1808,6 +1843,32 @@ mod tests {
         }
         assert!(html.contains("Download"));
         assert!(!html.contains("Remove"));
+    }
+
+    /// A queued download that failed for good offers Retry (the queue's, in
+    /// place of Download); a queued or paused one offers neither.
+    #[test]
+    fn a_queued_failure_offers_retry_and_a_waiting_entry_neither() {
+        fn queued(failed: bool) -> Element {
+            rsx! {
+                VideoKeepControl {
+                    video: None,
+                    queued: QueuedKeep { line: "x".into(), failed },
+                    quality: DEFAULT_QUALITY_BPS,
+                    busy: false,
+                    message: None,
+                    on_quality: |_| {},
+                    on_download: |()| {},
+                    on_remove: |()| {},
+                }
+            }
+        }
+        let failed = render(|| queued(true));
+        assert!(failed.contains("Retry"), "{failed}");
+        assert!(!failed.contains(">Download<"), "{failed}");
+        let waiting = render(|| queued(false));
+        assert!(!waiting.contains("Retry"), "{waiting}");
+        assert!(!waiting.contains(">Download<"), "{waiting}");
     }
 
     #[test]
