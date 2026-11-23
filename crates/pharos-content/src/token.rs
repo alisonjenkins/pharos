@@ -649,8 +649,11 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     // A token already on file and usable (no marker names it) is stored
     // again with nothing pending: a marker over the active credential would
     // refuse it after a restart if this store then failed to clear it.
-    let already_usable =
-        matches!(&previous, Some(s) if s.token == token) && matches!(found, Marker::Absent);
+    // A token this process fences (a sign-out left it on disk) is not
+    // usable, however plainly it reads: it gets its marker like any install.
+    let already_usable = matches!(&previous, Some(s) if s.token == token)
+        && matches!(found, Marker::Absent)
+        && !fence_held(path).refuses(token);
     let pending = !retrying && !already_usable;
     if already_usable {
         log::info!("token store verdict=no_pending_marker reason=token_already_usable");
@@ -2254,6 +2257,28 @@ pub(crate) mod tests {
         assert!(again.is_ok(), "{again:?}");
         assert_eq!(load(&p2).unwrap().as_deref(), Some("tok"));
         assert_eq!(after_restart(&p2).as_deref(), Some("tok"));
+        // A fenced token that reads fine (an unsafe sign-out left it) is not
+        // usable: stored again, it still gets the pending marker, so a failed
+        // read-back with a failed repair does not leave it loadable after a
+        // restart.
+        let p4 = dir("pending-fenced").join("device-token");
+        store(&p4, "tokA").unwrap();
+        add_fence(&p4, &Fence::token(&fingerprint("tokA")), "test");
+        FAIL_READ_BACK.with(|f| f.set(true));
+        faults::MARKER.with(|f| f.set(true));
+        let fenced = store(&p4, "tokA");
+        faults::MARKER.with(|f| f.set(false));
+        FAIL_READ_BACK.with(|f| f.set(false));
+        assert!(fenced.is_err(), "{fenced:?}");
+        assert!(
+            revoked(&p4, &fingerprint("tokA")).is_some(),
+            "no pending marker"
+        );
+        assert_eq!(
+            after_restart(&p4),
+            None,
+            "the fenced token loads after a restart"
+        );
         // A folder whose sync is unsupported still signs in on the pending
         // path (the install's own fallback), not claimed durable.
         let p3 = dir("pending-dir-unsupported").join("device-token");
