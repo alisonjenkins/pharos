@@ -551,6 +551,12 @@ async fn download(user: &str, item: &str, run: u64, resume: bool) -> Result<u64,
         inits.extend(media.inits);
         texts.push((url.clone(), text));
     }
+    for url in super::kept_video::keep_only_unshared_tails(&mut short_tails, &files) {
+        info(&format!(
+            "pharos: video keep short tail verdict=not_excused item={item} reason=listed_elsewhere url_path={}",
+            url_path(&url)
+        ));
+    }
     if let Some((live, kept)) = &renewing {
         verify_renewal(&cache, user, item, run, &texts, &inits, kept, live).await?;
     }
