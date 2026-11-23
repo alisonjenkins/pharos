@@ -1060,8 +1060,8 @@ fn mark(path: &Path, named: Option<&str>, token_fingerprint: &str, removal: Stri
         Ok(()) => {
             changed("marked");
             log::warn!(
-                "token revocation marker verdict=written reason=token_not_removed user={} error={removal}",
-                named.unwrap_or("")
+                "token revocation marker verdict=written reason=token_not_removed user_named={} error={removal}",
+                named.is_some()
             );
             Ended::Marked(removal)
         }
@@ -2577,6 +2577,40 @@ pub(crate) mod tests {
         let ended = end_session(p, Some("tokA"), Some("A"));
         faults::REMOVE.with(|f| f.set(false));
         assert!(matches!(ended, Ended::Marked(_)), "{ended:?}");
+    }
+
+    /// CR review 6018104500 (token.rs:1042-1045): the marker warning says
+    /// whether a user is named, never which; the marker itself keeps the id.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_marker_warning_does_not_log_the_user_id() {
+        let d = dir("marker-log-user");
+        let p = d.join("device-token");
+        store(&p, "tokA").unwrap();
+        crate::testlog::start();
+        faults::REMOVE.with(|f| f.set(true));
+        let ended = end_session(&p, Some("tokA"), Some("user-7f3a"));
+        faults::REMOVE.with(|f| f.set(false));
+        assert!(matches!(ended, Ended::Marked(_)), "{ended:?}");
+        let lines = crate::testlog::lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("revocation marker verdict=written")
+                    && l.contains("user_named=true")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("user-7f3a")),
+            "the user id was logged: {lines:?}"
+        );
+        assert_eq!(
+            revoked(&p, &fingerprint("tokA"))
+                .and_then(|r| r.user)
+                .as_deref(),
+            Some("user-7f3a"),
+            "the marker lost the id"
+        );
     }
 
     /// What a restart reads: the in-process fence is gone, the disk stays.
