@@ -747,10 +747,18 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let dir =
-            std::env::temp_dir().join(format!("pharos-android-cache-retry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // Created exclusively: a name already taken (a leftover, another
+        // process) is skipped, never reused or deleted, and only the folder
+        // this test made is removed.
+        let dir = (0u32..100)
+            .find_map(|n| {
+                let dir = std::env::temp_dir().join(format!(
+                    "pharos-android-cache-retry-{}-{n}",
+                    std::process::id()
+                ));
+                std::fs::create_dir(&dir).ok().map(|()| dir)
+            })
+            .unwrap_or_else(|| panic!("no free fixture folder name"));
         let _fixture = Fixture(dir.clone());
         let files = dir.to_str().unwrap().to_owned();
         let lib = content::Library::connect("http://127.0.0.1:9", &dir.join("token")).unwrap();
