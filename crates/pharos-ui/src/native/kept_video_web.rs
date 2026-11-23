@@ -573,6 +573,15 @@ async fn download(user: &str, item: &str, run: u64, resume: bool) -> Result<u64,
     let total = u32::try_from(all.len()).unwrap_or(u32::MAX);
     let planned = all.clone();
     let stale = stale_files(&record.files, &all);
+    // The run that planned this may have been replaced while the playlists
+    // were read (a pause, then a start): its plan does not touch the
+    // record its successor owns.
+    if !owns(user, item, run) {
+        info(&format!(
+            "pharos: video keep plan item={item} run={run} verdict=dropped reason=superseded_by_newer_run"
+        ));
+        return Err(Stop::Gone);
+    }
     let mut running = false;
     if !update(user, item, |v| {
         running = apply_plan(v, planned, estimate, total);
