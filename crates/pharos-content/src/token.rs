@@ -234,6 +234,20 @@ fn err(path: &Path, e: impl std::fmt::Display) -> ContentError {
     }
 }
 
+/// How [`store`] names a token it refuses to take up (empty, or revoked):
+/// a refusal of the credential, not a failure to persist it.
+const STORE_REFUSED: &str = "token store refused";
+
+fn refused(path: &Path, why: impl std::fmt::Display) -> ContentError {
+    err(path, format!("{STORE_REFUSED}: {why}"))
+}
+
+/// Whether `e` is a [`store`] that refused the token itself: a sign-in must
+/// stop, since the credential must not be taken up from memory either.
+pub fn is_store_refused(e: &ContentError) -> bool {
+    matches!(e, ContentError::TokenFile { why, .. } if why.starts_with(STORE_REFUSED))
+}
+
 /// What the file holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
@@ -550,7 +564,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
     let token = token.trim();
     if token.is_empty() {
         log::warn!("token store verdict=refused reason=empty_token");
-        return Err(err(path, "an empty token"));
+        return Err(refused(path, "an empty token"));
     }
     // The token this one replaces, for the fence. A read that fails does
     // not matter here: store never touches another token's marker.
@@ -604,7 +618,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
                 "same"
             }
         );
-        return Err(err(
+        return Err(refused(
             path,
             "a revocation marker refuses this token, and it is the one on file",
         ));
@@ -622,7 +636,7 @@ pub fn store(path: &Path, token: &str) -> Result<(), ContentError> {
         log::warn!(
             "token store verdict=refused reason=revocation_marker_blocks_token step=before_write error={e}"
         );
-        return Err(err(
+        return Err(refused(
             path,
             format!("the revocation marker refuses the new token and cannot be removed: {e}"),
         ));
