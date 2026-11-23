@@ -525,7 +525,7 @@ async fn download(user: &str, item: &str, resume: bool) -> Result<u64, Stop> {
 
     let estimate = estimate_bytes(plan.bandwidth_bps, duration_ms);
     info(&format!(
-        "pharos: video keep start item={item} quality={} files={} estimate={estimate}",
+        "pharos: video keep start item={item} quality_bps={} files={} estimate={estimate}",
         record.quality_bps,
         all.len()
     ));
