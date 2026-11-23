@@ -351,9 +351,12 @@ async fn start(ctx: Ctx, store: &dyn VideoStore, user: &str, item: &str, why: &s
         ));
         return;
     }
-    if let Some(grant) = settle(store, user, item, why, resumed_halt, outcome) {
+    let grant = settle(store, user, item, why, resumed_halt, outcome);
+    if let Some(grant) = grant {
         GRANTS.with(|g| g.borrow_mut().insert(item.to_owned(), grant));
     }
+    // The try the outcome counted (and when the next is) is on the page.
+    *QUEUE_CHANGED.write() += 1;
 }
 
 /// What a negotiation's outcome does: starts the run, or counts the try that
