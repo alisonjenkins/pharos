@@ -340,13 +340,9 @@ async fn start(ctx: Ctx, store: &dyn VideoStore, user: &str, item: &str, why: &s
         .find(|r| r.item == item)
         .and_then(|r| r.halt)
         .filter(|h| matches!(h, Halt::SessionEnded | Halt::Unreachable));
-    // A store halt is a try the server took part in: it answered the
-    // negotiation that started that run.
-    let tries = resumed_halt.map(|_| note_try(item, true));
     STARTING.set(true);
     let outcome = negotiate(ctx, &entry).await;
     STARTING.set(false);
-    let attempt = tries.map_or(0, |t| t.tries);
     // The viewer may have removed or paused it while the negotiation was
     // out: its grant is dropped, nothing is started.
     if let (Ok(_), Err(gone)) = (&outcome, still_startable(&load(), user, item)) {
@@ -355,13 +351,41 @@ async fn start(ctx: Ctx, store: &dyn VideoStore, user: &str, item: &str, why: &s
         ));
         return;
     }
+    if let Some(grant) = settle(store, user, item, why, resumed_halt, outcome) {
+        GRANTS.with(|g| g.borrow_mut().insert(item.to_owned(), grant));
+    }
+}
+
+/// What a negotiation's outcome does: starts the run, or counts the try that
+/// failed. The grant of a started run, for the caller to keep.
+fn settle<G>(
+    store: &dyn VideoStore,
+    user: &str,
+    item: &str,
+    why: &str,
+    resumed_halt: Option<Halt>,
+    outcome: Result<(KeepVideoRequest, G), Negotiation>,
+) -> Option<G> {
     match outcome {
         Ok((request, grant)) => match store.start(request) {
             Ok(()) => {
-                GRANTS.with(|g| g.borrow_mut().insert(item.to_owned(), grant));
+                // A store halt is a try the server took part in: it answered
+                // the negotiation that started that run. It is counted once,
+                // when a new run replaces it: counted at every attempt, a
+                // halt kept across offline retries reached the give-up count
+                // with no server answer at all.
+                let attempt = resumed_halt.map_or(0, |halt| {
+                    let t = note_try(item, true);
+                    platform::info(&format!(
+                        "pharos: video queue action=count_halt item={item} halt={halt:?} tries={} answered={}",
+                        t.tries, t.answered
+                    ));
+                    t.tries
+                });
                 platform::info(&format!(
                     "pharos: video queue action=start item={item} reason={why} attempt={attempt}"
                 ));
+                return Some(grant);
             }
             Err(refusal) => fail_for_good(user, item, refusal.to_string()),
         },
@@ -388,6 +412,7 @@ async fn start(ctx: Ctx, store: &dyn VideoStore, user: &str, item: &str, why: &s
         }
         Err(Negotiation::Never(reason)) => fail_for_good(user, item, reason),
     }
+    None
 }
 
 enum Negotiation {
@@ -455,4 +480,89 @@ async fn negotiate(
 /// The store, for a page handler.
 pub fn store() -> Option<Arc<dyn VideoStore>> {
     video_store()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::native::kept_video::KeepVideoRefusal;
+
+    #[derive(Default)]
+    struct Store {
+        started: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl VideoStore for Store {
+        fn videos(&self, _: &str) -> Vec<KeptVideo> {
+            Vec::new()
+        }
+        fn start(&self, request: KeepVideoRequest) -> Result<(), KeepVideoRefusal> {
+            self.started.lock().unwrap().push(request.item);
+            Ok(())
+        }
+        fn remove(&self, _: &str, _: &str) {}
+        fn save_position(&self, _: &str, _: &str, _: u64) {}
+        fn cap_bytes(&self) -> u64 {
+            u64::MAX
+        }
+        fn used_bytes(&self, _: &str) -> u64 {
+            0
+        }
+        fn free_bytes(&self) -> u64 {
+            u64::MAX
+        }
+    }
+
+    fn request(item: &str) -> KeepVideoRequest {
+        KeepVideoRequest {
+            item: item.to_owned(),
+            version: "v".to_owned(),
+            user: "u".to_owned(),
+            title: String::new(),
+            kind: String::new(),
+            runtime_ms: 0,
+            master_url: String::new(),
+            audio: None,
+            subtitles: Vec::new(),
+            quality_bps: 0,
+        }
+    }
+
+    fn tries_of(item: &str) -> Tries {
+        TRIES.with(|t| t.borrow().get(item).copied().unwrap_or_default())
+    }
+
+    /// A halt kept in the store across attempts that never reached the
+    /// server is not an answer each time: only the run that replaces it
+    /// counts it, once.
+    #[test]
+    fn a_kept_halt_is_counted_once_when_its_run_is_replaced() {
+        let store = Store::default();
+        let item = "halt-count";
+        for _ in 0..10 {
+            let _ = settle::<()>(
+                &store,
+                "u",
+                item,
+                "tick",
+                Some(Halt::SessionEnded),
+                Err(Negotiation::Offline("not connected".into())),
+            );
+        }
+        let t = tries_of(item);
+        assert_eq!(t.answered, 0, "unanswered attempts counted as answered");
+        assert!(!t.given_up(), "offline retries of a halt gave the item up");
+        let grant = settle(
+            &store,
+            "u",
+            item,
+            "tick",
+            Some(Halt::SessionEnded),
+            Ok((request(item), 7)),
+        );
+        assert_eq!(grant, Some(7));
+        assert_eq!(*store.started.lock().unwrap(), [item]);
+        assert_eq!(tries_of(item).answered, 1, "the halt was not counted once");
+    }
 }
