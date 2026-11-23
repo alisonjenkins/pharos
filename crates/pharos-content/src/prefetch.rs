@@ -1213,9 +1213,11 @@ impl Gate {
             // The wait for the headers may have outlived the job: a
             // replacement no longer wanted evicts nothing and truncates
             // nothing, whether its length is known or not.
-            if replacing && !self.still_wanted(id, generation) {
+            // A resumed body (206) is the same: it appends to the kept part
+            // only while it is still wanted.
+            if (replacing || append) && !self.still_wanted(id, generation) {
                 log::info!(
-                    "cache download id={id} verdict=cancelled reason=not_wanted_after_headers part=kept unknown_len={unknown_len}"
+                    "cache download id={id} verdict=cancelled reason=not_wanted_after_headers part=kept unknown_len={unknown_len} resumed={append}"
                 );
                 #[cfg(test)]
                 self.event(format!("cancelled_after_headers:{id}"));
@@ -3865,6 +3867,45 @@ mod tests {
                 r.dl.events()
             );
         }
+    }
+
+    /// CR outside-diff (prefetch.rs:1216): a resumed (206) body dropped while
+    /// its headers came appends nothing and evicts nothing; a still-wanted
+    /// one resumes as before (the neighbouring resume tests).
+    #[test]
+    fn a_resumed_body_dropped_while_its_headers_came_appends_nothing() {
+        let script = Script::default()
+            .file("/audio/1", body(1000, 1))
+            .drop_first_after(600);
+        let r = rig_with_free(
+            "resume-dropped-headers",
+            script,
+            1 << 20,
+            &["t"],
+            fast(),
+            Box::new(|_| Ok(u64::MAX)),
+        );
+        let gate = Arc::downgrade(&r.dl.gate);
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *r.dl.gate.after_headers.lock().unwrap() = Some(Box::new(move || {
+            // The first response is the body that breaks at 600; the second
+            // is the resume.
+            if seen.fetch_add(1, Ordering::SeqCst) == 1 {
+                if let Some(gate) = gate.upgrade() {
+                    gate.lock().generation += 1;
+                }
+            }
+        }));
+        r.dl.prefetch(&ids(&["track/1"]));
+        assert!(r.dl.wait_idle(Duration::from_secs(10)), "never ended");
+        assert!(!r.cache.is_complete("track/1"), "the dropped resume ran");
+        assert!(
+            r.dl.events()
+                .iter()
+                .any(|e| e == "cancelled_after_headers:track/1"),
+            "{:?}",
+            r.dl.events()
+        );
     }
 
     /// A whole new body that replaces a partial file is admitted with the

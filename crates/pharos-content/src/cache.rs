@@ -1822,13 +1822,15 @@ impl Cache {
         let room = match (parts_evicted, probed) {
             // The probe that stopped the eviction is the measure: it ran
             // after the last part went, so it is not taken again.
-            (true, Some((f, measured))) => {
+            // Finished tracks evicted before it changed what the index write
+            // below puts on disk: the measure is taken again then.
+            (true, Some((f, measured))) if !evicted => {
                 log::info!(
                     "cache admission id={downloading} verdict=approved reason=measured_after_reclaim after=part_evicted free_bytes={f} estimated={now} want={want} probe=reused"
                 );
                 measured.saturating_sub(outstanding)
             }
-            (true, None) => self.confirm(
+            (true, _) => self.confirm(
                 downloading,
                 want,
                 outstanding,
@@ -2535,6 +2537,42 @@ pub(crate) mod tests {
         let need = (free + 700).saturating_sub(MIN_FREE_BYTES);
         let verdict = c.ensure_free_replacing_part("track/x", need, true);
         assert!(verdict.is_ok(), "{verdict:?}");
+    }
+
+    /// CR outside-diff (cache.rs:1825): when finished tracks were evicted
+    /// too, the index is persisted before the free-space probe that decides
+    /// the admission, so the in-loop probe is not the decision; the room is
+    /// measured again after the write (and refused if that probe fails).
+    #[test]
+    fn a_track_eviction_is_persisted_before_the_probe_that_decides() {
+        let d = tmp("evict-track-then-part-probe");
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let inner = disk_of(&d, MIN_FREE_BYTES + 20_000);
+        let seen = calls.clone();
+        let c = Cache::open_with_probe(
+            &d,
+            1 << 30,
+            Box::new(move |p| {
+                if seen.fetch_add(1, Ordering::SeqCst) >= 2u64 {
+                    return Err(std::io::Error::other("probe failed"));
+                }
+                inner(p)
+            }),
+        )
+        .unwrap();
+        put(&c, "track/a", 400);
+        c.protect(&[]);
+        std::fs::write(c.part_path("track/x"), vec![1u8; 600]).unwrap();
+        std::fs::write(c.part_path("track/z"), vec![2u8; 1000]).unwrap();
+        calls.store(0, Ordering::SeqCst);
+        let free = (c.free)(&d).unwrap();
+        calls.store(0, Ordering::SeqCst);
+        let need = (free + 1100).saturating_sub(MIN_FREE_BYTES);
+        let verdict = c.ensure_free_replacing_part("track/x", need, true);
+        assert!(
+            matches!(verdict, Err(NoRoom::LowDisk(_))),
+            "a probe taken before the track evictions were persisted decided: {verdict:?}"
+        );
     }
 
     /// CR 4644634482: a replacement that eviction could not make room for
