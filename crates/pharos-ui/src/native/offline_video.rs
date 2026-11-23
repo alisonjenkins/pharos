@@ -1100,12 +1100,19 @@ fn tear_down_session(end: SessionEnded) -> Option<String> {
 /// and the parked downloads stand; the warning says the cleanup did not.
 /// None for any other end: the ordinary message stays as it is.
 fn restart_warning(outcome: &TokenEnd) -> Option<String> {
-    let TokenEnd::Unsafe { removal, .. } = outcome else {
-        return None;
-    };
-    Some(format!(
-        "This device could not save the sign-out ({removal}), so a restart may sign the account back in to its downloads. Sign in and sign out again to retry."
-    ))
+    match outcome {
+        TokenEnd::Unsafe { removal, .. } => Some(format!(
+            "This device could not save the sign-out ({removal}), so a restart may sign the account back in to its downloads. Sign in and sign out again to retry."
+        )),
+        // The token is gone, but its absence may not be on disk: the same
+        // warning the explicit sign-out gives (`SignOutReply::NotDurable`).
+        TokenEnd::ForgottenNotDurable(why) => Some(format!(
+            "This device removed the sign-in but could not confirm the removal was saved ({why}), so a restart may sign the account back in to its downloads. Sign in and sign out again to retry."
+        )),
+        // Durable removal, a kept replacement, and a synced revocation
+        // marker (restarts refuse the token) stay quiet.
+        TokenEnd::Forgotten | TokenEnd::KeptReplacement | TokenEnd::Marked(_) => None,
+    }
 }
 
 /// What a session's end did to its device token, on every platform (the
@@ -1311,6 +1318,21 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::super::kept_video::KeptState;
     use super::*;
+
+    /// CR review 6018104500 (offline_video.rs:1103-1104): an implicit
+    /// session end whose removal is not durable warns like an explicit
+    /// sign-out; durable removals and synced markers stay quiet.
+    #[test]
+    fn a_session_end_that_is_not_durable_warns() {
+        let warned = restart_warning(&TokenEnd::ForgottenNotDurable("sync failed".into()));
+        assert!(
+            warned.is_some_and(|w| w.contains("could not confirm") && w.contains("sync failed")),
+            "no warning for an unconfirmed removal"
+        );
+        assert_eq!(restart_warning(&TokenEnd::Forgotten), None);
+        assert_eq!(restart_warning(&TokenEnd::KeptReplacement), None);
+        assert_eq!(restart_warning(&TokenEnd::Marked("x".into())), None);
+    }
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
