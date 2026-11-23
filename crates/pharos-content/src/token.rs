@@ -1957,6 +1957,11 @@ pub(crate) mod tests {
         faults::REMOVE.with(|f| f.set(true));
         assert!(matches!(end_session(&p, None, Some("A")), Ended::Marked(_)));
         faults::REMOVE.with(|f| f.set(false));
+        // Only the marker may refuse tokA here: the in-process fence the
+        // sign-out set would refuse it whatever the reader did with the lock.
+        clear_fence(&p);
+        EVERY_FILE.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(!fence(&p).refuses("tokA"), "the fence is still set");
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let p2 = p.clone();
         let reader = std::thread::spawn(move || {
@@ -1977,10 +1982,8 @@ pub(crate) mod tests {
             std::fs::remove_file(revoked_path(&p, &fingerprint("tokA"))).unwrap();
         }
         assert_eq!(reader.join().unwrap(), None, "the revoked token was read");
-        // The ended session's token stays fenced in this process; with the
-        // marker gone by hand, a restart reads it again.
-        assert_eq!(load(&p).unwrap(), None);
-        assert_eq!(after_restart(&p).as_deref(), Some("tokA"));
+        // With the marker gone by hand and no fence, the token reads again.
+        assert_eq!(load(&p).unwrap().as_deref(), Some("tokA"));
     }
 
     /// CR 4642574358: the marker a store's unconfirmed install left is not
