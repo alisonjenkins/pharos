@@ -63,24 +63,72 @@ pub(crate) fn retry_init(when: &str) -> InitRetry {
         ));
     }
     // The video accounting now counts: a cache that opened before it did
-    // has not yet trimmed with it. Setting the hook again trims once.
-    if trim_after_retry(verdict, LIBRARY.get().is_some_and(|l| l.cache_enabled())) {
-        if let Some(lib) = LIBRARY.get() {
-            lib.set_outside_used(std::sync::Arc::new(|| outside_bytes(OUTSIDE_USED.get())));
-            log(&format!(
-                "video accounting retry when={when} trim=requested reason=accounting_installed_after_cache"
-            ));
-        }
+    // has not yet trimmed with it. Owed once, settled by whichever of this
+    // retry and `connect_library` sees both the accounting and the library.
+    if verdict == InitRetry::Done {
+        TRIM_OWED.store(true, Ordering::SeqCst);
     }
+    settle_trim(when);
     verdict
 }
 
-/// Whether a retry that just ran should make the music cache trim: only
-/// the retry that finished the init (`Done`, never again once it is done),
-/// and only when the cache is already enabled: a cache enabled later trims
-/// as it opens.
-pub(crate) fn trim_after_retry(verdict: InitRetry, cache_enabled: bool) -> bool {
-    verdict == InitRetry::Done && cache_enabled
+/// A trim the accounting's arrival owes the music cache, until one path
+/// has settled it.
+static TRIM_OWED: AtomicBool = AtomicBool::new(false);
+
+/// What settling the owed trim found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrimVerdict {
+    /// Nothing owed (never arrived, or another path already settled it).
+    NotOwed,
+    /// Owed, but the library is not published yet: it stays owed for the
+    /// path that publishes it.
+    NoLibraryYet,
+    /// Owed, the cache is not enabled: a cache enabled later trims as it
+    /// opens, so the debt is dropped.
+    CacheNotOpen,
+    /// Owed and due now. Returned to exactly one caller.
+    Trim,
+}
+
+/// Settles the owed trim: the one atomic swap that takes it decides who
+/// trims, so the accounting arriving before or after the library publishes
+/// trims once.
+pub(crate) fn take_trim(owed: &AtomicBool, library: bool, cache_enabled: bool) -> TrimVerdict {
+    if !library {
+        return if owed.load(Ordering::SeqCst) {
+            TrimVerdict::NoLibraryYet
+        } else {
+            TrimVerdict::NotOwed
+        };
+    }
+    if !owed.swap(false, Ordering::SeqCst) {
+        return TrimVerdict::NotOwed;
+    }
+    if cache_enabled {
+        TrimVerdict::Trim
+    } else {
+        TrimVerdict::CacheNotOpen
+    }
+}
+
+/// Runs the owed trim if the library is published; `by` names the path.
+fn settle_trim(by: &str) {
+    let lib = LIBRARY.get();
+    let verdict = take_trim(
+        &TRIM_OWED,
+        lib.is_some(),
+        lib.is_some_and(|l| l.cache_enabled()),
+    );
+    if verdict == TrimVerdict::NotOwed {
+        return;
+    }
+    if let (TrimVerdict::Trim, Some(lib)) = (verdict, lib) {
+        lib.set_outside_used(std::sync::Arc::new(|| outside_bytes(OUTSIDE_USED.get())));
+    }
+    log(&format!(
+        "video accounting trim by={by} verdict={verdict:?} reason=accounting_installed_after_cache"
+    ));
 }
 
 /// How long the background retry waits between tries, and how many it
@@ -365,6 +413,9 @@ pub(crate) fn connect_library(env: &mut Env, ctx: &JObject) -> R<()> {
     lib.set_outside_used(std::sync::Arc::new(|| outside_bytes(OUTSIDE_USED.get())));
     ensure_cache(&lib, &files, "first_connect");
     let _ = LIBRARY.set(lib);
+    // A retry that finished the init while the library was unpublished left
+    // the trim owed.
+    settle_trim("connect");
     Ok(())
 }
 
@@ -751,8 +802,8 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 #[cfg(test)]
 mod tests {
     use super::{
-        access, outside_bytes, rerun_init, retry_until_done, spawn_once, trim_after_retry,
-        Background, Caller, InitRetry,
+        access, outside_bytes, rerun_init, retry_until_done, spawn_once, take_trim, Background,
+        Caller, InitRetry, TrimVerdict,
     };
     use pharos_content as content;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -762,11 +813,46 @@ mod tests {
     /// and a cache not yet enabled do not.
     #[test]
     fn only_the_first_successful_retry_trims_an_enabled_cache() {
-        assert!(trim_after_retry(InitRetry::Done, true));
-        assert!(!trim_after_retry(InitRetry::Done, false));
-        assert!(!trim_after_retry(InitRetry::AlreadyDone, true));
-        assert!(!trim_after_retry(InitRetry::StillMissing, true));
-        assert!(!trim_after_retry(InitRetry::NothingToRun, true));
+        let owed = AtomicBool::new(false);
+        // Only Done owes a trim; the other verdicts leave nothing owed.
+        assert_eq!(take_trim(&owed, true, true), TrimVerdict::NotOwed);
+        owed.store(true, Ordering::SeqCst);
+        assert_eq!(take_trim(&owed, true, true), TrimVerdict::Trim);
+        assert_eq!(take_trim(&owed, true, true), TrimVerdict::NotOwed);
+        // A cache not yet enabled trims as it opens: the debt is dropped.
+        owed.store(true, Ordering::SeqCst);
+        assert_eq!(take_trim(&owed, true, false), TrimVerdict::CacheNotOpen);
+        assert_eq!(take_trim(&owed, true, true), TrimVerdict::NotOwed);
+    }
+
+    /// CR (service.rs:58): the retry that finishes the init may run before
+    /// or after `connect_library` publishes the library; the trim runs once
+    /// either way.
+    #[test]
+    fn the_trim_runs_once_whichever_of_the_retry_and_the_publish_comes_first() {
+        let trims = |order: &[&str]| {
+            let owed = AtomicBool::new(false);
+            let mut library = false;
+            let mut n = 0;
+            for step in order {
+                match *step {
+                    "retry_done" => owed.store(true, Ordering::SeqCst),
+                    "publish" => library = true,
+                    _ => unreachable!(),
+                }
+                // Each step ends with the settle both paths run.
+                if take_trim(&owed, library, true) == TrimVerdict::Trim {
+                    n += 1;
+                }
+            }
+            // A later connect or retry settles again: nothing more.
+            if take_trim(&owed, library, true) == TrimVerdict::Trim {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(trims(&["retry_done", "publish"]), 1, "retry first");
+        assert_eq!(trims(&["publish", "retry_done"]), 1, "publish first");
     }
 
     /// CR review 6018104500 (service.rs:280): the background retry keeps
