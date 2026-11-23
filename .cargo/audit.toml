@@ -54,4 +54,10 @@ ignore = [
     # all` is empty). Ignored with Alison's OK; full argument in deny.toml.
     "RUSTSEC-2026-0545",
     "RUSTSEC-2026-0548",
+    # RUSTSEC-2026-0594 — private-cookie nonces can repeat after fork in
+    # cookie < 0.18.3. The 0.18 line is bumped to the fixed 0.18.3; the
+    # cookie 0.16.2 that actix-web 4 pins has no fixed 0.16.x, and is built
+    # WITHOUT the `private` feature, so the affected code is never compiled.
+    # Ignored with Alison's OK; full argument in deny.toml.
+    "RUSTSEC-2026-0594",
 ]
