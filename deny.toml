@@ -152,6 +152,18 @@ ignore = [
     # re-check if anything enables Burn's `tch` backend.
     "RUSTSEC-2026-0545",
     "RUSTSEC-2026-0548",
+    # RUSTSEC-2026-0594 — `cookie` < 0.18.3 can repeat the AES-GCM nonce of a
+    # PrivateJar (encrypted) cookie in processes that fork, because the RNG
+    # state is copied into the child. The 0.18 line (via wry, the desktop /
+    # phone webview) is bumped to the fixed 0.18.3. cookie 0.16.2 is pinned
+    # by actix-web 4 and has no fixed 0.16.x release, but it is built with
+    # only `percent-encode` (`cargo tree -i cookie@0.16.2 -e features
+    # --target all --all-features` shows no `private` or `secure`), so
+    # PrivateJar is not compiled at all; pharos also never uses actix's
+    # cookie jars. Ignored with Alison's OK (2026-11-23). Drop the entry when
+    # actix-web moves to a fixed cookie, and re-check if anything enables
+    # cookie's `private` / `secure` feature.
+    "RUSTSEC-2026-0594",
 ]
 
 [licenses]
