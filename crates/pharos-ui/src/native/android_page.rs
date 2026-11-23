@@ -3480,19 +3480,22 @@ impl tv_page::ProxyResponse for reqwest::Response {
             .map(str::to_owned)
     }
     fn redirect(&self) -> Option<Result<String, String>> {
-        if !reqwest::Response::status(self).is_redirection() {
-            return None;
+        let target = tv_page::redirect_target(
+            reqwest::Response::status(self).is_redirection(),
+            self.headers()
+                .get(reqwest::header::LOCATION)
+                .map(|v| v.to_str().map_err(|_| ())),
+            |location| {
+                self.url()
+                    .join(location)
+                    .map(|u| u.to_string())
+                    .map_err(|e| e.to_string())
+            },
+        );
+        if let Some(Err(why)) = &target {
+            log::warn!("download redirect verdict=refused reason=location_unusable error={why}");
         }
-        let location = self
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())?;
-        Some(
-            self.url()
-                .join(location)
-                .map(|u| u.to_string())
-                .map_err(|e| e.to_string()),
-        )
+        target
     }
     async fn body(self) -> Result<Vec<u8>, String> {
         self.bytes()
