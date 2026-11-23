@@ -164,10 +164,11 @@ pub struct KeptVideo {
     pub stale_on_disk: u64,
     /// What the transfer had written when it stopped (a pause or a failure):
     /// a Failed record reports its estimate as its bytes (the reservation),
-    /// so the paused row's progress reads this instead. 0 on a record saved
-    /// before it was kept: the estimate is shown, as it was.
+    /// so the paused row's progress reads this instead. `None` on a record
+    /// saved before it was kept (the estimate is shown, as it was); `Some(0)`
+    /// is a transfer that stopped before its first byte.
     #[serde(default)]
-    pub transferred: u64,
+    pub transferred: Option<u64>,
     /// Why a Failed record stopped when a later try can mend it (ADR 0148):
     /// the queue tries it again by itself, keeping its files. `None` on a
     /// failure only the viewer can act on, and on every other state. A build
@@ -190,7 +191,9 @@ impl KeptVideo {
     /// [`Self::bytes`] (a record from before that was kept).
     pub fn held(&self) -> u64 {
         match &self.state {
-            KeptState::Failed { .. } if self.transferred > 0 => self.transferred,
+            KeptState::Failed { .. } if self.transferred.is_some() => {
+                self.transferred.unwrap_or_default()
+            }
             _ => self.bytes(),
         }
     }
@@ -1129,7 +1132,7 @@ pub fn new_record(request: &KeepVideoRequest, saved_at: String) -> KeptVideo {
         saved_at,
         estimate_from_adoption: false,
         stale_on_disk: 0,
-        transferred: 0,
+        transferred: None,
         halt: None,
     }
 }
