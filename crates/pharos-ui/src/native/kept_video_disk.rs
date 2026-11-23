@@ -2696,8 +2696,27 @@ async fn verify_renewal(
     }
     let mut compared = 0usize;
     for key in &inits {
-        let Ok(stored) = std::fs::read(inner.file_path(user, item, key)) else {
-            continue;
+        let stored = match std::fs::read(inner.file_path(user, item, key)) {
+            Ok(stored) => stored,
+            // Never stored, and no stored media depends on it (checked
+            // above): nothing to compare, and the download fetches it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            // Present but unreadable: not a match. The renewal stops here
+            // and the download is tried again, rather than publishing media
+            // never confirmed to belong to the renewed stream.
+            Err(e) => {
+                emit(
+                    true,
+                    format!(
+                        "pharos: video keep renewed item={item} verdict=init_unreadable url_path={} error={e}",
+                        url_path(key)
+                    ),
+                );
+                return Err(Stop::Failed(format!(
+                    "the stored {} could not be read to check the renewed stream: {e}",
+                    url_path(key)
+                )));
+            }
         };
         // One byte past the stored length is enough to tell them apart.
         let limit = (stored.len() as u64).saturating_add(1);
@@ -9104,6 +9123,40 @@ pub(crate) mod tests {
             .filter(|l| l.contains("verdict=stream_changed"))
             .collect();
         assert!(changed.is_empty(), "{changed:?}");
+    }
+
+    /// CR review 6018104500 (kept_video_disk.rs:2678-2679): a stored init
+    /// that cannot be read is not a match: the renewal stops and says why.
+    #[tokio::test]
+    async fn a_stored_init_that_cannot_be_read_stops_the_renewal() {
+        let rig = Rig::new("renew-init-unreadable");
+        for key in [INIT, SEG0, SEG1] {
+            rig.server.fail(key, &[401]);
+        }
+        let store = rig.open();
+        store.start(request("1")).unwrap();
+        store.settled().await;
+        assert_eq!(only(&store).halt, Some(Halt::SessionEnded));
+        // A folder where the init's file should be: present, unreadable.
+        let at = rig
+            .dir
+            .join("u1")
+            .join("1")
+            .join("files")
+            .join(file_name(INIT));
+        std::fs::create_dir_all(&at).unwrap();
+        let renamed = renew_server(&rig, "q");
+        let mut again = request("1");
+        again.master_url = renamed(MASTER_KEY);
+        store.start(again).unwrap();
+        store.settled().await;
+        let v = only(&store);
+        assert_ne!(v.state, KeptState::Ready, "{v:?}");
+        let seen = lines("pharos: video keep renewed");
+        assert!(
+            seen.iter().any(|l| l.contains("verdict=init_unreadable")),
+            "{seen:?}"
+        );
     }
 
     /// A retry under another stream (another bitrate) starts afresh and
