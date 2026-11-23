@@ -131,6 +131,9 @@ struct Gate {
     /// before it is admitted.
     #[cfg(test)]
     after_first_chunk: Mutex<Option<Box<dyn FnMut() + Send>>>,
+    /// Test hook: runs once the response headers are in, before admission.
+    #[cfg(test)]
+    after_headers: Mutex<Option<Box<dyn FnMut() + Send>>>,
     queue: Mutex<Queue>,
     idle: Condvar,
     wake: Notify,
@@ -239,6 +242,8 @@ impl Downloader {
             before_park: Mutex::new(None),
             #[cfg(test)]
             after_first_chunk: Mutex::new(None),
+            #[cfg(test)]
+            after_headers: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1196,6 +1201,26 @@ impl Gate {
             // admitted with the part counted as room; only then does the
             // part go. One that does not fit even so is refused with the
             // part kept.
+            #[cfg(test)]
+            if let Some(hook) = self
+                .after_headers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+            {
+                hook();
+            }
+            // The wait for the headers may have outlived the job: a
+            // replacement no longer wanted evicts nothing and truncates
+            // nothing, whether its length is known or not.
+            if replacing && !self.still_wanted(id, generation) {
+                log::info!(
+                    "cache download id={id} verdict=cancelled reason=not_wanted_after_headers part=kept unknown_len={unknown_len}"
+                );
+                #[cfg(test)]
+                self.event(format!("cancelled_after_headers:{id}"));
+                return Err(Fail::Cancelled);
+            }
             let mut first_chunk = None;
             let mut reserved_ahead = if replacing && unknown_len {
                 match self
@@ -1826,6 +1851,8 @@ mod tests {
             before_park: Mutex::new(None),
             #[cfg(test)]
             after_first_chunk: Mutex::new(None),
+            #[cfg(test)]
+            after_headers: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1880,6 +1907,8 @@ mod tests {
             before_park: Mutex::new(None),
             #[cfg(test)]
             after_first_chunk: Mutex::new(None),
+            #[cfg(test)]
+            after_headers: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -1944,6 +1973,8 @@ mod tests {
             before_park: Mutex::new(None),
             #[cfg(test)]
             after_first_chunk: Mutex::new(None),
+            #[cfg(test)]
+            after_headers: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -2020,6 +2051,8 @@ mod tests {
             before_park: Mutex::new(None),
             #[cfg(test)]
             after_first_chunk: Mutex::new(None),
+            #[cfg(test)]
+            after_headers: Mutex::new(None),
             queue: Mutex::new(Queue {
                 wanted: VecDeque::new(),
                 pinned: VecDeque::new(),
@@ -3777,6 +3810,61 @@ mod tests {
             "{:?}",
             r.dl.events()
         );
+    }
+
+    /// CR outside-diff (prefetch.rs:1184): a replacement dropped while its
+    /// headers came, known length or not, evicts and truncates nothing.
+    #[test]
+    fn a_replacement_dropped_while_its_headers_came_keeps_its_part() {
+        for chunked in [false, true] {
+            let script = Script::default().file("/audio/1", body(400, 2)).no_etag();
+            let script = if chunked {
+                script.chunked().chunk_bytes(400)
+            } else {
+                script
+            };
+            let slot: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::default();
+            let r = rig_with_free(
+                if chunked {
+                    "replace-dropped-headers-unknown"
+                } else {
+                    "replace-dropped-headers-known"
+                },
+                script,
+                1 << 20,
+                &["t"],
+                fast(),
+                starved_while_part(
+                    slot.clone(),
+                    Arc::new(AtomicBool::new(true)),
+                    600,
+                    MIN_FREE_BYTES - 100,
+                ),
+            );
+            let part = r.cache.part_path("track/1");
+            *slot.lock().unwrap() = Some(part.clone());
+            std::fs::write(&part, body(600, 1)).unwrap();
+            let gate = Arc::downgrade(&r.dl.gate);
+            *r.dl.gate.after_headers.lock().unwrap() = Some(Box::new(move || {
+                if let Some(gate) = gate.upgrade() {
+                    gate.lock().generation += 1;
+                }
+            }));
+            r.dl.prefetch(&ids(&["track/1"]));
+            assert!(r.dl.wait_idle(Duration::from_secs(10)), "never ended");
+            assert_eq!(
+                std::fs::read(&part).ok(),
+                Some(body(600, 1)),
+                "a dropped replacement changed its part (chunked={chunked})"
+            );
+            assert!(
+                r.dl.events()
+                    .iter()
+                    .any(|e| e == "cancelled_after_headers:track/1"),
+                "{:?}",
+                r.dl.events()
+            );
+        }
     }
 
     /// A whole new body that replaces a partial file is admitted with the
