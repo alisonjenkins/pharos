@@ -115,6 +115,9 @@ pub enum ParseError {
         tag: &'static str,
         line: usize,
     },
+    /// The playlist names an `#EXT-X-KEY` (not `METHOD=NONE`): its key
+    /// would have to be stored and served for a copy to play offline.
+    Encrypted,
 }
 
 impl fmt::Display for ParseError {
@@ -135,6 +138,9 @@ impl fmt::Display for ParseError {
             }
             Self::TagWithoutUri { tag, line } => {
                 write!(f, "#{tag} at line {line} has no following URI")
+            }
+            Self::Encrypted => {
+                f.write_str("playlist is encrypted (#EXT-X-KEY): an offline copy would not play")
             }
         }
     }
