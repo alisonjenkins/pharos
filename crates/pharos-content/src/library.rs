@@ -1304,11 +1304,27 @@ impl Worker {
     ) -> Result<Option<Link>, ContentError> {
         #[cfg(test)]
         tests::RESUMED_WITH.with(|r| r.borrow_mut().push(device_token.clone()));
-        // A test stands in for the server's side of a successful resume.
+        // A test stands in for the server's side of a successful resume: it
+        // supplies the link only; the adoption below is the production one.
         #[cfg(test)]
-        if let Some(link) = tests::RESUME_LINK.with(|r| r.borrow_mut().take()) {
-            return Ok(self.adopt_resumed(link, &device_token));
-        }
+        let seam = tests::RESUME_LINK.with(|r| r.borrow_mut().take());
+        #[cfg(not(test))]
+        let seam = None;
+        let link = match seam {
+            Some(link) => link,
+            None => self.open_resumed(events, &device_token).await?,
+        };
+        Ok(self.adopt_resumed(link, &device_token))
+    }
+
+    /// The server's side of a resume: opens the connection, resumes the
+    /// session and gets its media token, as a link.
+    async fn open_resumed(
+        &mut self,
+        events: &UnboundedSender<(u64, Event)>,
+        device_token: &str,
+    ) -> Result<Link, ContentError> {
+        let device_token = device_token.to_owned();
         let (bootstrap, closed) = net::open(&self.base).await?;
         let session = match net::resume(&bootstrap, &closed, &device_token).await {
             Ok(s) => s,
@@ -1336,7 +1352,7 @@ impl Worker {
             }
             Err(e) => return Err(e),
         };
-        Ok(self.adopt_resumed(Link::new(cat, media, device_token.clone()), &device_token))
+        Ok(Link::new(cat, media, device_token))
     }
 
     /// Takes up a resumed `link`: none when a sign-out fenced the token while
