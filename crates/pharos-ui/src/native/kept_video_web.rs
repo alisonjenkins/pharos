@@ -323,32 +323,56 @@ async fn fetch_retry(
 }
 
 enum PutErr {
+    /// A newer run owns the item now: this write is not made.
+    Superseded,
     /// The body transfer broke: fetching again can mend it.
     Transfer(String),
     /// The store refused it (quota and the like).
     Store(String),
 }
 
+/// How long a successor waits between looks at a superseded run's write.
+const PUT_FENCE_STEP_MS: u32 = 10;
+
 async fn put(
     cache: &web_sys::Cache,
+    user: &str,
+    item: &str,
+    run: u64,
     url: &str,
     response: &web_sys::Response,
 ) -> Result<(), PutErr> {
-    JsFuture::from(cache.put_with_str(url, response))
-        .await
-        .map(|_| ())
-        .map_err(|e| {
-            let name = js_sys::Reflect::get(&e, &"name".into())
-                .ok()
-                .and_then(|n| n.as_string())
-                .unwrap_or_default();
-            let reason = format!("{name}: {}", describe(&e));
-            if put_is_retryable(&name) {
-                PutErr::Transfer(reason)
-            } else {
-                PutErr::Store(reason)
-            }
-        })
+    // A write the browser already started for a run since superseded cannot
+    // be cancelled: wait for it to settle, then check this run still owns
+    // the item, so it never lands under (or is overwritten by) the other's.
+    let mut waited = 0u32;
+    while RUNS.with(|r| r.borrow().put_in_flight_from_another(user, item, run)) {
+        waited += 1;
+        platform::sleep_ms(PUT_FENCE_STEP_MS).await;
+    }
+    if waited > 0 {
+        info(&format!(
+            "pharos: video keep put verdict=waited item={item} run={run} steps={waited} reason=superseded_write_in_flight"
+        ));
+    }
+    if !owns(user, item, run) {
+        return Err(PutErr::Superseded);
+    }
+    RUNS.with(|r| r.borrow_mut().begin_put(user, item, run));
+    let written = JsFuture::from(cache.put_with_str(url, response)).await;
+    RUNS.with(|r| r.borrow_mut().end_put(user, item, run));
+    written.map(|_| ()).map_err(|e| {
+        let name = js_sys::Reflect::get(&e, &"name".into())
+            .ok()
+            .and_then(|n| n.as_string())
+            .unwrap_or_default();
+        let reason = format!("{name}: {}", describe(&e));
+        if put_is_retryable(&name) {
+            PutErr::Transfer(reason)
+        } else {
+            PutErr::Store(reason)
+        }
+    })
 }
 
 /// Fetches `url` and stores it, fetching again (on the same backoff) when
@@ -372,7 +396,7 @@ async fn fetch_put(
         } else {
             (response, None)
         };
-        let err = match put(cache, url, &stored).await {
+        let err = match put(cache, user, item, run, url, &stored).await {
             Ok(()) => {
                 let r = match back {
                     Some(r) => r,
@@ -384,6 +408,7 @@ async fn fetch_put(
         };
         attempt += 1;
         match err {
+            PutErr::Superseded => return Err(Stop::Gone),
             PutErr::Store(reason) => {
                 let reason = format!("could not store {}: {reason}", url_path(url));
                 warn(&format!(
