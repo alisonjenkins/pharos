@@ -25,6 +25,21 @@ pub fn flagged_refs(series_ids: &[String]) -> Vec<ItemRef> {
         .collect()
 }
 
+/// The flagged shows to keep from an answer that came back for the session
+/// `asked_in` while `now` is current: none once the app signed in again
+/// (a reconnect, another user), since the list was cleared for that session
+/// and an answer for the old one would put its shows back.
+pub fn answer_for_session(asked_in: u32, now: u32, ids: &[String]) -> Option<Vec<ItemRef>> {
+    if asked_in != now {
+        platform::info(&format!(
+            "pharos: flagged shows verdict=dropped reason=session_changed asked_in={asked_in} now={now} ids={}",
+            ids.len()
+        ));
+        return None;
+    }
+    Some(flagged_refs(ids))
+}
+
 /// Whether the badge shows: an admin, on a show in the answered list.
 pub fn badge_shown(admin: bool, flagged: Option<&[ItemRef]>, series: ItemRef) -> bool {
     admin && flagged.is_some_and(|list| list.contains(&series))
@@ -169,6 +184,7 @@ pub fn CheckMatchBadge(series: ItemRef) -> Element {
         }
         let (mut list, mut asked, held) = (flagged.list, flagged.asked, held.0);
         asked.set(true);
+        let asked_in = ctx.machine.peek().session();
         spawn(async move {
             let token = match held_token(ctx, held, "flagged_token").await {
                 Ok(token) => token,
@@ -182,7 +198,13 @@ pub fn CheckMatchBadge(series: ItemRef) -> Element {
                 }
             };
             match fetch_flagged(&platform::page_origin(), &token).await {
-                Ok(ids) => list.set(Some(flagged_refs(&ids))),
+                Ok(ids) => {
+                    if let Some(shows) =
+                        answer_for_session(asked_in, ctx.machine.peek().session(), &ids)
+                    {
+                        list.set(Some(shows));
+                    }
+                }
                 Err(e) => platform::warn(&format!("pharos: flagged shows unreadable: {e}")),
             }
         });
@@ -231,6 +253,20 @@ pub fn CheckMatchBadge(series: ItemRef) -> Element {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_for_an_earlier_session_is_dropped() {
+        let ids = vec!["000000000000002a000000000000002a".to_owned()];
+        assert_eq!(
+            answer_for_session(3, 3, &ids),
+            Some(vec![ItemRef::Synth(42)])
+        );
+        assert_eq!(
+            answer_for_session(3, 4, &ids),
+            None,
+            "a reconnect's list took the old session's shows"
+        );
+    }
 
     #[test]
     fn flagged_ids_become_the_shows_item_refs_and_unreadable_ones_are_dropped() {
