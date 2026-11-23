@@ -617,7 +617,7 @@ mod tests {
             saved_at: String::new(),
             estimate_from_adoption: false,
             stale_on_disk: 0,
-            transferred: 0,
+            transferred: None,
             halt,
         }
     }
@@ -658,7 +658,7 @@ mod tests {
         let row = |records: &[KeptVideo], q: &Queue| {
             rows(q, records, &HashMap::new(), "u", 0).remove(0).state
         };
-        paused.transferred = 250;
+        paused.transferred = Some(250);
         assert_eq!(
             row(&[paused.clone()], &q2),
             RowState::Paused {
@@ -666,7 +666,18 @@ mod tests {
                 bytes: 250
             }
         );
-        paused.transferred = 0;
+        // A transfer that stopped before its first byte holds nothing: 0%,
+        // not the reservation (a record from before it was kept is None).
+        paused.transferred = Some(0);
+        assert_eq!(
+            row(&[paused.clone()], &q2),
+            RowState::Paused {
+                percent: 0,
+                bytes: 0
+            },
+            "a zero-byte pause showed the reservation"
+        );
+        paused.transferred = None;
         assert_eq!(
             row(&[paused], &q2),
             RowState::Paused {
@@ -679,7 +690,7 @@ mod tests {
             r#"{"item":"1","user":"u","master_url":"/m","files":[],"state":{"state":"ready"}}"#,
         )
         .unwrap();
-        assert_eq!(old.transferred, 0);
+        assert_eq!(old.transferred, None);
     }
 
     #[test]
