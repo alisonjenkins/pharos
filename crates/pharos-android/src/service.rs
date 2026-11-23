@@ -45,6 +45,8 @@ pub fn set_init_hook(hook: fn(&str) -> bool) {
 static FILES: OnceLock<String> = OnceLock::new();
 /// Whether `INIT_HOOK` has said it is done.
 static INIT_DONE: AtomicBool = AtomicBool::new(false);
+/// Whether a caller holds the claim to run `INIT_HOOK` now: one at a time.
+static INIT_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Runs the init hook again unless it is done, so a service-only process
 /// whose video folder failed at connect registers the store once the folder
@@ -53,6 +55,7 @@ static INIT_DONE: AtomicBool = AtomicBool::new(false);
 pub(crate) fn retry_init(when: &str) -> InitRetry {
     let verdict = rerun_init(
         &INIT_DONE,
+        &INIT_RUNNING,
         FILES.get().map(String::as_str),
         INIT_HOOK.get().copied(),
     );
@@ -66,20 +69,20 @@ pub(crate) fn retry_init(when: &str) -> InitRetry {
     // has not yet trimmed with it. Owed once, settled by whichever of this
     // retry and `connect_library` sees both the accounting and the library.
     if verdict == InitRetry::Done {
-        TRIM_OWED.store(true, Ordering::SeqCst);
+        TRIM.accounting_arrived();
     }
     settle_trim(when);
     verdict
 }
 
-/// A trim the accounting's arrival owes the music cache, until one path
-/// has settled it.
-static TRIM_OWED: AtomicBool = AtomicBool::new(false);
+/// The trim the accounting's arrival owes the music cache.
+static TRIM: TrimDebt = TrimDebt::new();
 
 /// What settling the owed trim found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrimVerdict {
-    /// Nothing owed (never arrived, or another path already settled it).
+    /// Nothing owed (never arrived, covered by the cache's own open, or
+    /// another path already settled it).
     NotOwed,
     /// Owed, but the library is not published yet: it stays owed for the
     /// path that publishes it.
@@ -91,35 +94,78 @@ pub(crate) enum TrimVerdict {
     Trim,
 }
 
-/// Settles the owed trim: the one atomic swap that takes it decides who
-/// trims, so the accounting arriving before or after the library publishes
-/// trims once.
-pub(crate) fn take_trim(owed: &AtomicBool, library: bool, cache_enabled: bool) -> TrimVerdict {
-    if !library {
-        return if owed.load(Ordering::SeqCst) {
-            TrimVerdict::NoLibraryYet
+/// Whether the music cache still owes a trim for the video accounting. One
+/// lock covers the three events that decide it, so the accounting arriving,
+/// the cache opening and the library publishing trim once between them,
+/// whatever their order.
+pub(crate) struct TrimDebt(Mutex<TrimState>);
+
+#[derive(Default)]
+struct TrimState {
+    /// The accounting arrived after a cache that did not count it.
+    owed: bool,
+    /// A cache opened with the accounting installed: opening trims with it.
+    covered: bool,
+}
+
+impl TrimDebt {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(TrimState {
+            owed: false,
+            covered: false,
+        }))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, TrimState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The accounting is installed: a trim is owed unless the cache already
+    /// opened with it.
+    pub(crate) fn accounting_arrived(&self) {
+        let mut s = self.state();
+        if !s.covered {
+            s.owed = true;
+        }
+    }
+
+    /// The cache opened (and so trimmed itself); `had_accounting` says the
+    /// accounting was installed when it did, so nothing more is owed.
+    pub(crate) fn cache_opened(&self, had_accounting: bool) {
+        if had_accounting {
+            let mut s = self.state();
+            s.covered = true;
+            s.owed = false;
+        }
+    }
+
+    /// Settles the owed trim: taking it under the lock decides who trims.
+    pub(crate) fn take(&self, library: bool, cache_enabled: bool) -> TrimVerdict {
+        let mut s = self.state();
+        if !library {
+            return if s.owed {
+                TrimVerdict::NoLibraryYet
+            } else {
+                TrimVerdict::NotOwed
+            };
+        }
+        if !std::mem::take(&mut s.owed) {
+            return TrimVerdict::NotOwed;
+        }
+        if cache_enabled {
+            TrimVerdict::Trim
         } else {
-            TrimVerdict::NotOwed
-        };
-    }
-    if !owed.swap(false, Ordering::SeqCst) {
-        return TrimVerdict::NotOwed;
-    }
-    if cache_enabled {
-        TrimVerdict::Trim
-    } else {
-        TrimVerdict::CacheNotOpen
+            TrimVerdict::CacheNotOpen
+        }
     }
 }
 
 /// Runs the owed trim if the library is published; `by` names the path.
 fn settle_trim(by: &str) {
     let lib = LIBRARY.get();
-    let verdict = take_trim(
-        &TRIM_OWED,
-        lib.is_some(),
-        lib.is_some_and(|l| l.cache_enabled()),
-    );
+    let verdict = TRIM.take(lib.is_some(), lib.is_some_and(|l| l.cache_enabled()));
     if verdict == TrimVerdict::NotOwed {
         return;
     }
@@ -269,6 +315,8 @@ pub(crate) enum InitRetry {
     Done,
     /// Run, and still not done: a later caller tries again.
     StillMissing,
+    /// Another caller is running it now: not run again beside it.
+    InFlight,
 }
 
 impl InitRetry {
@@ -278,14 +326,17 @@ impl InitRetry {
             Self::NothingToRun => "nothing_to_run",
             Self::Done => "done",
             Self::StillMissing => "still_missing",
+            Self::InFlight => "in_flight",
         }
     }
 }
 
 /// Runs `hook` over `files` unless `done` says it is done, and records its
-/// answer.
+/// answer. The claim to run it is one compare-exchange on `running`, so two
+/// callers never both run it: the one that loses reports `InFlight`.
 pub(crate) fn rerun_init(
     done: &AtomicBool,
+    running: &AtomicBool,
     files: Option<&str>,
     hook: Option<fn(&str) -> bool>,
 ) -> InitRetry {
@@ -295,6 +346,24 @@ pub(crate) fn rerun_init(
     let (Some(files), Some(hook)) = (files, hook) else {
         return InitRetry::NothingToRun;
     };
+    if running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return InitRetry::InFlight;
+    }
+    /// Releases the claim, on a panic in the hook too.
+    struct Claim<'a>(&'a AtomicBool);
+    impl Drop for Claim<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _claim = Claim(running);
+    // A caller that finished between the first check and the claim.
+    if done.load(Ordering::Acquire) {
+        return InitRetry::AlreadyDone;
+    }
     if hook(files) {
         done.store(true, Ordering::Release);
         InitRetry::Done
@@ -434,8 +503,11 @@ pub(crate) fn ensure_cache(lib: &content::Library, files: &str, when: &str) -> C
         return CacheSetup::AlreadyEnabled;
     }
     let cache_dir = Path::new(files).join("audio-cache");
+    // Opening trims with whatever accounting is installed now.
+    let had_accounting = accounting_installed();
     match lib.enable_cache(&cache_dir, content::DEFAULT_CAP_BYTES) {
         Ok(()) => {
+            TRIM.cache_opened(had_accounting);
             log(&format!(
                 "cache enabled when={when} cap_bytes={}",
                 lib.cache_cap().unwrap_or(0)
@@ -802,8 +874,8 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 #[cfg(test)]
 mod tests {
     use super::{
-        access, outside_bytes, rerun_init, retry_until_done, spawn_once, take_trim, Background,
-        Caller, InitRetry, TrimVerdict,
+        access, outside_bytes, rerun_init, retry_until_done, spawn_once, Background, Caller,
+        InitRetry, TrimDebt, TrimVerdict,
     };
     use pharos_content as content;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -813,16 +885,50 @@ mod tests {
     /// and a cache not yet enabled do not.
     #[test]
     fn only_the_first_successful_retry_trims_an_enabled_cache() {
-        let owed = AtomicBool::new(false);
-        // Only Done owes a trim; the other verdicts leave nothing owed.
-        assert_eq!(take_trim(&owed, true, true), TrimVerdict::NotOwed);
-        owed.store(true, Ordering::SeqCst);
-        assert_eq!(take_trim(&owed, true, true), TrimVerdict::Trim);
-        assert_eq!(take_trim(&owed, true, true), TrimVerdict::NotOwed);
+        let debt = TrimDebt::new();
+        // Only Done owes a trim; nothing owed before it.
+        assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
+        debt.accounting_arrived();
+        assert_eq!(debt.take(true, true), TrimVerdict::Trim);
+        assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
         // A cache not yet enabled trims as it opens: the debt is dropped.
-        owed.store(true, Ordering::SeqCst);
-        assert_eq!(take_trim(&owed, true, false), TrimVerdict::CacheNotOpen);
-        assert_eq!(take_trim(&owed, true, true), TrimVerdict::NotOwed);
+        debt.accounting_arrived();
+        assert_eq!(debt.take(true, false), TrimVerdict::CacheNotOpen);
+        assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
+    }
+
+    /// Counts the trims of one startup: the settle's, and the cache open's
+    /// own when it ran with the accounting installed. Steps: "retry_done"
+    /// (the init succeeds), "open" (the cache opens), "publish" (the library
+    /// is published; both paths then settle).
+    fn startup_trims(order: &[&str]) -> usize {
+        let debt = TrimDebt::new();
+        let (mut library, mut accounting, mut open) = (false, false, false);
+        let mut trims = 0;
+        for step in order {
+            match *step {
+                "retry_done" => {
+                    accounting = true;
+                    debt.accounting_arrived();
+                }
+                "open" => {
+                    open = true;
+                    // Opening trims with what is installed now.
+                    trims += usize::from(accounting);
+                    debt.cache_opened(accounting);
+                }
+                "publish" => library = true,
+                _ => unreachable!(),
+            }
+            if debt.take(library, open) == TrimVerdict::Trim {
+                trims += 1;
+            }
+        }
+        // A later connect or retry settles again: nothing more.
+        if debt.take(library, open) == TrimVerdict::Trim {
+            trims += 1;
+        }
+        trims
     }
 
     /// CR (service.rs:58): the retry that finishes the init may run before
@@ -830,29 +936,62 @@ mod tests {
     /// either way.
     #[test]
     fn the_trim_runs_once_whichever_of_the_retry_and_the_publish_comes_first() {
-        let trims = |order: &[&str]| {
-            let owed = AtomicBool::new(false);
-            let mut library = false;
-            let mut n = 0;
-            for step in order {
-                match *step {
-                    "retry_done" => owed.store(true, Ordering::SeqCst),
-                    "publish" => library = true,
-                    _ => unreachable!(),
-                }
-                // Each step ends with the settle both paths run.
-                if take_trim(&owed, library, true) == TrimVerdict::Trim {
-                    n += 1;
-                }
+        // Cache open first with no accounting (it trims nothing counted):
+        // the accounting's arrival owes the one trim, either side of publish.
+        assert_eq!(startup_trims(&["open", "retry_done", "publish"]), 1);
+        assert_eq!(startup_trims(&["open", "publish", "retry_done"]), 1);
+    }
+
+    /// CR 4666325440: an init that succeeds before the cache opens is
+    /// trimmed by the open itself; the settle after the publish must not
+    /// trim again.
+    #[test]
+    fn an_init_done_before_the_cache_opens_trims_once() {
+        assert_eq!(startup_trims(&["retry_done", "open", "publish"]), 1);
+        assert_eq!(startup_trims(&["open", "retry_done", "publish"]), 1);
+    }
+
+    /// CR 4666325440: a retry and a connect that both reach the init at once
+    /// run the hook once, and one reports it done: one trim is owed.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn concurrent_inits_run_the_hook_once_and_owe_one_trim() {
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+        static LOST: AtomicUsize = AtomicUsize::new(0);
+        fn hook(_: &str) -> bool {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            // Hold the claim until another caller has tried it and lost.
+            let held = std::time::Instant::now();
+            while LOST.load(Ordering::SeqCst) == 0 && held.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
             }
-            // A later connect or retry settles again: nothing more.
-            if take_trim(&owed, library, true) == TrimVerdict::Trim {
-                n += 1;
+            true
+        }
+        let callers = 4;
+        let (done, running) = (AtomicBool::new(false), AtomicBool::new(false));
+        let debt = TrimDebt::new();
+        let verdicts = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..callers {
+                s.spawn(|| {
+                    let v = rerun_init(&done, &running, Some("/files"), Some(hook));
+                    if v == InitRetry::Done {
+                        debt.accounting_arrived();
+                    }
+                    verdicts.lock().unwrap().push(v);
+                    if v == InitRetry::InFlight {
+                        LOST.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
             }
-            n
-        };
-        assert_eq!(trims(&["retry_done", "publish"]), 1, "retry first");
-        assert_eq!(trims(&["publish", "retry_done"]), 1, "publish first");
+        });
+        let verdicts = verdicts.into_inner().unwrap();
+        let done_count = verdicts.iter().filter(|v| **v == InitRetry::Done).count();
+        assert!(LOST.load(Ordering::SeqCst) > 0, "no overlap forced");
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1, "{verdicts:?}");
+        assert_eq!(done_count, 1, "{verdicts:?}");
+        assert_eq!(debt.take(true, true), TrimVerdict::Trim);
+        assert_eq!(debt.take(true, true), TrimVerdict::NotOwed);
     }
 
     /// CR review 6018104500 (service.rs:280): the background retry keeps
@@ -997,22 +1136,25 @@ mod tests {
             assert_eq!(files, "/files");
             RUNS.fetch_add(1, Ordering::SeqCst) >= 1
         }
-        let done = AtomicBool::new(false);
-        assert_eq!(rerun_init(&done, None, Some(hook)), InitRetry::NothingToRun);
+        let (done, running) = (AtomicBool::new(false), AtomicBool::new(false));
         assert_eq!(
-            rerun_init(&done, Some("/files"), None),
+            rerun_init(&done, &running, None, Some(hook)),
             InitRetry::NothingToRun
         );
         assert_eq!(
-            rerun_init(&done, Some("/files"), Some(hook)),
+            rerun_init(&done, &running, Some("/files"), None),
+            InitRetry::NothingToRun
+        );
+        assert_eq!(
+            rerun_init(&done, &running, Some("/files"), Some(hook)),
             InitRetry::StillMissing
         );
         assert_eq!(
-            rerun_init(&done, Some("/files"), Some(hook)),
+            rerun_init(&done, &running, Some("/files"), Some(hook)),
             InitRetry::Done
         );
         assert_eq!(
-            rerun_init(&done, Some("/files"), Some(hook)),
+            rerun_init(&done, &running, Some("/files"), Some(hook)),
             InitRetry::AlreadyDone
         );
         assert_eq!(RUNS.load(Ordering::SeqCst), 2, "a done hook ran again");
