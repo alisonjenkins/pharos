@@ -344,11 +344,27 @@ pub fn admit(
         .filter(|e| !records.iter().any(|r| r.user == e.user && r.item == e.item))
         .map(QueueEntry::estimate)
         .sum();
+    // An entry already started has bytes still to write that the free
+    // figure does not lack yet: its estimate less what its record holds.
+    // They take room only from the free-space floor: the cap's `used`
+    // already counts the record's own bytes, and `promised` the rest.
+    let outstanding: u64 = queue
+        .entries
+        .iter()
+        .filter(|e| e.item != entry.item || e.user != entry.user)
+        .filter_map(|e| {
+            records
+                .iter()
+                .find(|r| r.user == e.user && r.item == e.item)
+                .map(|r| e.estimate().saturating_sub(r.bytes()))
+        })
+        .sum();
+    let promised_free = promised.saturating_add(outstanding);
     fits(
         entry.estimate(),
         used.saturating_add(promised),
         cap,
-        free.saturating_sub(promised),
+        free.saturating_sub(promised_free),
     )
 }
 
@@ -505,6 +521,7 @@ pub fn waiting_line(halt: Halt, in_secs: u64) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use crate::native::offline_ui::FREE_GUARD_BYTES;
 
     fn entry(item: &str) -> QueueEntry {
         QueueEntry {
@@ -750,6 +767,22 @@ mod tests {
         let cap = one * 2 + one / 2;
         assert!(admit(&q, &[], &third, 0, cap, u64::MAX).is_err());
         assert!(admit(&Queue::default(), &[], &third, 0, cap, u64::MAX).is_ok());
+    }
+
+    /// CR review 6018104500 (download_queue.rs:344): a download already
+    /// started still has bytes to write; the free-space floor counts them.
+    /// Disarm check: leaving `outstanding` out admits the second film.
+    #[test]
+    fn admission_counts_the_bytes_a_started_download_has_still_to_write() {
+        let q = queue(&["1"]);
+        let records = [record("1", downloading(), None)];
+        let second = entry("2");
+        // Room for the second film beside the first's bytes on disk, but
+        // not beside what the first has yet to write.
+        let free = second.estimate() + FREE_GUARD_BYTES + 10_000;
+        assert!(admit(&q, &records, &second, 0, u64::MAX, free).is_err());
+        let roomy = free + q.entries[0].estimate();
+        assert!(admit(&q, &records, &second, 0, u64::MAX, roomy).is_ok());
     }
 
     #[test]
