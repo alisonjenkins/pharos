@@ -332,6 +332,7 @@ impl Library {
                     qc: None,
                     qc_gen: 0,
                     qc_approved: Arc::default(),
+                    sign_out_retry: None,
                     limit,
                 };
                 worker.run_thread(rx, ready_tx)
@@ -938,6 +939,11 @@ struct Worker {
     /// Set by the poller once it has queued its approval, so a command that
     /// runs before the worker consumes it does not start a poller over it.
     qc_approved: Arc<AtomicBool>,
+    /// The fingerprint of the token a sign-out left neither removed nor
+    /// marked ([`token::Ended::Unsafe`]), kept for the next sign-out: with
+    /// no link and no file it cannot name that token itself. Cleared once an
+    /// end is safe.
+    sign_out_retry: Option<String>,
     limit: Duration,
 }
 
@@ -1407,7 +1413,23 @@ impl Worker {
         // An `Unsafe` end fences the token it targeted (every token, when
         // it could not name one) inside `end_session`, under the file's
         // lock: no store lands between the operation and its fence.
-        let ended = token::end_session(&self.token_path, seen, None);
+        let retained = if seen.is_none() {
+            self.sign_out_retry.clone()
+        } else {
+            None
+        };
+        let ended = token::end_session_retrying(&self.token_path, seen, None, retained.as_deref());
+        // A sign-out that is still unsafe is retried with its target; any
+        // other end clears it.
+        if seen.is_none() {
+            self.sign_out_retry = match &ended {
+                token::Ended::Unsafe {
+                    target: Some(fp), ..
+                } => Some(fp.clone()),
+                token::Ended::Unsafe { target: None, .. } => retained.clone(),
+                _ => None,
+            };
+        }
         if let token::Ended::Unsafe { target, .. } = &ended {
             log::warn!(
                 "token fence verdict={} reason=token_neither_removed_nor_marked at={at}",
@@ -2080,6 +2102,7 @@ mod tests {
             qc: None,
             qc_gen: 0,
             qc_approved: Arc::default(),
+            sign_out_retry: None,
             limit: Duration::from_secs(5),
         };
         (w, shared, token_path)
@@ -2195,6 +2218,51 @@ mod tests {
                 |l| l.contains("credentials reloaded: verdict=signed_out reason=no_token_file")
             ),
             "{lines:?}"
+        );
+    }
+
+    /// A sign-out that could neither remove nor mark its token, retried
+    /// once the file is gone but the folder still will not sync, marks the
+    /// token the first one left: the worker kept its target, which the
+    /// retry cannot read from a file that is not there.
+    // Fault injection exists in debug builds only.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_sign_out_retry_marks_the_token_the_first_one_left() {
+        use std::io::ErrorKind::Other;
+        let root = test_root("signout-retry-target");
+        let (mut w, shared, token_path) = worker(&root);
+        let (events, _rx) = unbounded_channel::<(u64, Event)>();
+        let (rt, local) = local_rt();
+        token::store(&token_path, "tok").unwrap();
+        shared.set_auth(AuthState::SignedIn);
+        let fp = token::fingerprint("tok");
+        // First: removed, the folder will not sync, the marker fails.
+        crate::token::tests::DIR_SYNC_ERRORS.with(|q| *q.borrow_mut() = vec![Other, Other]);
+        token::faults::MARKER.with(|f| f.set(true));
+        let first = local.block_on(&rt, async { w.execute(&Op::SignOut, &events).await });
+        token::faults::MARKER.with(|f| f.set(false));
+        crate::token::tests::DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+        assert!(first.is_err(), "an unsafe sign-out reported success");
+        assert_eq!(w.sign_out_retry.as_deref(), Some(fp.as_str()));
+        // Retried: the file is gone, the folder still will not sync.
+        crate::testlog::start();
+        crate::token::tests::DIR_SYNC_ERRORS.with(|q| *q.borrow_mut() = vec![Other, Other]);
+        let retry = local.block_on(&rt, async { w.execute(&Op::SignOut, &events).await });
+        crate::token::tests::DIR_SYNC_ERRORS.with(|q| q.borrow_mut().clear());
+        assert!(retry.is_ok(), "the retry failed");
+        assert_ne!(
+            token::marker(&token_path, &fp),
+            token::Marker::Absent,
+            "the retry left the token unmarked"
+        );
+        assert_eq!(w.sign_out_retry, None, "a safe end kept its retry target");
+        assert!(
+            crate::testlog::lines()
+                .iter()
+                .any(|l| l.contains("verdict=marked_revoked at=sign_out")),
+            "{:?}",
+            crate::testlog::lines()
         );
     }
 
