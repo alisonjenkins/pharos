@@ -1149,7 +1149,8 @@ impl Worker {
                         let polling = self.stop_sign_in();
                         self.shared.set_auth(AuthState::SignedOut);
                         log::warn!(
-                            "credentials stay signed out: verdict=signed_out reason=token_lookup_failed quickconnect_stopped={polling} error={e}"
+                            "credentials stay signed out: verdict=signed_out reason=token_lookup_failed quickconnect_stopped={polling} error={}",
+                            e.redacted()
                         );
                         return Err(e);
                     }
@@ -2614,6 +2615,13 @@ mod tests {
         assert!(result.is_err(), "the lookup error was not returned");
         assert!(w.link.is_none());
         assert_eq!(shared.lock().auth, AuthState::SignedOut, "{lines:?}");
+        // CR review 6018104500 (library.rs:1147): the log never carries the
+        // token file's path.
+        let shown = token_path.display().to_string();
+        assert!(
+            lines.iter().all(|l| !l.contains(&shown)),
+            "the token path was logged: {lines:?}"
+        );
         assert!(
             lines.iter().any(|l| l.contains(
                 "credentials stay signed out: verdict=signed_out reason=token_lookup_failed"
