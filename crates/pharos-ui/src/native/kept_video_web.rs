@@ -359,8 +359,22 @@ async fn put(
         return Err(PutErr::Superseded);
     }
     RUNS.with(|r| r.borrow_mut().begin_put(user, item, run));
-    let written = JsFuture::from(cache.put_with_str(url, response)).await;
-    RUNS.with(|r| r.borrow_mut().end_put(user, item, run));
+    // The count is given back by a task of its own when the browser's write
+    // settles, not by this future: a sibling file's failure drops this one
+    // mid-write, and the write still runs.
+    let guard = super::kept_video::OnDrop::new({
+        let (user, item) = (user.to_owned(), item.to_owned());
+        move || RUNS.with(|r| r.borrow_mut().end_put(&user, &item, run))
+    });
+    let promise = cache.put_with_str(url, response);
+    wasm_bindgen_futures::spawn_local({
+        let settled = promise.clone();
+        async move {
+            let _ = JsFuture::from(settled).await;
+            drop(guard);
+        }
+    });
+    let written = JsFuture::from(promise).await;
     written.map(|_| ()).map_err(|e| {
         let name = js_sys::Reflect::get(&e, &"name".into())
             .ok()

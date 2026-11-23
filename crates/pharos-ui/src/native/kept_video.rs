@@ -1273,10 +1273,50 @@ impl RunIds {
     }
 }
 
+/// Runs its closure when dropped: a count taken for a write that the
+/// browser may still be making is given back by whoever owns this, whether
+/// the future that started the write finished or was dropped.
+pub struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    pub fn new(f: F) -> Self {
+        Self(Some(f))
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// CR 4666431623 / 4667502228: a write's count is given back by the task
+    /// that owns the guard, not by the caller's future: a caller dropped
+    /// mid-write (a sibling fetch failed) leaves the count until the write
+    /// settles, and the settle releases it, so no successor waits forever.
+    #[test]
+    fn a_dropped_caller_does_not_leak_the_write_count() {
+        let runs = std::rc::Rc::new(std::cell::RefCell::new(RunIds::default()));
+        let old = runs.borrow_mut().claim("u", "1");
+        runs.borrow_mut().begin_put("u", "1", old);
+        let guard = OnDrop::new({
+            let runs = runs.clone();
+            move || runs.borrow_mut().end_put("u", "1", old)
+        });
+        let new = runs.borrow_mut().claim("u", "1");
+        // The caller is gone; the write has not settled: still counted.
+        assert!(runs.borrow().put_in_flight_from_another("u", "1", new));
+        // The independent task finishes with the browser's write.
+        drop(guard);
+        assert!(!runs.borrow().put_in_flight_from_another("u", "1", new));
+    }
 
     /// CR 4666431623: a superseded run's cache write that the browser
     /// already started cannot be cancelled; the successor waits for it
