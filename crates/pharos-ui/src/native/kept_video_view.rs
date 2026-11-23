@@ -583,6 +583,28 @@ fn row_kind(state: &RowState) -> &'static str {
 /// `listing`, so the page reads the store once for its two sections.
 #[component]
 fn VideoQueue(listing: Signal<Listing>) -> Element {
+    // A waiting row counts down to its next try: it renders again each
+    // second while any row waits, and not otherwise.
+    let mut clock = use_signal(|| 0u32);
+    let waiting = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    let counting = std::rc::Rc::clone(&waiting);
+    use_future(move || {
+        let waiting = std::rc::Rc::clone(&counting);
+        async move {
+            poll_every(
+                platform::SLEEP_IS_REAL,
+                || platform::sleep_ms(COUNTDOWN_MS),
+                || {
+                    if waiting.get() {
+                        *clock.write() += 1;
+                    }
+                    true
+                },
+            )
+            .await;
+        }
+    });
+    let _ = clock.read();
     let Some(store) = shown_video_store() else {
         return rsx! {};
     };
@@ -597,6 +619,7 @@ fn VideoQueue(listing: Signal<Listing>) -> Element {
     let queue = download_driver::load();
     let now = platform::now_ms().max(0.0) as u64;
     let rows = download_queue::rows(&queue, &records, &download_driver::tries(), &user, now);
+    waiting.set(any_waiting(&rows));
     if rows.is_empty() {
         return rsx! {};
     }
@@ -608,6 +631,16 @@ fn VideoQueue(listing: Signal<Listing>) -> Element {
             }
         }
     }
+}
+
+/// How often a waiting row's countdown is drawn again.
+const COUNTDOWN_MS: u32 = 1_000;
+
+/// Whether any row counts down to a try, so the queue draws again each
+/// [`COUNTDOWN_MS`].
+fn any_waiting(rows: &[download_queue::Row]) -> bool {
+    rows.iter()
+        .any(|r| matches!(r.state, RowState::Waiting { .. }))
 }
 
 /// A store handle for props (compared by pointer).
@@ -1082,6 +1115,35 @@ mod tests {
             "Waiting for a connection \u{b7} tries again in 5 s \u{b7} 1 KiB kept"
         );
         assert_eq!(row_kind(&RowState::Queued), "queued");
+    }
+
+    /// The queue draws its countdown again only while a row waits.
+    #[test]
+    fn the_countdown_runs_only_while_a_row_waits() {
+        let row = |state| download_queue::Row {
+            item: "1".into(),
+            title: "t".into(),
+            quality_bps: 0,
+            estimate: 0,
+            position: 1,
+            state,
+            can_move_up: false,
+            can_move_down: false,
+        };
+        let waiting = row(RowState::Waiting {
+            halt: Halt::Unreachable,
+            bytes: 0,
+            in_secs: 4,
+        });
+        assert!(any_waiting(&[row(RowState::Queued), waiting]));
+        assert!(!any_waiting(&[
+            row(RowState::Queued),
+            row(RowState::Paused {
+                percent: 0,
+                bytes: 0
+            })
+        ]));
+        assert!(!any_waiting(&[]));
     }
 
     /// A halted record is not offered Retry on its title page: the queue
