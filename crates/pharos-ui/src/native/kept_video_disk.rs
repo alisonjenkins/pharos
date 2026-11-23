@@ -4641,8 +4641,15 @@ async fn run(inner: Arc<Inner>, user: String, item: String, run: u64) {
 /// while `run` still owns the item. Each check and deletion is one step
 /// under the state lock, so a removal and restart in between cannot have
 /// its replacement's file at the same path deleted from under it.
+///
+/// Lock order, as everywhere: the host's admission guard first, then the
+/// state lock. The guard is taken per key and released with it (also on the
+/// early return), so a host that admits music or another download against
+/// the shared figures never reads the bytes between a landed playlist's
+/// deletion and the books that count it.
 fn drop_refused_files(inner: &Inner, user: &str, item: &str, run: u64, keys: &[String]) {
     for key in keys {
+        let _admission = inner.env.budget.admission_guard();
         let mut st = lock(&inner.state);
         if st.runs.get(&(user.to_owned(), item.to_owned())) != Some(&run) {
             return;
@@ -12062,7 +12069,16 @@ pub(crate) mod tests {
             st.runs.insert(("u1".to_owned(), "1".to_owned()), 999);
             st.playlists_landed.insert(who.clone(), len + 7);
         }
+        let taken = rig.budget.taken.load(Ordering::SeqCst);
         drop_refused_files(&store.inner, "u1", "1", 999, std::slice::from_ref(&key));
+        // CR outside-diff (kept_video_disk.rs:4652): the delete ran under the
+        // host's admission guard, taken for the key and released after.
+        assert_eq!(
+            rig.budget.taken.load(Ordering::SeqCst),
+            taken + 1,
+            "the cleanup deleted without the admission guard"
+        );
+        assert_eq!(rig.budget.held.load(Ordering::SeqCst), 0, "guard leaked");
         assert!(!path.exists());
         assert_eq!(
             lock(&store.inner.state).playlists_landed.get(&who).copied(),
