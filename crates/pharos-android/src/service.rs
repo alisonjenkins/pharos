@@ -50,7 +50,7 @@ static INIT_DONE: AtomicBool = AtomicBool::new(false);
 /// whose video folder failed at connect registers the store once the folder
 /// can be made, with no activity to do it. `when` names the caller in the
 /// log line.
-pub(crate) fn retry_init(when: &str) {
+pub(crate) fn retry_init(when: &str) -> InitRetry {
     let verdict = rerun_init(
         &INIT_DONE,
         FILES.get().map(String::as_str),
@@ -62,6 +62,25 @@ pub(crate) fn retry_init(when: &str) {
             verdict.label()
         ));
     }
+    // The video accounting now counts: a cache that opened before it did
+    // has not yet trimmed with it. Setting the hook again trims once.
+    if trim_after_retry(verdict, LIBRARY.get().is_some_and(|l| l.cache_enabled())) {
+        if let Some(lib) = LIBRARY.get() {
+            lib.set_outside_used(std::sync::Arc::new(|| outside_bytes(OUTSIDE_USED.get())));
+            log(&format!(
+                "video accounting retry when={when} trim=requested reason=accounting_installed_after_cache"
+            ));
+        }
+    }
+    verdict
+}
+
+/// Whether a retry that just ran should make the music cache trim: only
+/// the retry that finished the init (`Done`, never again once it is done),
+/// and only when the cache is already enabled: a cache enabled later trims
+/// as it opens.
+pub(crate) fn trim_after_retry(verdict: InitRetry, cache_enabled: bool) -> bool {
+    verdict == InitRetry::Done && cache_enabled
 }
 
 /// Whether a background `retry_init` is running now.
@@ -75,7 +94,9 @@ pub(crate) fn retry_init_in_background(when: &'static str) {
     if INIT_DONE.load(Ordering::Acquire) {
         return;
     }
-    let verdict = spawn_once(&RETRY_RUNNING, move || retry_init(when));
+    let verdict = spawn_once(&RETRY_RUNNING, move || {
+        retry_init(when);
+    });
     if verdict != Background::Started {
         log(&format!(
             "video accounting retry when={when} verdict={}",
@@ -673,9 +694,24 @@ pub extern "system" fn Java_com_alisonjenkins_pharos_auto_PharosMediaService_onL
 
 #[cfg(test)]
 mod tests {
-    use super::{access, outside_bytes, rerun_init, spawn_once, Background, Caller, InitRetry};
+    use super::{
+        access, outside_bytes, rerun_init, spawn_once, trim_after_retry, Background, Caller,
+        InitRetry,
+    };
     use pharos_content as content;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// CR review 6018104500 (service.rs:54-58): the retry that finishes the
+    /// init trims an already-enabled cache once; later retries (AlreadyDone)
+    /// and a cache not yet enabled do not.
+    #[test]
+    fn only_the_first_successful_retry_trims_an_enabled_cache() {
+        assert!(trim_after_retry(InitRetry::Done, true));
+        assert!(!trim_after_retry(InitRetry::Done, false));
+        assert!(!trim_after_retry(InitRetry::AlreadyDone, true));
+        assert!(!trim_after_retry(InitRetry::StillMissing, true));
+        assert!(!trim_after_retry(InitRetry::NothingToRun, true));
+    }
 
     /// The playback path's retry returns at once while the store opens, and
     /// a second caller meanwhile does not start another open; once it ends
