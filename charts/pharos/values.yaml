@@ -389,13 +389,15 @@ aligner:
       size: 1Gi
       storageClass: ""
 
-# Replaces pods that stay NotReady (docs/kubernetes.md, "Self-healing").
-# A pod-level fault, such as an NFS mount gone stale under the aligner, fails
-# its readiness probe for good; neither probe replaces the pod, so the Service
-# just loses it. A CronJob deletes pods labelled pharos.io/self-heal=true
-# (the aligners) that have been NotReady for notReadyMinutes after starting,
-# and their Deployment makes fresh ones. On by default; it needs RBAC to
-# delete pods in the release's namespace, so set false where that is refused.
+# Rolls out a fresh pod for a Deployment whose pod stays NotReady
+# (docs/kubernetes.md, "Self-healing"). A pod-level fault, such as an NFS
+# mount gone stale under the aligner, fails its readiness probe for good;
+# neither probe replaces the pod, so the Service just loses it. A CronJob
+# restarts each Deployment labelled pharos.io/self-heal=true (the aligners)
+# whose pod has been NotReady for notReadyMinutes after starting, as
+# `kubectl rollout restart` does. On by default; it needs RBAC to patch pods
+# and Deployments in the release's namespace, so set false where that is
+# refused.
 selfHeal:
   enabled: true
   schedule: "*/2 * * * *"

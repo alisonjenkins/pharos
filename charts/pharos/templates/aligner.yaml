@@ -20,6 +20,7 @@ metadata:
   labels:
     {{- include "pharos.labels" $root | nindent 4 }}
     app.kubernetes.io/component: {{ .component }}
+    {{- include "pharos.selfHeal.label" $root | nindent 4 }}
 spec:
   replicas: 1
   {{- if or $cfg.gpu.enabled $cfg.cache.enabled }}
@@ -35,7 +36,6 @@ spec:
     metadata:
       labels:
         {{- $selector | nindent 8 }}
-        {{- include "pharos.selfHeal.label" $root | nindent 8 }}
     spec:
       {{- with $root.Values.pullSecrets }}
       imagePullSecrets:
