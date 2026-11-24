@@ -248,6 +248,7 @@ async fn align(
     // Checked here, not mapped from the decode: ffmpeg missing is a server
     // fault (500), not a missing file.
     if !full_path.is_file() {
+        tracing::warn!(path = %rel_path, "song file not found");
         return fail(StatusCode::NOT_FOUND, format!("file not found: {rel_path}"));
     }
 
