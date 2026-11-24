@@ -425,6 +425,8 @@ pub fn source_open_failure(msg: &str) -> Option<&'static str> {
     let tail = msg.split("Error opening input").nth(1)?;
     Some(if tail.contains("Stale file handle") {
         "stale_handle"
+    } else if tail.contains("Transport endpoint is not connected") {
+        "not_connected"
     } else if tail.contains("No such file or directory") {
         "missing"
     } else if tail.contains("Permission denied") {
@@ -11780,6 +11782,10 @@ mod tests {
         assert_eq!(
             source_open_failure("Error opening input: Permission denied"),
             Some("permission")
+        );
+        assert_eq!(
+            source_open_failure("Error opening input: Transport endpoint is not connected"),
+            Some("not_connected")
         );
         assert_eq!(
             source_open_failure("Error opening input: Protocol not found"),
