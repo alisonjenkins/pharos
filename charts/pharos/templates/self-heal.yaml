@@ -8,7 +8,9 @@ pharos.io/self-heal=true whose containers have all started (so past the
 startup probe) are candidates.
 */ -}}
 {{- if .Values.selfHeal.enabled }}
-{{- $name := printf "%s-self-heal" (include "pharos.fullname" .) }}
+{{- /* A CronJob name may be at most 52 characters: its Jobs append an
+11-character suffix to it. */ -}}
+{{- $name := printf "%s-self-heal" (include "pharos.fullname" . | trunc 42 | trimSuffix "-") }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
