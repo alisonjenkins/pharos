@@ -58,19 +58,19 @@ fi
 yq "$container.args[0]" <<<"$cronjob" >"$work/script.sh"
 
 ago() { date -u -d "@$(($(date +%s) - $1))" +%Y-%m-%dT%H:%M:%SZ; }
-pod() { # name phase started ready seconds-since-ready-changed [seconds-since-stamp|-] [terminating|restarts-now]
-  # A stamp records 0 restarts; a pod's containers have restarted 0 times
-  # unless the 7th argument says otherwise.
-  local deleting=null annotations='{}' restarts=0
+pod() { # name phase started ready seconds-since-ready-changed [seconds-since-stamp|-] [terminating|replaced]
+  # A stamp names container aaaaaaaaaaaa; the pod's container is that one
+  # unless the 7th argument says it was replaced. restartCount stays 0 either
+  # way, as after a node restart that lost kubelet state.
+  local deleting=null annotations='{}' id=aaaaaaaaaaaa
   case "${7:-}" in
     terminating) deleting="\"$(ago 1)\"" ;;
-    '') ;;
-    *) restarts="$7" ;;
+    replaced) id=bbbbbbbbbbbb ;;
   esac
   [ -n "${6:-}" ] && [ "$6" != - ] &&
-    annotations="{\"pharos.io/not-ready-since\":\"$(($(date +%s) - $6))/0\"}"
-  printf '{"metadata":{"name":"%s","deletionTimestamp":%s,"annotations":%s},"status":{"phase":"%s","containerStatuses":[{"started":%s,"restartCount":%s}],"conditions":[{"type":"Ready","status":"%s","lastTransitionTime":"%s"}]}}' \
-    "$1" "$deleting" "$annotations" "$2" "$3" "$restarts" "$4" "$(ago "$5")"
+    annotations="{\"pharos.io/not-ready-since\":\"$(($(date +%s) - $6))/aaaaaaaaaaaa\"}"
+  printf '{"metadata":{"name":"%s","deletionTimestamp":%s,"annotations":%s},"status":{"phase":"%s","containerStatuses":[{"started":%s,"restartCount":0,"containerID":"containerd://%s0123456789"}],"conditions":[{"type":"Ready","status":"%s","lastTransitionTime":"%s"}]}}' \
+    "$1" "$deleting" "$annotations" "$2" "$3" "$id" "$4" "$(ago "$5")"
 }
 {
   echo '{"items":['
@@ -82,9 +82,9 @@ pod() { # name phase started ready seconds-since-ready-changed [seconds-since-st
   pod first-seen Running true False 600; echo ,
   # Stamped 600 s ago, then Ready, then NotReady again 30 s ago: restamped.
   pod relapsed Running true False 30 600; echo ,
-  # Stamped 400 s ago, then its container restarted (Ready stayed False):
-  # its startup ran again, so the count starts again.
-  pod restarted Running true False 900 400 1; echo ,
+  # Stamped 400 s ago, then its container was replaced (Ready stayed False,
+  # restartCount unchanged): its startup ran again, so the count starts again.
+  pod restarted Running true False 900 400 replaced; echo ,
   pod starting Running false False 600; echo ,
   pod blip Running true False 900 60; echo ,
   pod leaving Running true False 900 400 terminating; echo ,
