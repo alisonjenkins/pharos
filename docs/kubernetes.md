@@ -143,6 +143,8 @@ So the chart splits the work:
 |-------|--------------|
 | Aligner `GET /readyz` | Stats the media root and reads one entry, on its own thread with a 2 s limit. Answers 503 with the error when either fails. |
 | Aligner readiness probe | Points at `/readyz`. Liveness stays on `/healthz`, because a restart would not help. |
+| Server `GET /readyz` | Lists each media root on its own thread with a 2 s limit, and fails from the first media read that hits a stale handle, lost connection or I/O error until the pod is replaced. Answers 503 with the cause under `media`. A missing or refused library folder does not fail it, so one deleted folder cannot take the whole server out of its Service. |
+| Server media routes | A file the share cannot read answers 503, not 404: the file is not missing, this pod cannot reach it. |
 | `selfHeal` CronJob | Every 2 minutes, deletes this release's pods labelled `pharos.io/self-heal=true` that have been NotReady for `selfHeal.notReadyMinutes` (default 5) after starting. Their Deployment makes fresh pods, which mount the share again. |
 
 It is on by default. To tune it, or to turn it off where the namespace may
@@ -179,6 +181,12 @@ The image is any one with `bash`, `jq` and `kubectl` (`selfHeal.image`).
 - Gauge `pharos_aligner_media_ok`: 1 when the last readiness check read the
   media root, 0 when it did not. The chart's ServiceMonitor scrapes only the
   server, so add a scrape for the aligner's `/metrics` to use it.
+- Server log line `readyz: media share unreadable` and the one-off
+  `media share broken; the pod needs a fresh mount`, each with the cause.
+- Gauge `pharos_media_share_ok` on the server: 0 while `/readyz` finds the
+  share unusable.
+- Counter `pharos_source_unreadable_total{reason="stale_handle"}` (or
+  `not_connected`) on the server, per media read that hit a share fault.
 - `kube_pod_status_ready{condition="false"}` from kube-state-metrics, for the
   pod itself.
 
