@@ -59,7 +59,9 @@ rollout restart straight away, and it stays Ready while that is pending.
 - With `RollingUpdate` (Postgres, `strategy.type: RollingUpdate`) and the
   chart's default `maxUnavailable: 0` and `maxSurge: 1`, browsing never
   goes down. A `maxUnavailable` above 0 or a `maxSurge` of 0 lets the
-  Deployment stop the old pod first, which brings back an outage. The old pod
+  Deployment stop the old pod first, which brings back an outage. So does a
+  new pod that is not Ready within 15 minutes, since the old pod then goes
+  unready too. The old pod
   keeps serving everything but media until the new pod is Ready, and the
   Deployment then retires the old pod. Media is down from the fault until
   then, which is about one pod startup.

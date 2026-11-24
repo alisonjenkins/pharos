@@ -170,7 +170,8 @@ server sets that Deployment's `kubectl.kubernetes.io/restartedAt`, and
   pod serves everything but media until the new pod is Ready. Browsing
   never goes down as long as `strategy.rollingUpdate.maxUnavailable` is 0
   and `maxSurge` is above 0, the chart's defaults. Other values let the
-  Deployment stop the old pod first.
+  Deployment stop the old pod first. The new pod must also be Ready within
+  15 minutes; past that the old pod goes unready too (see below).
 - With `Recreate` (SQLite), the old pod stops as soon as the restart lands,
   so Pharos is down for one restart instead of the reaper's wait.
 
