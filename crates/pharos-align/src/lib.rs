@@ -16,6 +16,7 @@ pub mod forward;
 pub mod http;
 pub mod line;
 pub mod loudness;
+pub mod media;
 pub mod obs;
 pub mod offset;
 pub mod pin;

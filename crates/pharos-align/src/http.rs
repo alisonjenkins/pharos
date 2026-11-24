@@ -1,4 +1,4 @@
-//! The HTTP face of the service: `/align` and `/healthz` with the Python
+//! The HTTP face of the service: `/align`, `/healthz` and `/readyz` with the Python
 //! service's statuses and error bodies.
 
 use std::path::{Path, PathBuf};
@@ -15,7 +15,8 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
-use crate::obs::{set_remote_parent, Metrics, GPU_POOL_BYTES, SONGS_TOTAL, SONG_SECONDS};
+use crate::media::MediaProbe;
+use crate::obs::{set_remote_parent, Metrics, GPU_POOL_BYTES, MEDIA_OK, SONGS_TOTAL, SONG_SECONDS};
 use crate::placement::Method;
 use crate::plan::{parse_options, parse_request, resolve, Line, SongOptions};
 use crate::service::{Aligned, Answer, Engine, Progress, SongError};
@@ -124,6 +125,8 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub media_root: PathBuf,
+    /// Looks at `media_root` for `/readyz`.
+    pub media: MediaProbe,
     /// `None` answers `/metrics` with an empty body, as before a recorder is installed.
     pub metrics: Option<Metrics>,
 }
@@ -155,6 +158,25 @@ fn error(status: StatusCode, message: impl Into<String>) -> HttpResponse {
 
 async fn healthz() -> HttpResponse {
     json(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+/// Ready while the media root can be read; a pod whose mount went stale
+/// answers 503 here, so it leaves the Service and can be replaced.
+async fn readyz(state: web::Data<AppState>) -> HttpResponse {
+    match state.media.check().await {
+        Ok(()) => {
+            metrics::gauge!(MEDIA_OK).set(1.0);
+            json(StatusCode::OK, &serde_json::json!({ "ok": true }))
+        }
+        Err(e) => {
+            metrics::gauge!(MEDIA_OK).set(0.0);
+            tracing::warn!(error = %e, "media root unreadable");
+            json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &serde_json::json!({ "ok": false, "error": e.to_string() }),
+            )
+        }
+    }
 }
 
 async fn metrics(state: web::Data<AppState>) -> HttpResponse {
@@ -421,6 +443,11 @@ pub fn configure(state: web::Data<AppState>) -> impl FnOnce(&mut web::ServiceCon
             .service(
                 web::resource("/healthz")
                     .route(web::get().to(healthz))
+                    .default_service(web::to(not_found)),
+            )
+            .service(
+                web::resource("/readyz")
+                    .route(web::get().to(readyz))
                     .default_service(web::to(not_found)),
             )
             .service(
