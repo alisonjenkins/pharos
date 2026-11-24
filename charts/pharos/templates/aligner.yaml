@@ -35,6 +35,7 @@ spec:
     metadata:
       labels:
         {{- $selector | nindent 8 }}
+        {{- include "pharos.selfHeal.label" $root | nindent 8 }}
     spec:
       {{- with $root.Values.pullSecrets }}
       imagePullSecrets:
