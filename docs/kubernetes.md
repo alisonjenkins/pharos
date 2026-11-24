@@ -163,8 +163,19 @@ condition is False from before its startup probe passed, so the reaper does
 not trust its age: the first run that sees a started pod NotReady stamps it
 with the annotation `pharos.io/not-ready-since`, and the count runs from that
 stamp. A container replaced since the stamp (it records each container's
-ID), or a Ready change after it, starts the count again. Healing so takes between `notReadyMinutes` and `notReadyMinutes` plus
-one 2-minute run. Each stamp and each deletion logs one line:
+ID), or a Ready change after it, starts the count again.
+
+So, from the fault to the pod's deletion, with the defaults:
+
+| Step | Takes |
+|------|-------|
+| Readiness probe fails enough times to mark the pod NotReady | up to 30 s (aligner: 3 × 10 s) |
+| The next reaper run stamps it | up to 2 min |
+| The stamp ages past `notReadyMinutes` | 5 min |
+| The next reaper run deletes it | up to 2 min |
+
+That is about 5 to 10 minutes, then the new pod's own startup. Each stamp
+and each deletion logs one line:
 
 ```
 self-heal: watching pod=<name> not_ready_since=<unix seconds> containers=<ids>

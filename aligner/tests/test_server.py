@@ -371,3 +371,67 @@ def test_a_hung_media_root_answers_within_the_timeout() -> None:
         deadline.wait(0.01)
     else:
         raise AssertionError("the slot was not freed once the probe returned")
+
+
+def test_a_song_file_the_share_cannot_read_is_a_503_and_keeps_readyz_failing(
+    running_server: tuple[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import errno as errno_mod
+    import os as os_mod
+
+    from pharos_aligner import server as server_mod
+
+    base_url, media_root = running_server
+    (media_root / "stale.mp3").write_bytes(b"x")
+    real_stat = os_mod.stat
+
+    def stale_stat(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if str(path).endswith("stale.mp3"):
+            raise OSError(errno_mod.ESTALE, "Stale file handle", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(server_mod.os, "stat", stale_stat)
+    monkeypatch.setattr(server_mod, "_broken", None)
+    payload = {"path": "stale.mp3", "lines": [{"start_ms": 0, "end_ms": 1000, "text": "a"}]}
+    req = urllib.request.Request(
+        f"{base_url}/align",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as info:
+        urllib.request.urlopen(req)
+    assert info.value.code == 503
+    assert "song file unreadable" in json.loads(info.value.read().decode("utf-8"))["error"]
+
+    with pytest.raises(urllib.error.HTTPError) as ready:
+        urllib.request.urlopen(f"{base_url}/readyz")
+    assert ready.value.code == 503
+    assert "Stale file handle" in json.loads(ready.value.read().decode("utf-8"))["error"]
+
+
+def test_a_missing_song_file_is_still_a_404(running_server: tuple[str, Path]) -> None:
+    base_url, _ = running_server
+    payload = {"path": "gone.mp3", "lines": [{"start_ms": 0, "end_ms": 1000, "text": "a"}]}
+    req = urllib.request.Request(
+        f"{base_url}/align",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with pytest.raises(urllib.error.HTTPError) as info:
+        urllib.request.urlopen(req)
+    assert info.value.code == 404
+
+
+def test_a_probe_thread_that_cannot_start_frees_the_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pharos_aligner import server as server_mod
+
+    def refuse(self):  # type: ignore[no-untyped-def]
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(server_mod.threading.Thread, "start", refuse)
+    error = server_mod.checked_media_root_error("/media", timeout=0.05, probe=lambda root: None)
+    assert error is not None and "can't start new thread" in error
+    assert server_mod._PROBE_SLOT.acquire(blocking=False)
+    server_mod._PROBE_SLOT.release()

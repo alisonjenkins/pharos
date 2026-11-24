@@ -49,7 +49,10 @@ automatically.
 
 ## Consequences
 
-- A stale mount now heals in about 5 to 7 minutes, with no one involved.
+- A stale mount now heals with no one involved, about 5 to 10 minutes after
+  the fault: up to 30 s for readiness to fail, up to one 2-minute run for
+  the first stamp, `notReadyMinutes` (5), and up to one more run for the
+  deletion; then the new pod starts.
 - `pharos_aligner_media_ok` and `pharos_aligner_source_unreadable_total`
   show the fault, and the CronJob logs each pod it deletes.
 - The CronJob can delete pods. Its Role is limited to one namespace, and its
