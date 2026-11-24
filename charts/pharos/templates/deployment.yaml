@@ -4,6 +4,7 @@ metadata:
   name: {{ include "pharos.fullname" . }}
   labels:
     {{- include "pharos.labels" . | nindent 4 }}
+    {{- include "pharos.selfHeal.label" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   strategy:
@@ -31,7 +32,6 @@ spec:
         {{- end }}
       labels:
         {{- include "pharos.selectorLabels" . | nindent 8 }}
-        {{- include "pharos.selfHeal.label" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
