@@ -444,26 +444,34 @@ pub fn source_open_failure(msg: &str) -> Option<&'static str> {
 /// [`source_open_failure`] for an encode whose FIRST input is `source`: an
 /// input that failed to open is classified only when it is the source. A
 /// muxed segment also opens the title's continuous audio encode, a cache
-/// file, as a second input; that file failing to open says nothing about the
-/// source or its share, so it stays a transcode failure.
+/// file, as a second input (`more_inputs`); that file failing to open says
+/// nothing about the source or its share, so it stays a transcode failure.
 ///
 /// ffmpeg names the input both ways: `[in#N @ …] Error opening input: …`
 /// gives its index, and `Error opening input file <url>.` its URL. Either
-/// one pointing elsewhere rules the source out.
-pub fn source_open_failure_of(msg: &str, source: &Path) -> Option<&'static str> {
+/// one pointing elsewhere rules the source out. With more than one input, the
+/// source must also be named positively: the worker passes back only the
+/// tail of stderr, so a cut that dropped the name leaves the failure
+/// unattributed rather than blamed on the source.
+pub fn source_open_failure_of(msg: &str, source: &Path, more_inputs: bool) -> Option<&'static str> {
     let reason = source_open_failure(msg)?;
-    let index_elsewhere = msg
+    let indices: Vec<&str> = msg
         .split("[in#")
         .skip(1)
         .filter_map(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .any(|n| n != "0");
+        .filter(|n| !n.is_empty())
+        .collect();
     let source_url = source.to_string_lossy();
-    let named_elsewhere = msg
+    let urls: Vec<&str> = msg
         .lines()
         .filter_map(|line| line.trim().strip_prefix("Error opening input file "))
         .map(|url| url.strip_suffix('.').unwrap_or(url))
-        .any(|url| url != source_url);
-    (!index_elsewhere && !named_elsewhere).then_some(reason)
+        .collect();
+    let named_elsewhere =
+        indices.iter().any(|n| *n != "0") || urls.iter().any(|url| *url != source_url);
+    let named_source = indices.contains(&"0") || urls.iter().any(|url| *url == source_url);
+    let attributed = !named_elsewhere && (named_source || !more_inputs);
+    attributed.then_some(reason)
 }
 
 /// Whether a transcode failure message is [`pharos_transcode::protocol::WorkerError::NoFrames`],
@@ -3944,8 +3952,11 @@ impl HlsSegmentCache {
                     // HTTP status all say "storage", and remember it so the
                     // client's retry loop does not spawn ffmpeg again (B218).
                     let e = match e {
-                        HlsCacheError::Transcode(msg) => match source_open_failure_of(&msg, source)
-                        {
+                        HlsCacheError::Transcode(msg) => match source_open_failure_of(
+                            &msg,
+                            source,
+                            attempt_opts.muxed_audio_source.is_some(),
+                        ) {
                             Some(reason) => {
                                 record_source_unreadable(reason);
                                 self.note_source_unreadable(source, reason).await;
@@ -11806,14 +11817,16 @@ mod tests {
         assert_eq!(
             source_open_failure_of(
                 "[in#0 @ 0x1] Error opening input: Input/output error\nError opening input file /media/film.mkv.",
-                source
+                source,
+                true
             ),
             Some("io_error")
         );
         assert_eq!(
             source_open_failure_of(
                 "[in#1 @ 0x2] Error opening input: Input/output error\nError opening input file /cache/hls/7/audio/a.m4a.",
-                source
+                source,
+                true
             ),
             None,
             "the cached audio input is not the source"
@@ -11821,7 +11834,8 @@ mod tests {
         assert_eq!(
             source_open_failure_of(
                 "Error opening input: Input/output error\nError opening input file /cache/hls/7/audio/a.m4a.",
-                source
+                source,
+                true
             ),
             None,
             "named by URL alone"
@@ -11829,15 +11843,41 @@ mod tests {
         assert_eq!(
             source_open_failure_of(
                 "[in#1 @ 0x2] Error opening input: Stale file handle",
-                source
+                source,
+                true
             ),
             None,
             "named by index alone"
         );
         assert_eq!(
-            source_open_failure_of("Error opening input: Stale file handle", source),
+            source_open_failure_of("Error opening input: Stale file handle", source, false),
             Some("stale_handle"),
-            "an unnamed input is the source, as before"
+            "with one input, an unnamed input is the source, as before"
+        );
+        assert_eq!(
+            source_open_failure_of("Error opening input: Stale file handle", source, true),
+            None,
+            "with a second input, a failure stderr's cut left unnamed is not blamed on the source"
+        );
+    }
+
+    /// The same, through the worker's stderr tail: when the cut keeps the
+    /// "Error opening input" text but drops the `[in#1]` and the cache file's
+    /// URL, a muxed encode still does not blame the source.
+    #[test]
+    fn a_cache_input_whose_name_the_stderr_tail_cut_is_not_blamed_on_the_source() {
+        let source = Path::new("/media/film.mkv");
+        let mut stderr = String::from("[in#1 @ 0x2] Error opening input");
+        stderr.push_str(&"x".repeat(420));
+        stderr.push_str(": Input/output error\nError opening input files: Input/output error\n");
+        let msg = pharos_transcode::worker::exec::classify_failure(&stderr, false).to_string();
+        assert!(msg.contains("Error opening input"), "{msg}");
+        assert!(!msg.contains("[in#1"), "the cut kept the index: {msg}");
+        assert_eq!(source_open_failure_of(&msg, source, true), None, "{msg}");
+        assert_eq!(
+            source_open_failure_of(&msg, source, false),
+            Some("io_error"),
+            "a single-input encode still blames its only input: {msg}"
         );
     }
 
