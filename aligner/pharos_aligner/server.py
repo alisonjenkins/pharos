@@ -66,6 +66,23 @@ def torch_threads(raw: str | None) -> int:
     return value
 
 
+
+def media_root_error(root: str) -> str | None:
+    """Why ``root`` cannot be read, or None when it can.
+
+    A stale NFS handle fails the stat; a mount that stats from cache but
+    cannot list fails the read. Restarting the container keeps the pod's
+    mount, so /readyz failing is what asks for a new pod.
+    """
+    try:
+        if not os.path.isdir(root):
+            return f"{root} is not a directory"
+        with os.scandir(root) as entries:
+            next(entries, None)
+    except OSError as e:
+        return f"reading {root}: {e}"
+    return None
+
 class AlignerHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for health checks and lyric alignment."""
 
@@ -118,6 +135,13 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/healthz":
             self._send_json(200, {"ok": True})
+        elif self.path == "/readyz":
+            error = media_root_error(self.get_media_root())
+            if error is None:
+                self._send_json(200, {"ok": True})
+            else:
+                logger.warning("media root unreadable: %s", error)
+                self._send_json(503, {"ok": False, "error": error})
         else:
             self._send_json(404, {"error": "not found"})
 
