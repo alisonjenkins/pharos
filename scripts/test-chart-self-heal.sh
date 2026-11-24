@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Renders the chart's selfHeal CronJob and runs its script against a fake
-# kubectl, checking which pods it deletes. Run as part of `just helm-test`.
+# kubectl, checking which Deployments it restarts and which pods it stamps. Run as part of `just helm-test`.
 set -euo pipefail
 
 chart="$(dirname "$0")/../charts/pharos"
@@ -23,28 +23,30 @@ rendered="$(helm template p "$chart" --namespace pharos --show-only templates/se
 cronjob="$(yq 'select(.kind == "CronJob")' <<<"$rendered")"
 role="$(yq 'select(.kind == "Role")' <<<"$rendered")"
 
-if [ "$(yq '.rules[0].verbs | join(",")' <<<"$role")" = "get,list,patch,delete" ]; then
-  ok "the Role can only get, list, patch and delete pods"
+rules="$(yq '[.rules[] | (.apiGroups[0]) + "/" + (.resources | join(",")) + ":" + (.verbs | join(","))] | join(" ")' <<<"$role")"
+if [ "$rules" = "/pods:get,list,patch apps/deployments:get,list,patch" ]; then
+  ok "the Role can only read and patch pods and deployments, and delete nothing"
 else
-  fail "the Role's verbs are not get,list,patch,delete"
+  fail "the Role's rules are \"$rules\""
 fi
 
 container='.spec.jobTemplate.spec.template.spec.containers[0]'
 selector="$(yq "$container.env[] | select(.name == \"SELECTOR\") | .value" <<<"$cronjob")"
 if [ "$selector" = "app.kubernetes.io/instance=p,pharos.io/self-heal=true" ]; then
-  ok "the reaper looks only at this release's labelled pods"
+  ok "the reaper looks only at this release's labelled Deployments"
 else
   fail "the reaper's selector is \"$selector\""
 fi
 
-# The aligner pods carry the label the reaper selects on.
+# The aligner Deployments carry the label the reaper selects on.
 aligner="$(helm template p "$chart" --show-only templates/aligner.yaml \
   --set aligner.enabled=true --set aligner.image.tag=t \
   --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s)"
-if [ "$(grep -c 'pharos.io/self-heal: "true"' <<<"$aligner")" -eq 2 ]; then
-  ok "primary and shadow aligner pods carry the self-heal label"
+labelled="$(yq 'select(.kind == "Deployment") | .metadata.labels["pharos.io/self-heal"]' <<<"$aligner" | grep -c true || true)"
+if [ "$labelled" -eq 2 ]; then
+  ok "primary and shadow aligner Deployments carry the self-heal label"
 else
-  fail "the aligner pods do not both carry the self-heal label"
+  fail "the aligner Deployments do not both carry the self-heal label"
 fi
 
 yq "$container.args[0]" <<<"$cronjob" >"$work/script.sh"
@@ -84,41 +86,79 @@ pod() { # name phase started ready seconds-since-ready-changed [seconds-since-st
   # A node that stopped reporting: Unknown is not a pod fault.
   pod unknown Running true Unknown 900 400
   echo ']}'
-} >"$work/pods.json"
+} >"$work/pods-app_aligner.json"
+
+# A Deployment this reaper restarted a minute ago: left alone, stale pod
+# or not, until its new pod has had the whole limit.
+{
+  echo '{"items":['
+  pod recent-stale Running true False 900 400
+  echo ']}'
+} >"$work/pods-app_recent.json"
+{
+  echo '{"items":['
+  pod calm-ready Running true True 3600
+  echo ']}'
+} >"$work/pods-app_calm.json"
+deployment() { # name seconds-since-restart|-
+  local annotations='{}'
+  [ "$2" != - ] && annotations="{\"kubectl.kubernetes.io/restartedAt\":\"$(ago "$2")\"}"
+  printf '{"metadata":{"name":"%s"},"spec":{"selector":{"matchLabels":{"app":"%s"}},"template":{"metadata":{"annotations":%s}}}}' \
+    "$1" "$1" "$annotations"
+}
+{
+  echo '{"items":['
+  deployment aligner -; echo ,
+  deployment recent 60; echo ,
+  deployment calm 3600
+  echo ']}'
+} >"$work/deployments.json"
 
 mkdir "$work/bin"
 cat >"$work/bin/kubectl" <<KUBECTL
 #!/usr/bin/env bash
-case "\$1" in
-  get) cat "$work/pods.json" ;;
-  delete) echo "\$*" >>"$work/deleted" ;;
-  annotate) echo "\${5}" >>"$work/stamped" ;;
+selector=""
+args=("\$@")
+for ((i = 0; i < \${#args[@]}; i++)); do
+  [ "\${args[i]}" = -l ] && selector="\${args[i + 1]}"
+done
+case "\$1 \$2" in
+  "get deployments") cat "$work/deployments.json" ;;
+  "get pods") cat "$work/pods-\${selector//[^a-z]/_}.json" ;;
+  "patch deployment") echo "\$5 \$*" >>"$work/restarted" ;;
+  "annotate pod") echo "\$5" >>"$work/stamped" ;;
   *) exit 2 ;;
 esac
 KUBECTL
 chmod +x "$work/bin/kubectl"
 
-touch "$work/deleted" "$work/stamped"
+touch "$work/restarted" "$work/stamped"
 if PATH="$work/bin:$PATH" NAMESPACE=pharos SELECTOR=x NOT_READY_SECONDS=300 \
   bash "$work/script.sh" >"$work/out"; then
   ok "the reaper script runs"
 else
   fail "the reaper script failed: $(cat "$work/out")"
 fi
-if [ "$(cat "$work/deleted")" = "delete pod -n pharos stale --wait=false" ]; then
-  ok "only the started pod NotReady past the limit is deleted"
+if [ "$(cut -d' ' -f1 "$work/restarted")" = "aligner" ] &&
+  grep -q 'kubectl.kubernetes.io/restartedAt' "$work/restarted"; then
+  ok "only the Deployment whose pod is NotReady past the limit is rolled out, once"
 else
-  fail "deleted: $(tr '\n' ';' <"$work/deleted")"
+  fail "restarted: $(tr '\n' ';' <"$work/restarted")"
 fi
 if [ "$(sort "$work/stamped" | tr '\n' ' ')" = "first-seen relapsed restarted " ]; then
   ok "a pod first seen NotReady, NotReady again after recovering, or restarted, is stamped"
 else
   fail "stamped: $(tr '\n' ';' <"$work/stamped")"
 fi
-if grep -q "self-heal: deleting pod=stale not_ready_s=" "$work/out"; then
-  ok "the deletion is logged with the pod and how long it was NotReady"
+if grep -q "self-heal: restarting deployment=aligner pod=stale not_ready_s=" "$work/out"; then
+  ok "the rollout is logged with the Deployment, the pod and how long it was NotReady"
 else
-  fail "no deletion log line: $(cat "$work/out")"
+  fail "no rollout log line: $(cat "$work/out")"
+fi
+if grep -q "self-heal: waiting deployment=recent" "$work/out"; then
+  ok "a Deployment restarted within the limit is left alone"
+else
+  fail "no waiting line for the recently restarted Deployment: $(cat "$work/out")"
 fi
 
 exit "$failed"
