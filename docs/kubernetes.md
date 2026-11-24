@@ -160,12 +160,12 @@ take minutes on a cold GPU cache) and pods already terminating. A pod's Ready
 condition is False from before its startup probe passed, so the reaper does
 not trust its age: the first run that sees a started pod NotReady stamps it
 with the annotation `pharos.io/not-ready-since`, and the count runs from that
-stamp. A container restart since the stamp, or a Ready change after it,
-starts the count again. Healing so takes between `notReadyMinutes` and `notReadyMinutes` plus
+stamp. A container replaced since the stamp (it records each container's
+ID), or a Ready change after it, starts the count again. Healing so takes between `notReadyMinutes` and `notReadyMinutes` plus
 one 2-minute run. Each stamp and each deletion logs one line:
 
 ```
-self-heal: watching pod=<name> not_ready_since=<unix seconds> restarts=<n>
+self-heal: watching pod=<name> not_ready_since=<unix seconds> containers=<ids>
 self-heal: deleting pod=<name> not_ready_s=<seconds> limit_s=<seconds>
 ```
 
