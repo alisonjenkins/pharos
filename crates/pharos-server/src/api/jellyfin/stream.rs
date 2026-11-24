@@ -1298,21 +1298,27 @@ pub(crate) async fn open_named_file(
         .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
 }
 
+/// A read that failed because the share itself is gone (a stale NFS handle,
+/// a lost connection, an I/O error) is a 503, not a 404: the file is not
+/// missing, this pod just cannot reach it. It also marks the share broken,
+/// so `/readyz` fails and the pod is replaced with a fresh mount (B1531).
 fn source_unreadable(item: &MediaItem, e: &std::io::Error) -> actix_web::Error {
-    let reason = match e.kind() {
-        std::io::ErrorKind::NotFound => "missing",
-        std::io::ErrorKind::PermissionDenied => "permission",
-        _ => "io",
-    };
+    let reason = crate::media_share::unreadable_reason(e);
+    let share_broken = crate::media_share::MediaShare::global().note_read_error(&item.path, e);
     tracing::warn!(
         media.id = item.id,
         path = %item.path.display(),
         reason,
+        share_broken,
         error = %e,
         "media source is catalogued but unreadable on disk"
     );
     metrics::counter!("pharos_source_unreadable_total", "reason" => reason).increment(1);
-    error::ErrorNotFound("media source unreadable")
+    if share_broken {
+        error::ErrorServiceUnavailable("media share unreadable")
+    } else {
+        error::ErrorNotFound("media source unreadable")
+    }
 }
 
 /// 008 — refuse a URL-backed item at the byte routes, or `None` for a file.
@@ -1470,6 +1476,34 @@ mod tests {
             "a vanished source must be countable apart from an unknown id; \
              rendered:\n{rendered}"
         );
+    }
+
+    /// A stale handle is not a missing file: the client gets a 503, the
+    /// metric names the share fault, and the share is marked broken so
+    /// `/readyz` fails (B1531).
+    #[test]
+    fn a_stale_handle_is_a_503_and_breaks_the_share() {
+        let _ = crate::obs::init("info", None);
+        let item = MediaItem {
+            id: 4243,
+            path: "/mnt/media/stale.mkv".into(),
+            ..Default::default()
+        };
+        let err = source_unreadable(&item, &std::io::Error::from_raw_os_error(116));
+        assert_eq!(
+            err.as_response_error().status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!err.to_string().contains("/mnt/media"), "{err}");
+        let rendered = crate::obs::render();
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("pharos_source_unreadable_total")
+                    && l.contains("reason=\"stale_handle\"")),
+            "rendered:\n{rendered}"
+        );
+        assert!(crate::media_share::MediaShare::global().is_broken());
     }
 
     fn item_with_bitrate(bitrate_bps: Option<u64>, size_bytes: Option<u64>) -> MediaItem {
