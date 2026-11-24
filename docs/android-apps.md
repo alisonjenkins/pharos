@@ -30,7 +30,9 @@ Obtainium installs apps from GitHub and tells you when an update is out.
 3. In **App source URL**, enter `https://github.com/alisonjenkins/pharos`.
 4. Open the additional options and set:
    - **Filter release titles by regular expression**: `^Pharos apps`
-   - **Filter APKs by regular expression**: `pharos-phone`
+   - The APK filter, labelled **Filter APKs by regular expression** or
+     **Filter APK links by regular expression** depending on the Obtainium
+     version: `pharos-phone`. Leave the ZIP and tarball filters empty.
 5. Tap **Add**, then **Install**.
 6. Android asks to allow installs from Obtainium. Allow it, then go back
    and install again.
@@ -59,8 +61,8 @@ Obtainium works on a TV too, but it is awkward with a remote. The free
 To update, repeat steps 3 and 4 with the newest release. It installs over
 the old version and keeps your sign-in.
 
-To use Obtainium on the TV instead, follow the phone steps with the APK
-filter `pharos-tv`. Many TVs are 32-bit only: on those, install Obtainium's
+To use Obtainium on the TV instead, follow the phone steps with `pharos-tv`
+in the APK filter. Many TVs are 32-bit only: on those, install Obtainium's
 `app-armeabi-v7a-release.apk` instead of the arm64 one. If the arm64 file
 says "App not installed", use the 32-bit one.
 
