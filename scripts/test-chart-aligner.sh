@@ -64,6 +64,16 @@ expect "shadow on renders its deployment" present "name: p-pharos-aligner-shadow
 expect "shadow on runs the Rust image" present "pharos-aligner-rs:s" -- \
   --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s
 expect "the aligner waits up to 10 minutes to start" present "failureThreshold: 60" --
+# Readiness reads the media root; liveness must not, or a stale mount would
+# restart the container forever without replacing the pod's mount.
+probes="$(render)"
+if [ "$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].readinessProbe.httpGet.path' <<<"$probes")" = "/readyz" ] \
+  && [ "$(yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].livenessProbe.httpGet.path' <<<"$probes")" = "/healthz" ]; then
+  echo "ok   readiness checks /readyz, liveness /healthz"
+else
+  echo "FAIL the aligner's probes are not readiness /readyz, liveness /healthz" >&2
+  failed=1
+fi
 # Both Deployments carry it: the primary's and the shadow's.
 startup="$(render --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s)"
 if [ "$(grep -c "startupProbe:" <<<"$startup")" -eq 2 ]; then
