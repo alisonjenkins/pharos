@@ -173,6 +173,12 @@ async fn readyz(
             snap.media_restart = stays_ready(&media, &e);
             snap.ready = snap.media_restart.is_some();
         }
+        // A drain may have begun while the check awaited; it wins over the
+        // restart's stay-ready, which would otherwise answer 200.
+        if snap.ready && handle.snapshot().await.map_or(true, |now| now.draining) {
+            snap.draining = true;
+            snap.ready = false;
+        }
         record_media(&snap);
     }
     if snap.ready {
