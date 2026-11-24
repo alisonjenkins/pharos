@@ -1636,7 +1636,7 @@ async fn serve_segment(
                 PlayheadSeed::Observes,
             )
             .await
-            .map_err(segment_cache_error)?;
+            .map_err(|e| segment_cache_error(e, share_of(&item.path)))?;
         crate::media_telemetry::note_segment_served(&req, seg, served, waited.elapsed());
         return Ok(HttpResponse::Ok()
             .content_type(opts.container.content_type())
@@ -1710,16 +1710,31 @@ async fn serve_segment(
 /// always was. Splitting them matters during a storage incident — on
 /// 2026-09-04 every one of a viewer's init retries was a 500 that read as an
 /// encoder fault (B218).
-fn segment_cache_error(e: pharos_cache::hls_cache::HlsCacheError) -> actix_web::Error {
+/// The media share an item's bytes come off, or `None` for a URL-backed
+/// source ffmpeg reads over the network.
+fn share_of(item_path: &std::path::Path) -> Option<&'static crate::media_share::MediaShare> {
+    pharos_core::Origin::classify(item_path)
+        .remote()
+        .is_none()
+        .then(crate::media_share::MediaShare::global)
+}
+
+fn segment_cache_error(
+    e: pharos_cache::hls_cache::HlsCacheError,
+    share: Option<&crate::media_share::MediaShare>,
+) -> actix_web::Error {
     match e {
         pharos_cache::hls_cache::HlsCacheError::SourceUnreadable { reason, detail } => {
-            // A stale handle, lost connection or I/O error is the share, not
-            // the file: 503, and the pod is marked for a fresh mount (B1531).
-            let share_broken = crate::media_share::is_share_reason(reason);
+            // A stale handle, lost connection or I/O error opening a file on
+            // the share is the share, not the file: 503, and the pod is
+            // marked for a fresh mount (B1531). The same error from a
+            // URL-backed source is the network's, and says nothing about the
+            // mount.
+            let share = share.filter(|_| crate::media_share::is_share_reason(reason));
+            let share_broken = share.is_some();
             tracing::warn!(reason, share_broken, error = %detail, "hls: media source unreadable");
-            if share_broken {
-                crate::media_share::MediaShare::global()
-                    .mark_broken(format!("hls source open ({reason}): {detail}"));
+            if let Some(share) = share {
+                share.mark_broken(format!("hls source open ({reason}): {detail}"));
                 error::ErrorServiceUnavailable("media share unreadable")
             } else {
                 error::ErrorNotFound("media source unreadable")
@@ -5394,7 +5409,7 @@ async fn vp9_segment_raw_from(
                 PlayheadSeed::Observes,
             )
             .await
-            .map_err(segment_cache_error)?;
+            .map_err(|e| segment_cache_error(e, share_of(&item.path)))?;
         crate::media_telemetry::note_segment_served(req, seg, served, waited.elapsed());
         return Ok(bytes);
     }
@@ -5544,52 +5559,69 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    /// A source ffmpeg could not open for a share fault is the share, not
-    /// the file: 503, and the share is marked broken (B1531). A missing file
-    /// stays the 404 it was.
+    /// A source on the share that ffmpeg could not open for a share fault is
+    /// the share, not the file: 503, and the share is marked broken (B1531).
+    /// A missing file stays the 404 it was, and so does the catch-all `io`.
     #[actix_web::test]
     async fn a_stale_source_is_a_503_and_breaks_the_share_and_a_missing_one_is_a_404() {
+        use actix_web::http::StatusCode;
         use pharos_cache::hls_cache::HlsCacheError;
-        let missing = segment_cache_error(HlsCacheError::SourceUnreadable {
-            reason: "missing",
-            detail: "Error opening input: No such file or directory".into(),
-        });
+        let unreadable = |reason, detail: &str| HlsCacheError::SourceUnreadable {
+            reason,
+            detail: format!("Error opening input: {detail}"),
+        };
+        let status = |e: actix_web::Error| e.as_response_error().status_code();
+        let fresh = || -> &'static crate::media_share::MediaShare {
+            Box::leak(Box::new(crate::media_share::MediaShare::new(
+                crate::media_share::ROOT_TIMEOUT,
+            )))
+        };
+
+        let share = fresh();
+        let missing = unreadable("missing", "No such file or directory");
         assert_eq!(
-            missing.as_response_error().status_code(),
-            actix_web::http::StatusCode::NOT_FOUND
+            status(segment_cache_error(missing, Some(share))),
+            StatusCode::NOT_FOUND
         );
-        let stale = segment_cache_error(HlsCacheError::SourceUnreadable {
-            reason: "stale_handle",
-            detail: "Error opening input: Stale file handle".into(),
-        });
+        let other = unreadable("io", "Protocol not found");
         assert_eq!(
-            stale.as_response_error().status_code(),
-            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+            status(segment_cache_error(other, Some(share))),
+            StatusCode::NOT_FOUND,
+            "the catch-all io reason is not a share fault"
         );
-        assert!(crate::media_share::MediaShare::global().is_broken());
+        assert!(!share.is_broken());
+
         for (reason, detail) in [
+            ("stale_handle", "Stale file handle"),
             ("not_connected", "Transport endpoint is not connected"),
             ("io_error", "Input/output error"),
         ] {
-            let e = segment_cache_error(HlsCacheError::SourceUnreadable {
-                reason,
-                detail: format!("Error opening input: {detail}"),
-            });
-            assert_eq!(
-                e.as_response_error().status_code(),
-                actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
-                "{reason}"
-            );
+            let share = fresh();
+            let e = segment_cache_error(unreadable(reason, detail), Some(share));
+            assert_eq!(status(e), StatusCode::SERVICE_UNAVAILABLE, "{reason}");
+            assert!(share.is_broken(), "{reason}");
         }
-        let other = segment_cache_error(HlsCacheError::SourceUnreadable {
-            reason: "io",
-            detail: "Error opening input: Protocol not found".into(),
-        });
-        assert_eq!(
-            other.as_response_error().status_code(),
-            actix_web::http::StatusCode::NOT_FOUND,
-            "the catch-all io reason is not a share fault"
+    }
+
+    /// A URL-backed source that fails with the same errors says nothing
+    /// about the mount: it stays a 404 and the share stays whole, so a
+    /// truncated upstream response cannot take the pod out of service.
+    #[actix_web::test]
+    async fn a_remote_source_error_leaves_the_share_whole() {
+        use pharos_cache::hls_cache::HlsCacheError;
+        let e = segment_cache_error(
+            HlsCacheError::SourceUnreadable {
+                reason: "io_error",
+                detail: "Error opening input: Input/output error".into(),
+            },
+            None,
         );
+        assert_eq!(
+            e.as_response_error().status_code(),
+            actix_web::http::StatusCode::NOT_FOUND
+        );
+        assert!(share_of(std::path::Path::new("/mnt/media/film.mkv")).is_some());
+        assert!(share_of(std::path::Path::new("ytdlp://youtube/x")).is_none());
     }
 
     // `use actix_web::test` shadows the bare `#[test]` attribute; qualify it.
