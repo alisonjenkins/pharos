@@ -2525,6 +2525,33 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // chart's selfHeal reaper replaces the pod with a fresh mount.
     let media_share = pharos_server::media_share::MediaShare::global();
     media_share.set_roots(cfg.media.scan_roots());
+    // ADR-0156 — when the chart names this pod's Deployment, a share that
+    // breaks after it was read asks for a rollout restart, and /readyz stays
+    // up meanwhile so browsing keeps working.
+    let self_restart = pharos_server::self_restart::SelfRestart::global();
+    match pharos_server::self_restart::KubeRestarter::from_env() {
+        Some(Ok(restarter)) => {
+            tracing::info!(
+                target_deployment = %pharos_server::self_restart::Restarter::target(&restarter),
+                "self-restart: on; a broken media share asks for a rollout restart"
+            );
+            self_restart.set_restarter(std::sync::Arc::new(restarter));
+            media_share.on_broken(move |why| {
+                if media_share.was_whole() {
+                    self_restart.on_share_broken(why);
+                } else {
+                    tracing::warn!(
+                        "self-restart: the share broke before this pod ever read it; not restarting"
+                    );
+                }
+            });
+        }
+        Some(Err(error)) => tracing::error!(
+            error = %error,
+            "self-restart: configured but unusable; a broken media share fails /readyz instead"
+        ),
+        None => tracing::info!("self-restart: off (PHAROS_SELF_RESTART_DEPLOYMENT unset)"),
+    }
 
     // T48 phase 2 — opt-in SSDP responder so LAN DLNA / UPnP control
     // points discover us. The task owns its own UDP socket; we keep a
@@ -2617,9 +2644,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .max_age(3600);
         App::new()
             .app_data(web::Data::new(handle_for_app.clone()))
-            .app_data(web::Data::new(pharos_server::health::MediaReadiness(
-                media_share,
-            )))
+            .app_data(web::Data::new(pharos_server::health::MediaReadiness {
+                share: media_share,
+                restart: Some(self_restart),
+            }))
             .app_data(app_state.clone())
             .app_data(group_registry.clone())
             .app_data(session_hub.clone())
