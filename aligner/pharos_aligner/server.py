@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import http.server
 import json
 import logging
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -84,6 +86,44 @@ def media_root_error(root: str) -> str | None:
     return None
 
 
+# Errors that only a fresh mount clears: a read failing with one marks the
+# share broken until the process ends, so /readyz keeps failing (B1530).
+SHARE_ERRNOS = frozenset({errno.ESTALE, errno.EIO, errno.ENOTCONN})
+_BROKEN_LOCK = threading.Lock()
+_broken: str | None = None
+
+
+def mark_broken(why: str) -> None:
+    """Marks the share broken, keeping the first cause."""
+    global _broken
+    with _BROKEN_LOCK:
+        if _broken is None:
+            logger.error("media share broken; the pod needs a fresh mount: %s", why)
+            _broken = why
+
+
+def broken() -> str | None:
+    with _BROKEN_LOCK:
+        return _broken
+
+
+def song_file_error(path: str) -> OSError | None:
+    """None when ``path`` is a file whose first byte reads, else the error.
+
+    ``os.path.isfile`` answers False for every error, so a stale handle
+    looked like a missing file. A path that is not a regular file is
+    ENOENT, like one that is not there.
+    """
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return FileNotFoundError(errno.ENOENT, "not a file", path)
+        with open(path, "rb") as f:
+            f.read(1)
+    except OSError as e:
+        return e
+    return None
+
+
 # How long /readyz waits for the media root: a hard NFS mount whose server is
 # gone blocks a read for good, and the probe must still answer.
 ROOT_TIMEOUT_SECS = 2.0
@@ -103,6 +143,9 @@ def checked_media_root_error(
     A probe that does not finish in time keeps the slot until it does, so a
     hung mount answers "still checking" rather than starting another thread.
     """
+    why = broken()
+    if why is not None:
+        return why
     if not _PROBE_SLOT.acquire(blocking=False):
         return f"a check of {root} is still running"
     result: list[str | None] = []
@@ -117,7 +160,11 @@ def checked_media_root_error(
             done.set()
             _PROBE_SLOT.release()
 
-    threading.Thread(target=run, name="media-root-probe", daemon=True).start()
+    try:
+        threading.Thread(target=run, name="media-root-probe", daemon=True).start()
+    except RuntimeError as e:
+        _PROBE_SLOT.release()
+        return f"starting the check of {root}: {e}"
     if not done.wait(timeout):
         return f"reading {root}: no answer within {timeout:g} s"
     return result[0]
@@ -231,10 +278,22 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
         span.set_attribute("aligner.path", rel_path)
         span.set_attribute("aligner.lines", len(lines))
         # Checked here, not caught: a FileNotFoundError from inside the work
-        # (ffmpeg missing) is a server fault, not a missing file.
-        if not os.path.isfile(full_path):
+        # (ffmpeg missing) is a server fault, not a missing file. A file the
+        # share cannot read is not missing either: 503, and a share error
+        # keeps /readyz failing until the pod is replaced.
+        error = song_file_error(full_path)
+        if isinstance(error, FileNotFoundError):
+            logger.warning("song file not found: path=%s", rel_path)
             span.set_status(trace.Status(trace.StatusCode.ERROR, "file not found"))
             self._send_json(404, {"error": f"file not found: {rel_path}"})
+            return
+        if error is not None:
+            message = f"song file unreadable: {rel_path}: {error}"
+            logger.warning("%s", message)
+            if error.errno in SHARE_ERRNOS:
+                mark_broken(message)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "file unreadable"))
+            self._send_json(503, {"error": message})
             return
 
         try:
