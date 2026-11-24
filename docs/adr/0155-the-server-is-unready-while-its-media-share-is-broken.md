@@ -34,20 +34,19 @@ chart lets `selfHeal` roll out a fresh server pod as it does the aligner's
 
 ## Consequences
 
-- On SQLite the chart forces `Recreate` (one writer, a ReadWriteOnce
-  database volume), so the rollout stops the old pod before the new one
-  starts. A broken share then costs the whole server for about 6 to 10
-  minutes with the defaults (readiness fails within 60 s, then the reaper's
-  stamp, its 5-minute limit and its rollout, as `docs/kubernetes.md`
-  tabulates), plus the new pod's startup.
-- On Postgres with `RollingUpdate`, the new pod starts first. If its share
-  reads, it takes over with no gap; if not, the rollout stalls and the old
-  pod stays, so Pharos keeps serving what it can.
+- Once the share is broken the server is NotReady, so all of Pharos is out
+  of its Service, not only playback, until a fresh pod is Ready. With the
+  defaults that is about 6 to 10 minutes (readiness fails within 60 s, then
+  the reaper's stamp, its 5-minute limit and its rollout, as
+  `docs/kubernetes.md` tabulates), plus the new pod's startup. The strategy
+  does not shorten it: the old pod serves nothing either way. With
+  `RollingUpdate` (Postgres) the new pod is created alongside the old one;
+  with `Recreate` (SQLite, forced by the chart) the old one stops first.
 - Before this, playback was down until someone recreated the pod by hand,
   while the rest of Pharos kept working.
-- If the NAS itself is down, the new pod fails `/readyz` too. On `Recreate`
-  the reaper rolls it out again about every 7 to 9 minutes until the share
-  answers, and Pharos is unreachable for that time.
+- If the NAS itself is down, the new pod fails `/readyz` too. The reaper
+  rolls it out again about every 7 to 9 minutes until the share answers,
+  and Pharos is unreachable for that time.
 - A single file with an I/O error (`EIO`) marks the whole share broken. On
   NFS that error almost always means the share, and the cost of being wrong
   is one pod replacement.
