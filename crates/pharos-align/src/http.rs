@@ -15,8 +15,11 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
-use crate::media::MediaProbe;
-use crate::obs::{set_remote_parent, Metrics, GPU_POOL_BYTES, MEDIA_OK, SONGS_TOTAL, SONG_SECONDS};
+use crate::media::{read_source, MediaProbe, Source};
+use crate::obs::{
+    set_remote_parent, Metrics, GPU_POOL_BYTES, MEDIA_OK, SONGS_TOTAL, SONG_SECONDS,
+    SOURCE_UNREADABLE_TOTAL,
+};
 use crate::placement::Method;
 use crate::plan::{parse_options, parse_request, resolve, Line, SongOptions};
 use crate::service::{Aligned, Answer, Engine, Progress, SongError};
@@ -268,10 +271,41 @@ async fn align(
     span.record("aligner.path", rel_path.as_str());
     span.record("aligner.lines", lines.len());
     // Checked here, not mapped from the decode: ffmpeg missing is a server
-    // fault (500), not a missing file.
-    if !full_path.is_file() {
-        tracing::warn!(path = %rel_path, "song file not found");
-        return fail(StatusCode::NOT_FOUND, format!("file not found: {rel_path}"));
+    // fault (500), not a missing file. A file the share cannot read is not
+    // missing either: it is counted, logged with its error and answered 503,
+    // and a broken share keeps `/readyz` failing until the pod is replaced,
+    // since the root can still list while the song's directory is stale.
+    let checked = {
+        let full_path = full_path.clone();
+        web::block(move || read_source(&full_path)).await
+    };
+    match checked {
+        Ok(Source::Readable) => {}
+        Ok(Source::Missing) => {
+            tracing::warn!(path = %rel_path, "song file not found");
+            return fail(StatusCode::NOT_FOUND, format!("file not found: {rel_path}"));
+        }
+        Ok(Source::Unreadable(why, e)) => {
+            metrics::counter!(SOURCE_UNREADABLE_TOTAL, "reason" => why.label()).increment(1);
+            let message = format!("song file unreadable: {rel_path}: {e}");
+            tracing::warn!(
+                path = %rel_path,
+                reason = why.label(),
+                error = %e,
+                breaks_the_share = why.breaks_the_share(),
+                "song file unreadable"
+            );
+            if why.breaks_the_share() {
+                state.media.mark_broken(message.clone());
+            }
+            return fail(StatusCode::SERVICE_UNAVAILABLE, message);
+        }
+        Err(e) => {
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("song file check failed: {e}"),
+            );
+        }
     }
 
     let engine = Arc::clone(&state.engine);
