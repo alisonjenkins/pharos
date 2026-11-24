@@ -85,6 +85,14 @@ pub struct MediaShare {
     /// Set while a listing runs; one that never returns keeps it set, so a
     /// hung mount costs one thread, not one per probe.
     busy: Arc<AtomicBool>,
+    /// Shared with the listing thread, so a listing that fails after its
+    /// probe stopped waiting still marks the share broken.
+    latch: Arc<Latch>,
+}
+
+/// Whether the share broke, and what to tell when it does.
+#[derive(Default)]
+struct Latch {
     broken: Mutex<Option<String>>,
     /// Set once a check found every root listing with the share whole: a pod
     /// that never read its share has nothing to keep serving (ADR-0156).
@@ -93,6 +101,40 @@ pub struct MediaShare {
     seen_whole: AtomicBool,
     /// Told once, when the share first breaks after it was seen whole.
     on_broken: OnceLock<BrokenHook>,
+}
+
+impl Latch {
+    fn mark_broken(&self, why: String) {
+        let mut broken = self.broken.lock().unwrap_or_else(|p| p.into_inner());
+        if broken.is_some() {
+            return;
+        }
+        tracing::error!(error = %why, "media share broken; the pod needs a fresh mount");
+        metrics::gauge!(MEDIA_SHARE_OK).set(0.0);
+        let whole = self.seen_whole.load(Ordering::Acquire);
+        // Under the lock: a probe that sees the cause also sees what the
+        // hook decided.
+        match self.on_broken.get() {
+            Some(f) if whole => f(&why),
+            Some(_) => tracing::warn!(
+                error = %why,
+                "media share broke before any check found it whole; not telling the hook"
+            ),
+            None => {}
+        }
+        *broken = Some(why);
+    }
+
+    /// With a self-restart hook, a root that fails with a share-level error
+    /// is the share broken, as a read finding it would be: only a fresh
+    /// mount lists it again. Without one, nothing is latched.
+    fn note_listing(&self, listed: &Result<bool, ShareError>) {
+        if let Err(e @ ShareError::Io { .. }) = listed {
+            if self.on_broken.get().is_some() {
+                self.mark_broken(e.to_string());
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for MediaShare {
@@ -111,9 +153,7 @@ impl MediaShare {
             roots: Mutex::default(),
             timeout,
             busy: Arc::new(AtomicBool::new(false)),
-            broken: Mutex::default(),
-            seen_whole: AtomicBool::new(false),
-            on_broken: OnceLock::new(),
+            latch: Arc::default(),
         }
     }
 
@@ -127,14 +167,14 @@ impl MediaShare {
     /// share for good, as a read finding it does. Without one, a listing
     /// error fails only that check (V1531 as it was).
     pub fn on_broken(&self, f: impl Fn(&str) + Send + Sync + 'static) {
-        if self.on_broken.set(Box::new(f)).is_err() {
+        if self.latch.on_broken.set(Box::new(f)).is_err() {
             tracing::warn!("media share: an on_broken hook was already set; keeping the first");
         }
     }
 
     /// Whether a check has found the share whole since the process started.
     pub fn was_whole(&self) -> bool {
-        self.seen_whole.load(Ordering::Acquire)
+        self.latch.seen_whole.load(Ordering::Acquire)
     }
 
     /// The process's one share state: the mount belongs to the pod, so every
@@ -161,29 +201,13 @@ impl MediaShare {
 
     /// Marks the share broken, keeping the first cause.
     pub fn mark_broken(&self, why: String) {
-        let mut broken = self.broken.lock().unwrap_or_else(|p| p.into_inner());
-        if broken.is_some() {
-            return;
-        }
-        tracing::error!(error = %why, "media share broken; the pod needs a fresh mount");
-        metrics::gauge!(MEDIA_SHARE_OK).set(0.0);
-        let whole = self.seen_whole.load(Ordering::Acquire);
-        // Under the lock: a probe that sees the cause also sees what the
-        // hook decided.
-        match self.on_broken.get() {
-            Some(f) if whole => f(&why),
-            Some(_) => tracing::warn!(
-                error = %why,
-                "media share broke before any check found it whole; not telling the hook"
-            ),
-            None => {}
-        }
-        *broken = Some(why);
+        self.latch.mark_broken(why);
     }
 
     /// Whether a read has found the share broken.
     pub fn is_broken(&self) -> bool {
-        self.broken
+        self.latch
+            .broken
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .is_some()
@@ -218,10 +242,14 @@ impl MediaShare {
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         let busy = Arc::clone(&self.busy);
+        let latch = Arc::clone(&self.latch);
         let spawned = std::thread::Builder::new()
             .name("media-share-check".to_owned())
             .spawn(move || {
                 let result = list_roots(&roots);
+                // Here, not in the probe: a listing that fails after the
+                // probe timed out must still break the share.
+                latch.note_listing(&result);
                 busy.store(false, Ordering::Release);
                 drop(tx.send(result));
             });
@@ -233,29 +261,22 @@ impl MediaShare {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => Err(ShareError::TimedOut(self.timeout)),
         };
-        // With a self-restart hook, a root that fails with a share-level
-        // error is the share broken, as a read finding it would be: only a
-        // fresh mount lists it again. Without one, nothing is latched.
-        if let Err(e @ ShareError::Io { .. }) = &listed {
-            if self.on_broken.get().is_some() {
-                self.mark_broken(e.to_string());
-            }
-        }
         let all_listed = listed?;
         // A read may have found the share broken while the roots listed;
         // decide under the same lock a fault takes.
-        let broken = self.broken.lock().unwrap_or_else(|p| p.into_inner());
+        let broken = self.latch.broken.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(why) = broken.as_ref() {
             return Err(ShareError::Broken(why.clone()));
         }
         if all_listed {
-            self.seen_whole.store(true, Ordering::Release);
+            self.latch.seen_whole.store(true, Ordering::Release);
         }
         Ok(())
     }
 
     fn broken_cause(&self) -> Option<String> {
-        self.broken
+        self.latch
+            .broken
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
@@ -436,6 +457,38 @@ mod tests {
         assert!(matches!(listed, Err(ShareError::Io { .. })), "{listed:?}");
         assert!(!share.is_broken());
         assert!(share.check_with(|_| Ok(true)).await.is_ok());
+    }
+
+    /// A listing that fails with a share fault only after its probe gave up
+    /// still breaks the share and tells the hook, once.
+    #[tokio::test]
+    async fn a_listing_fault_after_the_probe_timed_out_still_tells_the_hook() {
+        let share = MediaShare::new(Duration::from_millis(10));
+        let told = Arc::new(Mutex::new(0_u32));
+        let sink = Arc::clone(&told);
+        share.on_broken(move |_| *sink.lock().unwrap() += 1);
+        share.set_roots(vec![PathBuf::from("/m")]);
+        assert!(share.check_with(|_| Ok(true)).await.is_ok());
+
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let listed = share
+            .check_with(move |roots| {
+                wait.recv().ok();
+                Err(ShareError::Io {
+                    root: roots[0].clone(),
+                    source: err(EIO),
+                })
+            })
+            .await;
+        assert!(matches!(listed, Err(ShareError::TimedOut(_))), "{listed:?}");
+        release.send(()).unwrap();
+        while share.busy.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        assert!(share.is_broken());
+        assert_eq!(*told.lock().unwrap(), 1);
+        assert!(matches!(share.check().await, Err(ShareError::Broken(_))));
+        assert_eq!(*told.lock().unwrap(), 1);
     }
 
     #[tokio::test]
