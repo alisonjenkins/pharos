@@ -30,6 +30,21 @@ fn healthz_and_unknown_routes() {
 }
 
 #[test]
+fn readyz_follows_whether_the_media_root_can_be_read() {
+    let s = serve("readyz", silent(), None);
+    assert_eq!(get(s.addr, "/readyz"), (200, json!({"ok": true})));
+    std::fs::remove_dir_all(&s.root).unwrap();
+    let (status, body) = get(s.addr, "/readyz");
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["ok"], json!(false));
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains(&s.root.display().to_string()), "{error}");
+    assert_eq!(get(s.addr, "/healthz"), (200, json!({"ok": true})));
+    std::fs::create_dir_all(&s.root).unwrap();
+    assert_eq!(get(s.addr, "/readyz"), (200, json!({"ok": true})));
+}
+
+#[test]
 fn a_song_answers_with_its_words_offset_and_version() {
     let s = serve("ok", silent(), None);
     let (status, body) = post(s.addr, &one_line());
