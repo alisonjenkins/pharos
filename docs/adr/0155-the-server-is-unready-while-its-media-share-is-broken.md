@@ -40,9 +40,9 @@ chart lets `selfHeal` replace the server pod as it does the aligner's.
 - If the NAS itself is down, the new pod fails `/readyz` too. The reaper then
   replaces it about every 7 minutes until the share answers again, and Pharos
   is unreachable for that time.
-- A single file with an I/O error (`EIO`) marks the whole share broken.
-  Read errors that local disks raise for one bad sector are rare on this
-  deployment's NFS media, and the cost is one pod replacement.
-- Turning `selfHeal` off leaves the pod unready with no replacement; that
-  setting should then also drop the server's label, which the chart does not
-  do yet.
+- A single file with an I/O error (`EIO`) marks the whole share broken. On
+  NFS that error almost always means the share, and the cost of being wrong
+  is one pod replacement.
+- With `selfHeal` off, a broken share leaves the server unready until someone
+  recreates the pod, so all of Pharos is unreachable rather than only
+  playback. `selfHeal` is on by default for this reason.
