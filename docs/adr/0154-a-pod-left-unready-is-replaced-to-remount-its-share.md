@@ -74,7 +74,8 @@ automatically.
 - The CronJob can restart Deployments. Its Role is limited to one namespace,
   and its selector to Deployments that opt in by label.
 - A share that stays broken makes the new pod stay unready too, and the
-  Deployment is rolled out again every 7 to 9 minutes until it reads.
+  Deployment is rolled out again every 7 to 9 minutes, plus each new pod's
+  scheduling and startup, until it reads.
 - The root cause (the NFS server changing its file handles, for example an
   export without a fixed `fsid=`) is outside Pharos. `docs/kubernetes.md`
   covers it.
