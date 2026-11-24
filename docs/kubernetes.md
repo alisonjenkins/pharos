@@ -158,7 +158,9 @@ The rollout follows the Deployment's own strategy. With `RollingUpdate`, the
 new pod is created alongside the old one where `maxSurge` allows, but the old
 pod may still go before the new one is Ready: it is NotReady, so the
 Deployment controller counts it unavailable and may scale it down at once.
-That loses nothing, since a NotReady pod is already out of its Service. With
+A NotReady pod is already out of its Service, so no new requests reach it;
+requests already in flight on it, or a client connected to it directly, can
+still be cut off. With
 `Recreate`, the old pod always stops first. The chart uses `Recreate` for
 the server on SQLite (its database volume is ReadWriteOnce and
 single-writer) and for an aligner with a GPU or a cache volume; otherwise
