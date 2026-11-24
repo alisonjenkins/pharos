@@ -11,14 +11,15 @@ trap 'rm -rf "$work"' EXIT
 ok() { echo "ok   $1"; }
 fail() { echo "FAIL $1" >&2; failed=1; }
 
-if [ -n "$(helm template p "$chart" --show-only templates/self-heal.yaml 2>/dev/null || true)" ]; then
+if [ -n "$(helm template p "$chart" --show-only templates/self-heal.yaml \
+  --set selfHeal.enabled=false 2>/dev/null || true)" ]; then
   fail "selfHeal off renders nothing"
 else
   ok "selfHeal off renders nothing"
 fi
 
-rendered="$(helm template p "$chart" --namespace pharos --show-only templates/self-heal.yaml \
-  --set selfHeal.enabled=true --set selfHeal.notReadyMinutes=5)"
+# On by default: a plain install gets the reaper.
+rendered="$(helm template p "$chart" --namespace pharos --show-only templates/self-heal.yaml)"
 cronjob="$(yq 'select(.kind == "CronJob")' <<<"$rendered")"
 role="$(yq 'select(.kind == "Role")' <<<"$rendered")"
 
