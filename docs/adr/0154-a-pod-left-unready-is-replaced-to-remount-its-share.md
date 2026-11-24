@@ -1,4 +1,4 @@
-# ADR-0154: A pod left unready is replaced, so its media share is mounted afresh
+# ADR-0154: A pod left unready is rolled out again, so its media share is mounted afresh
 
 - **Status:** Accepted
 - **Date:** 2026-11-24T12:30:00Z
@@ -28,8 +28,9 @@ automatically.
 - `/healthz` and the liveness probe never touch the mount, so a stale share
   does not cause a restart loop.
 - The chart points the aligner's readiness probe at `/readyz`.
-- The chart's `selfHeal` CronJob runs every 2 minutes. It deletes this
-  release's pods labelled `pharos.io/self-heal=true` that meet all of these:
+- The chart's `selfHeal` CronJob runs every 2 minutes. For each of this
+  release's Deployments labelled `pharos.io/self-heal=true`, it looks for a
+  pod that meets all of these:
   - Running;
   - every container started;
   - not terminating;
@@ -39,12 +40,18 @@ automatically.
     a new pod's Ready condition dates from before its startup probe passed.
     A container restart or a Ready change after the stamp restarts the count.
 
-  Their Deployment then starts a new pod, which mounts the share again.
+  It then sets the Deployment's `kubectl.kubernetes.io/restartedAt` pod
+  template annotation, as `kubectl rollout restart` does. The Deployment
+  rolls out a new pod by its own strategy, and the new pod mounts the share
+  again. A Deployment rolled out within `notReadyMinutes` is left alone, so
+  its new pod gets the whole limit to become Ready.
 - `selfHeal` is on by default, so a new install heals without extra steps.
-  An install whose namespace refuses a Role that deletes pods sets
+  An install whose namespace refuses a Role that patches pods and
+  Deployments sets
   `selfHeal.enabled: false`.
-- The CronJob runs under a ServiceAccount whose Role may only get, list,
-  patch (for the stamp) and delete pods in the release's namespace. It uses a small image with bash,
+- The CronJob runs under a ServiceAccount whose Role may only get, list and
+  patch pods (for the stamp) and Deployments (for the rollout) in the
+  release's namespace. It deletes nothing. It uses a small image with bash,
   jq and kubectl.
 
 ## Consequences
@@ -52,14 +59,18 @@ automatically.
 - A stale mount now heals with no one involved, about 5 to 10 minutes after
   the fault: up to 30 s for readiness to fail, up to one 2-minute run for
   the first stamp, `notReadyMinutes` (5), and up to one more run for the
-  deletion; then the new pod starts.
+  rollout; then the new pod starts.
+- With `RollingUpdate`, the new pod starts before the old one stops, so a
+  share still broken leaves the old pod in place and nothing is lost. With
+  `Recreate` (the aligner with a GPU or cache volume, the server on SQLite)
+  the old pod stops first, so the service is down while the new one starts.
 - `pharos_aligner_media_ok` and `pharos_aligner_source_unreadable_total`
-  show the fault, and the CronJob logs each pod it deletes.
-- The CronJob can delete pods. Its Role is limited to one namespace, and its
-  selector to pods that opt in by label.
-- A share that stays broken makes the pods come back and stay unready, so
-  they get replaced every few minutes. That is visible, and costs a model
-  load each time.
+  show the fault, and the CronJob logs each Deployment it rolls out.
+- The CronJob can restart Deployments. Its Role is limited to one namespace,
+  and its selector to Deployments that opt in by label.
+- A share that stays broken makes the new pod stay unready too. A `Recreate`
+  Deployment is then rolled out again every 7 to 9 minutes; a
+  `RollingUpdate` one keeps its stuck rollout and its old pod.
 - The root cause (the NFS server changing its file handles, for example an
   export without a fixed `fsid=`) is outside Pharos. `docs/kubernetes.md`
   covers it.
@@ -68,11 +79,16 @@ automatically.
 
 - **Liveness probe on the mount.** It restarts the container onto the same
   stale mount, so it would loop and never heal.
-- **The aligner deletes its own pod.** It would need an HTTP client and API
-  credentials inside the aligner, and a pod able to delete pods. Keeping that
-  power in a separate, small CronJob is easier to audit.
+- **Deleting the unready pod.** The first version did this. It bypasses the
+  Deployment's strategy: even a `RollingUpdate` Deployment loses its only
+  pod before a new one exists, and the cluster shows a deletion rather than
+  a rollout. A restart through the Deployment keeps rollout history and
+  surge where the strategy allows it, and needs no delete permission.
+- **The aligner restarts its own Deployment.** It would need an HTTP client
+  and API credentials inside the aligner. Keeping that power in a separate,
+  small CronJob is easier to audit.
 - **A `pharos admin` subcommand as the reaper.** It avoids a third-party
-  image, but runs the whole server image for a list-and-delete. The script is
+  image, but runs the whole server image for a list-and-patch. The script is
   covered by `scripts/test-chart-self-heal.sh` against a fake kubectl.
 
 ## References
