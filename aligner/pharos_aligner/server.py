@@ -124,6 +124,60 @@ def song_file_error(path: str) -> OSError | None:
     return None
 
 
+# How long the song preflight (resolving the path and reading the file's
+# first byte) may take, and how many may be stuck on the share at once.
+SONG_READ_TIMEOUT_SECS = 10.0
+MAX_STUCK_SONG_READS = 4
+_SONG_READS = threading.BoundedSemaphore(MAX_STUCK_SONG_READS)
+
+
+def song_preflight(
+    media_root: str,
+    rel_path: str,
+    timeout: float = SONG_READ_TIMEOUT_SECS,
+    check: Callable[[str, str], tuple[str, Any]] | None = None,
+) -> tuple[str, Any]:
+    """Resolves and reads ``rel_path`` on a thread of its own, within ``timeout``.
+
+    Returns ``(kind, value)``: ``("ok", full_path)``, ``("bad", message)``
+    for a path that escapes the root, ``("error", OSError)``, ``("busy",
+    None)`` when MAX_STUCK_SONG_READS earlier ones have not returned (the
+    share is not judged), or ``("timeout", None)``.
+    """
+    run_check = check or _check_song
+    if not _SONG_READS.acquire(blocking=False):
+        return "busy", None
+    result: list[tuple[str, Any]] = []
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            result.append(run_check(media_root, rel_path))
+        except Exception as e:  # noqa: BLE001 - reported, never lost
+            result.append(("error", OSError(errno.EIO, str(e))))
+        finally:
+            done.set()
+            _SONG_READS.release()
+
+    try:
+        threading.Thread(target=run, name="song-read", daemon=True).start()
+    except RuntimeError as e:
+        _SONG_READS.release()
+        return "error", OSError(errno.EAGAIN, f"starting the song read: {e}")
+    if not done.wait(timeout):
+        return "timeout", None
+    return result[0]
+
+
+def _check_song(media_root: str, rel_path: str) -> tuple[str, Any]:
+    try:
+        full_path = resolve(media_root, rel_path)
+    except ValueError as e:
+        return "bad", str(e)
+    error = song_file_error(full_path)
+    return ("ok", full_path) if error is None else ("error", error)
+
+
 # How long /readyz waits for the media root: a hard NFS mount whose server is
 # gone blocks a read for good, and the probe must still answer.
 ROOT_TIMEOUT_SECS = 2.0
@@ -270,7 +324,6 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
         phases = Phases()
         try:
             rel_path, lines = parse_request(body)
-            full_path = resolve(self.get_media_root(), rel_path)
         except ValueError as e:
             span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
             self._send_json(400, {"error": str(e)})
@@ -279,9 +332,29 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
         span.set_attribute("aligner.lines", len(lines))
         # Checked here, not caught: a FileNotFoundError from inside the work
         # (ffmpeg missing) is a server fault, not a missing file. A file the
-        # share cannot read is not missing either: 503, and a share error
-        # keeps /readyz failing until the pod is replaced.
-        error = song_file_error(full_path)
+        # share cannot read is not missing either: 503, and a share error or
+        # a read past the time limit keeps /readyz failing until the pod is
+        # replaced. Resolving the path reads the share too, so it runs in
+        # the same bounded preflight.
+        kind, value = song_preflight(self.get_media_root(), rel_path)
+        if kind == "bad":
+            span.set_status(trace.Status(trace.StatusCode.ERROR, value))
+            self._send_json(400, {"error": value})
+            return
+        if kind in ("busy", "timeout"):
+            message = (
+                f"song file unreadable: {rel_path}: no answer within {SONG_READ_TIMEOUT_SECS:g} s"
+                if kind == "timeout"
+                else f"song file unreadable: {rel_path}: {MAX_STUCK_SONG_READS} earlier reads have not returned"
+            )
+            logger.warning("%s", message)
+            if kind == "timeout":
+                mark_broken(message)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "file unreadable"))
+            self._send_json(503, {"error": message})
+            return
+        full_path = value if kind == "ok" else ""
+        error = value if kind == "error" else None
         if isinstance(error, FileNotFoundError):
             logger.warning("song file not found: path=%s", rel_path)
             span.set_status(trace.Status(trace.StatusCode.ERROR, "file not found"))
