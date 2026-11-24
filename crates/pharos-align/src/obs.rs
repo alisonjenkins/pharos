@@ -36,6 +36,8 @@ pub const SEPARATION_SECONDS: &str = "pharos_aligner_separation_seconds";
 /// Songs found at start-up whose recogniser stages ended the last process
 /// (B1435); each skips the stages from then on.
 pub const STAGE_CRASH_TOTAL: &str = "pharos_aligner_stage_crash_total";
+/// 1 when the media root answered the last `/readyz`, 0 when it did not.
+pub const MEDIA_OK: &str = "pharos_aligner_media_ok";
 /// A GPU window takes tens of milliseconds, a batched CPU pass seconds.
 const FORWARD_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 /// A song takes seconds to minutes on the CPU.
@@ -198,6 +200,10 @@ impl Metrics {
             GPU_POOL_BYTES,
             metrics::Unit::Bytes,
             "GPU pool bytes in the last song: peak = largest reading sampled after each window and at song end, kept = reserved after release"
+        );
+        metrics::describe_gauge!(
+            MEDIA_OK,
+            "1 when the media root could be read at the last readiness check, 0 when it could not"
         );
         Ok(Self { handle, process })
     }

@@ -53,7 +53,8 @@ impl Model for Even {
 
 pub struct Server {
     pub addr: SocketAddr,
-    root: PathBuf,
+    /// The media root the server reads songs from.
+    pub root: PathBuf,
     handle: actix_web::dev::ServerHandle,
 }
 
@@ -75,6 +76,7 @@ pub fn serve(name: &str, decoder: Decoder, gate: Option<mpsc::Receiver<()>>) -> 
     let state = web::Data::new(AppState {
         engine: Arc::new(Engine::new(loader, decoder, None)),
         media_root: root.clone(),
+        media: pharos_align::media::MediaProbe::new(root.clone()),
         metrics: None,
     });
     let (tx, rx) = mpsc::channel();

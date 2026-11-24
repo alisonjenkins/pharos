@@ -408,6 +408,7 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
     );
     let state = web::Data::new(AppState {
         engine,
+        media: pharos_align::media::MediaProbe::new(config.media_root.clone()),
         media_root: config.media_root,
         metrics: Some(metrics),
     });
