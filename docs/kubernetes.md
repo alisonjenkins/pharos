@@ -66,7 +66,7 @@ deployment:
    [NFS exports and stale handles](#nfs-exports-and-stale-handles)).
 2. **Keep `selfHeal` on** (the default) so a pod whose mount goes bad is
    replaced, not left out of its Service (see [Self-healing](#self-healing)).
-   It needs RBAC to delete pods in the release's namespace.
+   It needs RBAC to patch pods and Deployments in the release's namespace.
 3. **Running the aligner?** Its readiness probe reads the media root, so the
    media volume must be mounted and readable before it reports ready.
 
@@ -145,10 +145,10 @@ So the chart splits the work:
 | Aligner readiness probe | Points at `/readyz`. Liveness stays on `/healthz`, because a restart would not help. |
 | Server `GET /readyz` | Lists each media root on its own thread with a 2 s limit, and fails from the first media read that hits a stale handle, lost connection or I/O error until the pod is replaced. Answers 503 with the cause under `media`. A missing or refused library folder does not fail it, so one deleted folder cannot take the whole server out of its Service. |
 | Server media routes | A file the share cannot read answers 503, not 404: the file is not missing, this pod cannot reach it. |
-| `selfHeal` CronJob | Every 2 minutes, deletes this release's pods labelled `pharos.io/self-heal=true` that have been NotReady for `selfHeal.notReadyMinutes` (default 5) after starting. Their Deployment makes fresh pods, which mount the share again. |
+| `selfHeal` CronJob | Every 2 minutes, finds this release's Deployments labelled `pharos.io/self-heal=true` whose pod has been NotReady for `selfHeal.notReadyMinutes` (default 5) after starting, and rolls each one out again, as `kubectl rollout restart` does. The new pod mounts the share afresh. |
 
 It is on by default. To tune it, or to turn it off where the namespace may
-not grant a Role that deletes pods:
+not grant a Role that patches pods and Deployments:
 
 ```yaml
 selfHeal:
@@ -156,8 +156,17 @@ selfHeal:
   notReadyMinutes: 5   # long enough for a short NFS server reboot to pass
 ```
 
-The CronJob runs with a namespace-scoped Role that can only get, list, patch
-and delete pods. It skips pods still starting (the aligner's startup probe can
+The rollout follows the Deployment's own strategy. With `RollingUpdate`, the
+new pod starts before the old one stops, so a share that is still broken
+leaves the old pod serving what it can and nothing is lost. With `Recreate`,
+the old pod stops first. The chart uses `Recreate` for the server on SQLite
+(its database volume is ReadWriteOnce and single-writer) and for an aligner
+with a GPU or a cache volume, so those still go down while the new pod
+starts. After a rollout, the reaper leaves that Deployment alone for
+`notReadyMinutes`, so its new pod gets the whole limit to become Ready.
+
+The CronJob runs with a namespace-scoped Role that can only get, list and
+patch pods and Deployments. It deletes nothing. It skips pods still starting (the aligner's startup probe can
 take minutes on a cold GPU cache) and pods already terminating. A pod's Ready
 condition is False from before its startup probe passed, so the reaper does
 not trust its age: the first run that sees a started pod NotReady stamps it
@@ -165,21 +174,22 @@ with the annotation `pharos.io/not-ready-since`, and the count runs from that
 stamp. A container replaced since the stamp (it records each container's
 ID), or a Ready change after it, starts the count again.
 
-So, from the fault to the pod's deletion, with the defaults:
+So, from the fault to the rollout, with the defaults:
 
 | Step | Takes |
 |------|-------|
 | Readiness probe fails enough times to mark the pod NotReady | up to 30 s (aligner: 3 × 10 s) |
 | The next reaper run stamps it | up to 2 min |
 | The stamp ages past `notReadyMinutes` | 5 min |
-| The next reaper run deletes it | up to 2 min |
+| The next reaper run rolls out its Deployment | up to 2 min |
 
-That is about 5 to 10 minutes, then the new pod's own startup. Each stamp
-and each deletion logs one line:
+That is about 5 to 10 minutes, then the new pod's own startup. Each stamp,
+each rollout and each Deployment left to settle logs one line:
 
 ```
 self-heal: watching pod=<name> not_ready_since=<unix seconds> containers=<ids>
-self-heal: deleting pod=<name> not_ready_s=<seconds> limit_s=<seconds>
+self-heal: restarting deployment=<name> pod=<name> not_ready_s=<seconds> limit_s=<seconds>
+self-heal: waiting deployment=<name> restarted_s=<seconds>
 ```
 
 The image is any one with `bash`, `jq` and `kubectl` (`selfHeal.image`).
