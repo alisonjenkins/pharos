@@ -345,3 +345,29 @@ def test_every_answer_names_the_aligner_version(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_a_hung_media_root_answers_within_the_timeout() -> None:
+    from pharos_aligner.server import checked_media_root_error
+
+    release = threading.Event()
+
+    def hung(root: str) -> str | None:
+        release.wait(5)
+        return None
+
+    try:
+        error = checked_media_root_error("/media", timeout=0.05, probe=hung)
+        assert error is not None and "no answer within" in error
+        # The stuck probe keeps the one slot: no second thread starts.
+        error = checked_media_root_error("/media", timeout=0.05, probe=hung)
+        assert error is not None and "still running" in error
+    finally:
+        release.set()
+    deadline = threading.Event()
+    for _ in range(100):
+        if checked_media_root_error("/media", timeout=1, probe=lambda root: None) is None:
+            break
+        deadline.wait(0.01)
+    else:
+        raise AssertionError("the slot was not freed once the probe returned")

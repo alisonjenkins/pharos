@@ -83,6 +83,45 @@ def media_root_error(root: str) -> str | None:
         return f"reading {root}: {e}"
     return None
 
+
+# How long /readyz waits for the media root: a hard NFS mount whose server is
+# gone blocks a read for good, and the probe must still answer.
+ROOT_TIMEOUT_SECS = 2.0
+
+# One root probe in flight: probes stuck on a hung mount must not pile up
+# threads, one per kubelet check.
+_PROBE_SLOT = threading.Lock()
+
+
+def checked_media_root_error(
+    root: str,
+    timeout: float = ROOT_TIMEOUT_SECS,
+    probe: Callable[[str], str | None] = media_root_error,
+) -> str | None:
+    """``media_root_error`` on a worker thread, given at most ``timeout`` s.
+
+    A probe that does not finish in time keeps the slot until it does, so a
+    hung mount answers "still checking" rather than starting another thread.
+    """
+    if not _PROBE_SLOT.acquire(blocking=False):
+        return f"a check of {root} is still running"
+    result: list[str | None] = []
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            result.append(probe(root))
+        except Exception as e:  # noqa: BLE001 - any failure means not ready
+            result.append(f"reading {root}: {e}")
+        finally:
+            done.set()
+            _PROBE_SLOT.release()
+
+    threading.Thread(target=run, name="media-root-probe", daemon=True).start()
+    if not done.wait(timeout):
+        return f"reading {root}: no answer within {timeout:g} s"
+    return result[0]
+
 class AlignerHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for health checks and lyric alignment."""
 
@@ -136,7 +175,7 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/healthz":
             self._send_json(200, {"ok": True})
         elif self.path == "/readyz":
-            error = media_root_error(self.get_media_root())
+            error = checked_media_root_error(self.get_media_root())
             if error is None:
                 self._send_json(200, {"ok": True})
             else:
