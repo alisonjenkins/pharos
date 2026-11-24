@@ -455,7 +455,13 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 fn parse_rfc3339(s: &str) -> Option<i64> {
     let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
     let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b't' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
@@ -530,6 +536,8 @@ mod tests {
             "2026-11-24",
             "2026-13-01T00:00:00Z",
             "2026-11-24T18:00:00",
+            "2026-11-24T18-00-00Z",
+            "2026-11-24T18:00.00Z",
         ] {
             assert_eq!(parse_rfc3339(bad), None, "{bad}");
         }
