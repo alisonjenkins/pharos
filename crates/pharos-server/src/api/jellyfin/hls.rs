@@ -1713,8 +1713,17 @@ async fn serve_segment(
 fn segment_cache_error(e: pharos_cache::hls_cache::HlsCacheError) -> actix_web::Error {
     match e {
         pharos_cache::hls_cache::HlsCacheError::SourceUnreadable { reason, detail } => {
-            tracing::warn!(reason, error = %detail, "hls: media source unreadable");
-            error::ErrorNotFound("media source unreadable")
+            // A stale handle or lost connection is the share, not the file:
+            // 503, and the pod is marked for a fresh mount (B1531).
+            let share_broken = matches!(reason, "stale_handle" | "not_connected");
+            tracing::warn!(reason, share_broken, error = %detail, "hls: media source unreadable");
+            if share_broken {
+                crate::media_share::MediaShare::global()
+                    .mark_broken(format!("hls source open ({reason}): {detail}"));
+                error::ErrorServiceUnavailable("media share unreadable")
+            } else {
+                error::ErrorNotFound("media source unreadable")
+            }
         }
         other => error::ErrorInternalServerError(format!("segment cache: {other}")),
     }
@@ -5534,6 +5543,31 @@ mod stream_index_tests {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// A source ffmpeg could not open for a stale handle is the share, not
+    /// the file: 503, and the share is marked broken (B1531). A missing file
+    /// stays the 404 it was.
+    #[actix_web::test]
+    async fn a_stale_source_is_a_503_and_breaks_the_share_and_a_missing_one_is_a_404() {
+        use pharos_cache::hls_cache::HlsCacheError;
+        let missing = segment_cache_error(HlsCacheError::SourceUnreadable {
+            reason: "missing",
+            detail: "Error opening input: No such file or directory".into(),
+        });
+        assert_eq!(
+            missing.as_response_error().status_code(),
+            actix_web::http::StatusCode::NOT_FOUND
+        );
+        let stale = segment_cache_error(HlsCacheError::SourceUnreadable {
+            reason: "stale_handle",
+            detail: "Error opening input: Stale file handle".into(),
+        });
+        assert_eq!(
+            stale.as_response_error().status_code(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(crate::media_share::MediaShare::global().is_broken());
+    }
 
     // `use actix_web::test` shadows the bare `#[test]` attribute; qualify it.
     #[::core::prelude::v1::test]
