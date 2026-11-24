@@ -1,11 +1,13 @@
 {{- /*
-selfHeal: a CronJob that deletes this release's pods which have stayed
-NotReady too long, so their Deployment makes new ones. A failing readiness
-probe only takes a pod out of its Service, and a failing liveness probe only
-restarts the container; neither replaces a pod-level fault such as a stale
-NFS mount, which belongs to the pod. Only pods labelled
-pharos.io/self-heal=true whose containers have all started (so past the
-startup probe) are candidates.
+selfHeal: a CronJob that rolls out a fresh pod for each of this release's
+Deployments labelled pharos.io/self-heal=true whose pod has stayed NotReady
+too long, as `kubectl rollout restart` does. A failing readiness probe only
+takes a pod out of its Service, and a failing liveness probe only restarts
+the container; neither replaces a pod-level fault such as a stale NFS mount,
+which belongs to the pod. The rollout follows the Deployment's own strategy:
+RollingUpdate starts the new pod before the old one stops, Recreate stops
+the old one first. Only pods whose containers have all started (so past the
+startup probe) are counted.
 */ -}}
 {{- if .Values.selfHeal.enabled }}
 {{- /* A CronJob name may be at most 52 characters: its Jobs append an
@@ -30,7 +32,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     # patch: the reaper stamps when it first saw a pod NotReady.
-    verbs: ["get", "list", "patch", "delete"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    # patch: the restartedAt annotation that rolls out a fresh pod.
+    verbs: ["get", "list", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -107,27 +113,48 @@ spec:
                   # replaced container has a new ID even where its restart count
                   # was reset, as after a node restart that lost kubelet state.
                   key=pharos.io/not-ready-since
-                  kubectl get pods -n "$NAMESPACE" -l "$SELECTOR" -o json |
-                    jq -r --arg key "$key" '
+                  restarted_key=kubectl.kubernetes.io/restartedAt
+                  kubectl get deployments -n "$NAMESPACE" -l "$SELECTOR" -o json |
+                    jq -r --arg key "$restarted_key" '
                       .items[]
-                      | select(.metadata.deletionTimestamp == null)
-                      | select(.status.phase == "Running")
-                      | select((.status.containerStatuses // []) | length > 0 and all(.started == true))
-                      | ((.status.conditions // []) | map(select(.type == "Ready")) | first) as $ready
-                      | select($ready != null and $ready.status == "False")
-                      | ([.status.containerStatuses[].containerID // "none"
-                          | sub("^[a-z]+://"; "") | .[0:12]] | join(",")) as $containers
-                      | ((.metadata.annotations // {})[$key] // "" | split("/")) as $stamp
-                      | ((($stamp[0] // "0") | tonumber?) // 0) as $since
-                      | (if ($stamp[1] // "") == $containers then $since else 0 end) as $since
-                      | "\(.metadata.name) \($since) \($ready.lastTransitionTime | fromdateiso8601) \($containers)"' |
-                    while read -r pod since changed containers; do
-                      if [ "$since" -lt "$changed" ]; then
-                        echo "self-heal: watching pod=$pod not_ready_since=$now containers=$containers"
-                        kubectl annotate pod -n "$NAMESPACE" "$pod" --overwrite "$key=$now/$containers" >/dev/null
-                      elif [ $((now - since)) -gt "$NOT_READY_SECONDS" ]; then
-                        echo "self-heal: deleting pod=$pod not_ready_s=$((now - since)) limit_s=$NOT_READY_SECONDS"
-                        kubectl delete pod -n "$NAMESPACE" "$pod" --wait=false
+                      | ((.spec.template.metadata.annotations // {})[$key] // "") as $at
+                      | (if $at == "" then 0 else (try ($at | fromdateiso8601) catch 0) end) as $restarted
+                      | (.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")) as $pods
+                      | "\(.metadata.name) \($restarted) \($pods)"' |
+                    while read -r deploy restarted pods; do
+                      # One rollout at a time: a pod this reaper rolled out gets the
+                      # whole limit to become Ready before it is judged again.
+                      if [ $((now - restarted)) -lt "$NOT_READY_SECONDS" ]; then
+                        echo "self-heal: waiting deployment=$deploy restarted_s=$((now - restarted))"
+                        continue
+                      fi
+                      stale=""
+                      while read -r pod since changed containers; do
+                        if [ "$since" -lt "$changed" ]; then
+                          echo "self-heal: watching pod=$pod not_ready_since=$now containers=$containers"
+                          kubectl annotate pod -n "$NAMESPACE" "$pod" --overwrite "$key=$now/$containers" >/dev/null
+                        elif [ $((now - since)) -gt "$NOT_READY_SECONDS" ] && [ -z "$stale" ]; then
+                          stale="$pod $((now - since))"
+                        fi
+                      done < <(kubectl get pods -n "$NAMESPACE" -l "$pods" -o json |
+                        jq -r --arg key "$key" '
+                          .items[]
+                          | select(.metadata.deletionTimestamp == null)
+                          | select(.status.phase == "Running")
+                          | select((.status.containerStatuses // []) | length > 0 and all(.started == true))
+                          | ((.status.conditions // []) | map(select(.type == "Ready")) | first) as $ready
+                          | select($ready != null and $ready.status == "False")
+                          | ([.status.containerStatuses[].containerID // "none"
+                              | sub("^[a-z]+://"; "") | .[0:12]] | join(",")) as $containers
+                          | ((.metadata.annotations // {})[$key] // "" | split("/")) as $stamp
+                          | ((($stamp[0] // "0") | tonumber?) // 0) as $since
+                          | (if ($stamp[1] // "") == $containers then $since else 0 end) as $since
+                          | "\(.metadata.name) \($since) \($ready.lastTransitionTime | fromdateiso8601) \($containers)"')
+                      if [ -n "$stale" ]; then
+                        read -r pod seconds <<<"$stale"
+                        echo "self-heal: restarting deployment=$deploy pod=$pod not_ready_s=$seconds limit_s=$NOT_READY_SECONDS"
+                        kubectl patch deployment -n "$NAMESPACE" "$deploy" --type merge \
+                          -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"$restarted_key\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}}}}}" >/dev/null
                       fi
                     done
                   echo "self-heal: checked selector=$SELECTOR"
