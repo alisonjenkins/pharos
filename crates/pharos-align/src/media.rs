@@ -58,9 +58,13 @@ pub enum Unreadable {
     Io,
     /// The share's connection is gone (ENOTCONN).
     NotConnected,
-    /// The read did not answer within [`SOURCE_TIMEOUT`], or too many earlier
-    /// reads are still stuck: a hard mount whose server is gone.
+    /// The read did not answer within [`SOURCE_TIMEOUT`]: a hard mount
+    /// whose server is gone.
     TimedOut,
+    /// [`MAX_STUCK_SOURCE_READS`] earlier reads have not returned, so this one
+    /// was not started. Not taken to break the share: each stuck read marks
+    /// it broken itself if it passes the timeout.
+    Busy,
     /// Any other error, such as a permission refused on one file; the share
     /// itself is not taken to be broken.
     Other,
@@ -85,13 +89,14 @@ impl Unreadable {
             Self::Io => "io",
             Self::NotConnected => "not_connected",
             Self::TimedOut => "timed_out",
+            Self::Busy => "busy",
             Self::Other => "other",
         }
     }
 
     /// Whether only a fresh mount reads the share again.
     pub fn breaks_the_share(self) -> bool {
-        !matches!(self, Self::Other)
+        !matches!(self, Self::Other | Self::Busy)
     }
 }
 
@@ -172,16 +177,16 @@ impl MediaProbe {
     }
 
     /// [`read_source`] on a thread of its own, given at most the source
-    /// timeout. A read that never returns keeps its thread, so at most
-    /// [`MAX_STUCK_SOURCE_READS`] run at once; past that, and on a timeout,
-    /// the song is [`Unreadable::TimedOut`].
+    /// timeout, after which the song is [`Unreadable::TimedOut`]. A read that
+    /// never returns keeps its thread, so at most [`MAX_STUCK_SOURCE_READS`]
+    /// run at once; past that the song is [`Unreadable::Busy`].
     pub async fn read_source(&self, path: PathBuf) -> Source {
         if self.source_reads.fetch_add(1, Ordering::AcqRel) >= MAX_STUCK_SOURCE_READS {
             self.source_reads.fetch_sub(1, Ordering::AcqRel);
             return Source::Unreadable(
-                Unreadable::TimedOut,
+                Unreadable::Busy,
                 io::Error::new(
-                    io::ErrorKind::TimedOut,
+                    io::ErrorKind::WouldBlock,
                     format!(
                         "{MAX_STUCK_SOURCE_READS} earlier reads of the share have not returned"
                     ),
@@ -341,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn song_reads_stuck_on_the_share_cap_new_ones_as_timed_out() {
+    async fn song_reads_stuck_on_the_share_turn_new_ones_away_as_busy() {
         let d = dir("stuck");
         let song = d.join("song.flac");
         std::fs::write(&song, b"x").unwrap();
@@ -356,11 +361,12 @@ mod tests {
             .store(super::MAX_STUCK_SOURCE_READS, Ordering::Release);
         let found = probe.read_source(song.clone()).await;
         assert!(
-            matches!(
-                found,
-                super::Source::Unreadable(super::Unreadable::TimedOut, _)
-            ),
+            matches!(found, super::Source::Unreadable(super::Unreadable::Busy, _)),
             "{found:?}"
+        );
+        assert!(
+            !super::Unreadable::Busy.breaks_the_share(),
+            "turning a read away says nothing of the share"
         );
         assert!(super::Unreadable::TimedOut.breaks_the_share());
         probe.source_reads.store(0, Ordering::Release);
@@ -386,12 +392,13 @@ mod tests {
             Unreadable::Io.label(),
             Unreadable::NotConnected.label(),
             Unreadable::TimedOut.label(),
+            Unreadable::Busy.label(),
             Unreadable::Other.label(),
         ]
         .to_vec();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 5);
+        assert_eq!(labels.len(), 6);
     }
 
     #[test]
