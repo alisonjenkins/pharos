@@ -6,7 +6,7 @@
 
 ## Context
 
-ADR-0154 rolls out a fresh aligner pod whose media share has gone stale. The
+ADR-0154 rolls out a fresh pod for an aligner whose media share has gone stale. The
 server mounts the same share and has the same fault. A stale handle there
 makes every direct-play and HLS request fail, and the server used to answer
 each one 404 "media source unreadable", as if the file were gone. Its
@@ -42,8 +42,9 @@ chart lets `selfHeal` roll out a fresh server pod as it does the aligner's
   tabulates), plus the new pod's startup.
 - On Postgres with `RollingUpdate`, the new pod starts first. If its share
   reads, it takes over with no gap; if not, the rollout stalls and the old
-  pod stays, so Pharos keeps serving what it can. Before this, playback was down until someone recreated the pod by
-  hand, while the rest of Pharos kept working.
+  pod stays, so Pharos keeps serving what it can.
+- Before this, playback was down until someone recreated the pod by hand,
+  while the rest of Pharos kept working.
 - If the NAS itself is down, the new pod fails `/readyz` too. On `Recreate`
   the reaper rolls it out again about every 7 to 9 minutes until the share
   answers, and Pharos is unreachable for that time.
