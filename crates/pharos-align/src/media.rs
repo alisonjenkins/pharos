@@ -208,7 +208,13 @@ impl MediaProbe {
         }
         match tokio::time::timeout(self.source_timeout, rx).await {
             Ok(Ok(found)) => found,
-            Ok(Err(_)) | Err(_) => Source::Unreadable(
+            // The read's thread ended without an answer (it panicked): a
+            // fault here, not the share's.
+            Ok(Err(_)) => Source::Unreadable(
+                Unreadable::Other,
+                io::Error::other("the song read ended without an answer"),
+            ),
+            Err(_) => Source::Unreadable(
                 Unreadable::TimedOut,
                 io::Error::new(
                     io::ErrorKind::TimedOut,
