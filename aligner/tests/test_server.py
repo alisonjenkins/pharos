@@ -66,6 +66,21 @@ def test_healthz(running_server: tuple[str, Path]) -> None:
         assert data == {"ok": True}
 
 
+def test_readyz_follows_the_media_root(running_server: tuple[str, Path]) -> None:
+    base_url, media_root = running_server
+    with urllib.request.urlopen(f"{base_url}/readyz") as resp:
+        assert resp.status == 200
+        assert json.loads(resp.read().decode("utf-8")) == {"ok": True}
+    media_root.rmdir()
+    with pytest.raises(urllib.error.HTTPError) as info:
+        urllib.request.urlopen(f"{base_url}/readyz")
+    assert info.value.code == 503
+    data = json.loads(info.value.read().decode("utf-8"))
+    assert data["ok"] is False
+    assert str(media_root) in data["error"]
+    media_root.mkdir()
+
+
 def test_post_align_two_lines(running_server: tuple[str, Path]) -> None:
     base_url, media_root = running_server
     song_file = media_root / "test.mp3"

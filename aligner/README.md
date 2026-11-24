@@ -9,5 +9,6 @@ Forced alignment HTTP service for Pharos karaoke word-level lyric times.
 - `PHAROS_ALIGNER_OTLP_ENDPOINT`: OTLP/gRPC endpoint for traces (ADR-0105), e.g. `http://tempo:4317`; unset exports nothing. A request's `traceparent` header makes its spans part of the caller's trace. Each song logs one line, `path=… words_aligned=… duration_ms=… decode_ms=… model_ms=…`, or `failed=ffmpeg|internal|caller_gone` with the same totals.
 - `POST /align`: compute word-level timestamps for synced lyric lines. Before timing the words it looks for a constant offset between the lines and the singing (lyrics timed for another cut of the song), moves every line by it, and reports it as `offset_ms`. Each line also carries `score`, the mean probability of its words' characters (0 to 1, or null when it has no alignable words): it is low when the words are not what is sung, such as a translation over the original singing.
 - `GET /healthz`: health probe returning `{"ok": true}`.
+- `GET /readyz`: readiness probe; 503 with an `error` when the media root cannot be read (a stale NFS mount, say).
 
 Run tests: `pytest` inside `aligner/`.
