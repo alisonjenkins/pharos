@@ -50,13 +50,19 @@ fi
 yq "$container.args[0]" <<<"$cronjob" >"$work/script.sh"
 
 ago() { date -u -d "@$(($(date +%s) - $1))" +%Y-%m-%dT%H:%M:%SZ; }
-pod() { # name phase started ready seconds-since-ready-changed [seconds-since-stamp|-] [terminating]
-  local deleting=null annotations='{}'
-  [ "${7:-}" = terminating ] && deleting="\"$(ago 1)\""
+pod() { # name phase started ready seconds-since-ready-changed [seconds-since-stamp|-] [terminating|restarts-now]
+  # A stamp records 0 restarts; a pod's containers have restarted 0 times
+  # unless the 7th argument says otherwise.
+  local deleting=null annotations='{}' restarts=0
+  case "${7:-}" in
+    terminating) deleting="\"$(ago 1)\"" ;;
+    '') ;;
+    *) restarts="$7" ;;
+  esac
   [ -n "${6:-}" ] && [ "$6" != - ] &&
-    annotations="{\"pharos.io/not-ready-since\":\"$(($(date +%s) - $6))\"}"
-  printf '{"metadata":{"name":"%s","deletionTimestamp":%s,"annotations":%s},"status":{"phase":"%s","containerStatuses":[{"started":%s}],"conditions":[{"type":"Ready","status":"%s","lastTransitionTime":"%s"}]}}' \
-    "$1" "$deleting" "$annotations" "$2" "$3" "$4" "$(ago "$5")"
+    annotations="{\"pharos.io/not-ready-since\":\"$(($(date +%s) - $6))/0\"}"
+  printf '{"metadata":{"name":"%s","deletionTimestamp":%s,"annotations":%s},"status":{"phase":"%s","containerStatuses":[{"started":%s,"restartCount":%s}],"conditions":[{"type":"Ready","status":"%s","lastTransitionTime":"%s"}]}}' \
+    "$1" "$deleting" "$annotations" "$2" "$3" "$restarts" "$4" "$(ago "$5")"
 }
 {
   echo '{"items":['
@@ -68,6 +74,9 @@ pod() { # name phase started ready seconds-since-ready-changed [seconds-since-st
   pod first-seen Running true False 600; echo ,
   # Stamped 600 s ago, then Ready, then NotReady again 30 s ago: restamped.
   pod relapsed Running true False 30 600; echo ,
+  # Stamped 400 s ago, then its container restarted (Ready stayed False):
+  # its startup ran again, so the count starts again.
+  pod restarted Running true False 900 400 1; echo ,
   pod starting Running false False 600; echo ,
   pod blip Running true False 900 60; echo ,
   pod leaving Running true False 900 400 terminating; echo ,
@@ -101,8 +110,8 @@ if [ "$(cat "$work/deleted")" = "delete pod -n pharos stale --wait=false" ]; the
 else
   fail "deleted: $(tr '\n' ';' <"$work/deleted")"
 fi
-if [ "$(sort "$work/stamped" | tr '\n' ' ')" = "first-seen relapsed " ]; then
-  ok "a pod first seen NotReady, or NotReady again after recovering, is stamped"
+if [ "$(sort "$work/stamped" | tr '\n' ' ')" = "first-seen relapsed restarted " ]; then
+  ok "a pod first seen NotReady, NotReady again after recovering, or restarted, is stamped"
 else
   fail "stamped: $(tr '\n' ';' <"$work/stamped")"
 fi

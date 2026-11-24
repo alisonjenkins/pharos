@@ -37,6 +37,7 @@ automatically.
     counted from the first run that saw it started and NotReady. That run
     stamps the pod with the annotation `pharos.io/not-ready-since`, because
     a new pod's Ready condition dates from before its startup probe passed.
+    A container restart or a Ready change after the stamp restarts the count.
 
   Their Deployment then starts a new pod, which mounts the share again.
 - `selfHeal` is on by default, so a new install heals without extra steps.
