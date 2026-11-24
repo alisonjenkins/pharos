@@ -34,9 +34,11 @@ release, on the self-hosted Nix runner.
   repository variable `PHAROS_ANDROID_CERT_SHA256`.
 - `versionCode` is minutes since 2026-01-01 UTC for every build, CI or
   local. That is the scripts' default; `PHAROS_ANDROID_VERSION_CODE`
-  overrides it and must not be set, because a code below the installed
-  release's makes Android refuse the update as a downgrade. `versionName`
-  and the tag are the same minute as a date.
+  overrides it. The workflow sets it for both APKs from its shared
+  `version` job, so the two apps and the release carry the same minute.
+  Do not set it by hand for a local build, because a code below the
+  installed release's makes Android refuse the update as a downgrade.
+  `versionName` and the tag are the same minute as a date.
 - App releases are not marked Latest, so the server release stays Latest.
 - The audience is anyone who installs the apps. They install with Obtainium
   (phone) or Downloader (TV), as `docs/android-apps.md` explains, and sign in
