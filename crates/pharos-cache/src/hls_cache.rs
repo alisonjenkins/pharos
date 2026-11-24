@@ -413,7 +413,7 @@ fn failure_reason(err: &HlsCacheError) -> &'static str {
 ///
 /// The strings are ffmpeg's own (`Error opening input: Stale file handle`,
 /// `... No such file or directory`, `... Permission denied`), so the match is
-/// on the OS error text libav passes through, bounded to the four causes a
+/// on the OS error text libav passes through, bounded to the five causes a
 /// storage incident produces. On 2026-09-04 a stale NFS handle produced 3 862
 /// `500`s on one item's init segment in an hour — one ffmpeg spawn per client
 /// retry against a path that could not open — all reported as "transcode
@@ -427,6 +427,11 @@ pub fn source_open_failure(msg: &str) -> Option<&'static str> {
         "stale_handle"
     } else if tail.contains("Transport endpoint is not connected") {
         "not_connected"
+    } else if tail.contains("Input/output error") {
+        // EIO, which a hard NFS mount gives once its server is gone. Kept
+        // apart from the catch-all `io` below, which also covers causes a
+        // fresh mount would not fix (`Protocol not found`).
+        "io_error"
     } else if tail.contains("No such file or directory") {
         "missing"
     } else if tail.contains("Permission denied") {
@@ -11786,6 +11791,10 @@ mod tests {
         assert_eq!(
             source_open_failure("Error opening input: Transport endpoint is not connected"),
             Some("not_connected")
+        );
+        assert_eq!(
+            source_open_failure("Error opening input: Input/output error"),
+            Some("io_error")
         );
         assert_eq!(
             source_open_failure("Error opening input: Protocol not found"),
