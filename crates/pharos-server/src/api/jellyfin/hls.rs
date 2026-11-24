@@ -1713,9 +1713,9 @@ async fn serve_segment(
 fn segment_cache_error(e: pharos_cache::hls_cache::HlsCacheError) -> actix_web::Error {
     match e {
         pharos_cache::hls_cache::HlsCacheError::SourceUnreadable { reason, detail } => {
-            // A stale handle or lost connection is the share, not the file:
-            // 503, and the pod is marked for a fresh mount (B1531).
-            let share_broken = matches!(reason, "stale_handle" | "not_connected");
+            // A stale handle, lost connection or I/O error is the share, not
+            // the file: 503, and the pod is marked for a fresh mount (B1531).
+            let share_broken = crate::media_share::is_share_reason(reason);
             tracing::warn!(reason, share_broken, error = %detail, "hls: media source unreadable");
             if share_broken {
                 crate::media_share::MediaShare::global()
@@ -5544,7 +5544,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    /// A source ffmpeg could not open for a stale handle is the share, not
+    /// A source ffmpeg could not open for a share fault is the share, not
     /// the file: 503, and the share is marked broken (B1531). A missing file
     /// stays the 404 it was.
     #[actix_web::test]
@@ -5567,6 +5567,29 @@ mod tests {
             actix_web::http::StatusCode::SERVICE_UNAVAILABLE
         );
         assert!(crate::media_share::MediaShare::global().is_broken());
+        for (reason, detail) in [
+            ("not_connected", "Transport endpoint is not connected"),
+            ("io_error", "Input/output error"),
+        ] {
+            let e = segment_cache_error(HlsCacheError::SourceUnreadable {
+                reason,
+                detail: format!("Error opening input: {detail}"),
+            });
+            assert_eq!(
+                e.as_response_error().status_code(),
+                actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{reason}"
+            );
+        }
+        let other = segment_cache_error(HlsCacheError::SourceUnreadable {
+            reason: "io",
+            detail: "Error opening input: Protocol not found".into(),
+        });
+        assert_eq!(
+            other.as_response_error().status_code(),
+            actix_web::http::StatusCode::NOT_FOUND,
+            "the catch-all io reason is not a share fault"
+        );
     }
 
     // `use actix_web::test` shadows the bare `#[test]` attribute; qualify it.
