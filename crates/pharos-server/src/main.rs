@@ -2536,15 +2536,8 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 "self-restart: on; a broken media share asks for a rollout restart"
             );
             self_restart.set_restarter(std::sync::Arc::new(restarter));
-            media_share.on_broken(move |why| {
-                if media_share.was_whole() {
-                    self_restart.on_share_broken(why);
-                } else {
-                    tracing::warn!(
-                        "self-restart: the share broke before this pod ever read it; not restarting"
-                    );
-                }
-            });
+            // Told only when the share was seen whole first.
+            media_share.on_broken(move |why| self_restart.on_share_broken(why));
         }
         Some(Err(error)) => tracing::error!(
             error = %error,
