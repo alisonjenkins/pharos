@@ -49,11 +49,15 @@ fi
 yq "$container.args[0]" <<<"$cronjob" >"$work/script.sh"
 
 ago() { date -u -d "@$(($(date +%s) - $1))" +%Y-%m-%dT%H:%M:%SZ; }
-pod() { # name phase started ready seconds-since-ready-changed [terminating]
-  local deleting=null
-  [ "${6:-}" = terminating ] && deleting="\"$(ago 1)\""
-  printf '{"metadata":{"name":"%s","deletionTimestamp":%s},"status":{"phase":"%s","containerStatuses":[{"started":%s}],"conditions":[{"type":"Ready","status":"%s","lastTransitionTime":"%s"}]}}' \
-    "$1" "$deleting" "$2" "$3" "$4" "$(ago "$5")"
+pod() { # name phase started ready seconds-since-ready-changed [terminating|seconds-since-container-start]
+  local deleting=null state='{}'
+  case "${6:-}" in
+    terminating) deleting="\"$(ago 1)\"" ;;
+    '') ;;
+    *) state="{\"running\":{\"startedAt\":\"$(ago "$6")\"}}" ;;
+  esac
+  printf '{"metadata":{"name":"%s","deletionTimestamp":%s},"status":{"phase":"%s","containerStatuses":[{"started":%s,"state":%s}],"conditions":[{"type":"Ready","status":"%s","lastTransitionTime":"%s"}]}}' \
+    "$1" "$deleting" "$2" "$3" "$state" "$4" "$(ago "$5")"
 }
 {
   echo '{"items":['
@@ -62,7 +66,11 @@ pod() { # name phase started ready seconds-since-ready-changed [terminating]
   pod starting Running false False 600; echo ,
   pod blip Running true False 60; echo ,
   pod leaving Running true False 600 terminating; echo ,
-  pod pending Pending true False 600
+  pod pending Pending true False 600; echo ,
+  # NotReady since it was made, but its container started only a minute ago.
+  pod restarted Running true False 600 60; echo ,
+  # A node that stopped reporting: Unknown is not a pod fault.
+  pod unknown Running true Unknown 600
   echo ']}'
 } >"$work/pods.json"
 
