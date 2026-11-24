@@ -217,7 +217,13 @@ mod tests {
         ];
         assert_eq!(
             reasons,
-            ["stale_handle", "not_connected", "missing", "permission", "io"]
+            [
+                "stale_handle",
+                "not_connected",
+                "missing",
+                "permission",
+                "io"
+            ]
         );
     }
 
@@ -229,7 +235,10 @@ mod tests {
         assert!(share.check().await.is_ok());
 
         assert!(!share.note_read_error(Path::new("/m/a"), &err(2)));
-        assert!(share.check().await.is_ok(), "a missing file is not a share fault");
+        assert!(
+            share.check().await.is_ok(),
+            "a missing file is not a share fault"
+        );
 
         assert!(share.note_read_error(Path::new("/m/a"), &err(ESTALE)));
         share.note_read_error(Path::new("/m/b"), &err(EIO));
@@ -257,10 +266,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         share.set_roots(vec![dir.path().to_owned()]);
         share.busy.store(true, Ordering::Release);
-        assert!(matches!(
-            share.check().await,
-            Err(ShareError::StillWaiting)
-        ));
+        assert!(matches!(share.check().await, Err(ShareError::StillWaiting)));
         share.busy.store(false, Ordering::Release);
         assert!(share.check().await.is_ok());
     }
