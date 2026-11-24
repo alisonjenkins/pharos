@@ -11,10 +11,10 @@ this repo, tagged `apps-v<date>`. Each release holds two files:
 Both apps open on the Pharos server they were built for. Nobody types a
 server address. Each person signs in with their own Pharos account.
 
-- [Installing (friends)](#installing-friends)
+- [Installing](#installing)
 - [Publishing (server owner)](#publishing-server-owner)
 
-## Installing (friends)
+## Installing
 
 You need a Pharos account first. Ask the server owner for a user name and
 password. There is no sign-up page.
