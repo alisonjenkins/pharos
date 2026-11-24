@@ -56,8 +56,7 @@ returns the same server info (proving the UI's same-origin proxy); open
 just helm-lint
 helm install pharos charts/pharos -n pharos --create-namespace \
   --set persistence.media.type=existingClaim \
-  --set persistence.media.existingClaim=my-media-pvc \
-  --set selfHeal.enabled=true
+  --set persistence.media.existingClaim=my-media-pvc
 ```
 
 Before the first install, check these. Each one is a fault seen in a real
@@ -65,8 +64,9 @@ deployment:
 
 1. **Media over NFS?** Give the export a fixed `fsid=` (see
    [NFS exports and stale handles](#nfs-exports-and-stale-handles)).
-2. **Turn on `selfHeal`** so a pod whose mount goes bad is replaced, not left
-   out of its Service (see [Self-healing](#self-healing)).
+2. **Keep `selfHeal` on** (the default) so a pod whose mount goes bad is
+   replaced, not left out of its Service (see [Self-healing](#self-healing)).
+   It needs RBAC to delete pods in the release's namespace.
 3. **Running the aligner?** Its readiness probe reads the media root, so the
    media volume must be mounted and readable before it reports ready.
 
@@ -126,7 +126,7 @@ container keeps the stale mount. Only a new pod mounts the share again.
 Use a different number for each export. For a FUSE export, check its own docs
 for NFS settings too; mergerfs documents options for stable inode numbers.
 
-**Then turn on [`selfHeal`](#self-healing)** as the safety net for anything
+**Then keep [`selfHeal`](#self-healing) on** as the safety net for anything
 `fsid=` does not cover.
 
 ## Self-healing
@@ -145,11 +145,12 @@ So the chart splits the work:
 | Aligner readiness probe | Points at `/readyz`. Liveness stays on `/healthz`, because a restart would not help. |
 | `selfHeal` CronJob | Every 2 minutes, deletes this release's pods labelled `pharos.io/self-heal=true` that have been NotReady for `selfHeal.notReadyMinutes` (default 5) after starting. Their Deployment makes fresh pods, which mount the share again. |
 
-Turn it on:
+It is on by default. To tune it, or to turn it off where the namespace may
+not grant a Role that deletes pods:
 
 ```yaml
 selfHeal:
-  enabled: true
+  enabled: true        # false renders no CronJob, Role or ServiceAccount
   notReadyMinutes: 5   # long enough for a short NFS server reboot to pass
 ```
 

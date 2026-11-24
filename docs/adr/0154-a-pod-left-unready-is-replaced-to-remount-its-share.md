@@ -36,6 +36,9 @@ automatically.
   - NotReady for longer than `selfHeal.notReadyMinutes` (default 5).
 
   Their Deployment then starts a new pod, which mounts the share again.
+- `selfHeal` is on by default, so a new install heals without extra steps.
+  An install whose namespace refuses a Role that deletes pods sets
+  `selfHeal.enabled: false`.
 - The CronJob runs under a ServiceAccount whose Role may only get, list and
   delete pods in the release's namespace. It uses a small image with bash,
   jq and kubectl.
