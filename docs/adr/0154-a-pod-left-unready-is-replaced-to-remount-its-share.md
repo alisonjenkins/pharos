@@ -33,14 +33,17 @@ automatically.
   - Running;
   - every container started;
   - not terminating;
-  - NotReady for longer than `selfHeal.notReadyMinutes` (default 5).
+  - NotReady for longer than `selfHeal.notReadyMinutes` (default 5),
+    counted from the first run that saw it started and NotReady. That run
+    stamps the pod with the annotation `pharos.io/not-ready-since`, because
+    a new pod's Ready condition dates from before its startup probe passed.
 
   Their Deployment then starts a new pod, which mounts the share again.
 - `selfHeal` is on by default, so a new install heals without extra steps.
   An install whose namespace refuses a Role that deletes pods sets
   `selfHeal.enabled: false`.
-- The CronJob runs under a ServiceAccount whose Role may only get, list and
-  delete pods in the release's namespace. It uses a small image with bash,
+- The CronJob runs under a ServiceAccount whose Role may only get, list,
+  patch (for the stamp) and delete pods in the release's namespace. It uses a small image with bash,
   jq and kubectl.
 
 ## Consequences

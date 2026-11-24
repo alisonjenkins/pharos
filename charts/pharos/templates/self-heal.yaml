@@ -29,7 +29,8 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "delete"]
+    # patch: the reaper stamps when it first saw a pod NotReady.
+    verbs: ["get", "list", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -95,28 +96,30 @@ spec:
                 - |
                   set -euo pipefail
                   now="$(date +%s)"
+                  # A new pod's Ready condition is False from before its startup probe
+                  # passed, so its transition time cannot say how long readiness has
+                  # failed. The reaper stamps the time it first sees a started pod
+                  # NotReady and counts from that stamp; a Ready transition newer than
+                  # the stamp (the pod recovered and failed again) starts a new count.
+                  key=pharos.io/not-ready-since
                   kubectl get pods -n "$NAMESPACE" -l "$SELECTOR" -o json |
-                    jq -r --argjson now "$now" --argjson limit "$NOT_READY_SECONDS" '
+                    jq -r --arg key "$key" '
                       .items[]
                       | select(.metadata.deletionTimestamp == null)
                       | select(.status.phase == "Running")
                       | select((.status.containerStatuses // []) | length > 0 and all(.started == true))
                       | ((.status.conditions // []) | map(select(.type == "Ready")) | first) as $ready
                       | select($ready != null and $ready.status == "False")
-                      # A pod NotReady since it was made has a Ready
-                      # transition from before its containers started, so
-                      # count from the later of that and the newest
-                      # container start: the closest stamp to readiness
-                      # first being judged.
-                      | ([$ready.lastTransitionTime]
-                         + [.status.containerStatuses[].state.running.startedAt // empty]
-                         | map(fromdateiso8601) | max) as $since
-                      | ($now - $since) as $for
-                      | select($for > $limit)
-                      | "\(.metadata.name) \($for)"' |
-                    while read -r pod seconds; do
-                      echo "self-heal: deleting pod=$pod not_ready_s=$seconds limit_s=$NOT_READY_SECONDS"
-                      kubectl delete pod -n "$NAMESPACE" "$pod" --wait=false
+                      | (((.metadata.annotations // {})[$key] // "0" | tonumber?) // 0) as $since
+                      | "\(.metadata.name) \($since) \($ready.lastTransitionTime | fromdateiso8601)"' |
+                    while read -r pod since changed; do
+                      if [ "$since" -lt "$changed" ]; then
+                        echo "self-heal: watching pod=$pod not_ready_since=$now"
+                        kubectl annotate pod -n "$NAMESPACE" "$pod" --overwrite "$key=$now" >/dev/null
+                      elif [ $((now - since)) -gt "$NOT_READY_SECONDS" ]; then
+                        echo "self-heal: deleting pod=$pod not_ready_s=$((now - since)) limit_s=$NOT_READY_SECONDS"
+                        kubectl delete pod -n "$NAMESPACE" "$pod" --wait=false
+                      fi
                     done
                   echo "self-heal: checked selector=$SELECTOR"
               securityContext:

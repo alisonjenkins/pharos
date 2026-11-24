@@ -154,12 +154,17 @@ selfHeal:
   notReadyMinutes: 5   # long enough for a short NFS server reboot to pass
 ```
 
-The CronJob runs with a namespace-scoped Role that can only get, list and
-delete pods. It skips pods still starting (the aligner's startup probe can
-take minutes on a cold GPU cache) and pods already terminating. Each deletion
-logs one line:
+The CronJob runs with a namespace-scoped Role that can only get, list, patch
+and delete pods. It skips pods still starting (the aligner's startup probe can
+take minutes on a cold GPU cache) and pods already terminating. A pod's Ready
+condition is False from before its startup probe passed, so the reaper does
+not trust its age: the first run that sees a started pod NotReady stamps it
+with the annotation `pharos.io/not-ready-since`, and the count runs from that
+stamp. Healing so takes between `notReadyMinutes` and `notReadyMinutes` plus
+one 2-minute run. Each stamp and each deletion logs one line:
 
 ```
+self-heal: watching pod=<name> not_ready_since=<unix seconds>
 self-heal: deleting pod=<name> not_ready_s=<seconds> limit_s=<seconds>
 ```
 
