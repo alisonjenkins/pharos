@@ -31,6 +31,7 @@ spec:
         {{- end }}
       labels:
         {{- include "pharos.selectorLabels" . | nindent 8 }}
+        {{- include "pharos.selfHeal.label" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

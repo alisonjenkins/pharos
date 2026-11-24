@@ -393,7 +393,7 @@ aligner:
 # A pod-level fault, such as an NFS mount gone stale under the aligner, fails
 # its readiness probe for good; neither probe replaces the pod, so the Service
 # just loses it. A CronJob deletes pods labelled pharos.io/self-heal=true
-# (the aligners) that have been NotReady for notReadyMinutes after starting,
+# (the server and the aligners) that have been NotReady for notReadyMinutes after starting,
 # and their Deployment makes fresh ones. On by default; it needs RBAC to
 # delete pods in the release's namespace, so set false where that is refused.
 selfHeal:

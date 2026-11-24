@@ -47,6 +47,14 @@ else
   fail "the aligner pods do not both carry the self-heal label"
 fi
 
+# So does the server pod, whose /readyz fails on a broken share too (B1531).
+server="$(helm template p "$chart" --show-only templates/deployment.yaml)"
+if [ "$(yq '.spec.template.metadata.labels["pharos.io/self-heal"]' <<<"$server")" = "true" ]; then
+  ok "the server pod carries the self-heal label"
+else
+  fail "the server pod does not carry the self-heal label"
+fi
+
 yq "$container.args[0]" <<<"$cronjob" >"$work/script.sh"
 
 ago() { date -u -d "@$(($(date +%s) - $1))" +%Y-%m-%dT%H:%M:%SZ; }
