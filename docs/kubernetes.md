@@ -175,18 +175,20 @@ server sets that Deployment's `kubectl.kubernetes.io/restartedAt`, and
 - With `Recreate` (SQLite), the old pod stops as soon as the restart lands,
   so Pharos is down for one restart instead of the reaper's wait.
 
-`/readyz` fails as before, and the reaper heals the pod, in each of these
-cases:
+`/readyz` fails as before in each of these cases. The reaper then heals
+the pod, but only when `selfHeal.enabled` is on and the pod carries the
+chart's `selfHeal` label (a pod the chart renders); otherwise it stays
+unready until someone restarts it:
 
 - `serverSelfRestart` is off, or the server runs outside Kubernetes;
 - the API call fails, for example when the Role is missing;
-- the Deployment was restarted in the last 10 minutes;
+- the Deployment was restarted in the last 10 minutes, or is paused;
 - the pod never saw its share whole;
 - no new pod replaced it within 15 minutes.
 
 Each request logs one `self-restart:` line with the Deployment, the outcome
 and the cause, and counts
-`pharos_media_share_restart_total{outcome="restarted"|"recently_restarted"|"failed"}`.
+`pharos_media_share_restart_total{outcome="restarted"|"recently_restarted"|"paused"|"failed"}`.
 
 The rollout follows the Deployment's own strategy. With `RollingUpdate`, the
 new pod is created alongside the old one where `maxSurge` allows, but the old
