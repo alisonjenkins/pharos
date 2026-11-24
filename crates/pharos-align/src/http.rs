@@ -15,7 +15,7 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
-use crate::media::{read_source, MediaProbe, Source};
+use crate::media::{read_source, MediaError, MediaProbe, Source};
 use crate::obs::{
     set_remote_parent, Metrics, GPU_POOL_BYTES, MEDIA_OK, SONGS_TOTAL, SONG_SECONDS,
     SOURCE_UNREADABLE_TOTAL,
@@ -166,7 +166,12 @@ async fn healthz() -> HttpResponse {
 /// Ready while the media root can be read; a pod whose mount went stale
 /// answers 503 here, so it leaves the Service and can be replaced.
 async fn readyz(state: web::Data<AppState>) -> HttpResponse {
-    match state.media.check().await {
+    readiness(state.media.check().await)
+}
+
+/// The `/readyz` answer for a media check, with [`MEDIA_OK`] set to match.
+fn readiness(checked: Result<(), MediaError>) -> HttpResponse {
+    match checked {
         Ok(()) => {
             metrics::gauge!(MEDIA_OK).set(1.0);
             json(StatusCode::OK, &serde_json::json!({ "ok": true }))
@@ -503,8 +508,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
-    use super::{accepts_events, record_gpu};
-    use crate::obs::GPU_POOL_BYTES;
+    use super::{accepts_events, readiness, record_gpu};
+    use crate::media::MediaError;
+    use crate::obs::{GPU_POOL_BYTES, MEDIA_OK};
     use crate::service::{GpuMemory, GpuPool};
 
     fn gauges(recorder: &DebuggingRecorder) -> Vec<(String, f64)> {
@@ -573,5 +579,37 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
         assert_eq!(record_gpu(&tracing::Span::none(), None), (None, None));
         assert!(gauges(&recorder).is_empty());
+    }
+
+    fn media_ok(recorder: &DebuggingRecorder) -> Option<f64> {
+        recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| k.key().name() == MEDIA_OK)
+            .map(|(.., v)| {
+                let DebugValue::Gauge(g) = v else {
+                    panic!("{v:?}")
+                };
+                g.into_inner()
+            })
+    }
+
+    #[test]
+    fn readiness_sets_the_media_gauge_to_match_its_answer() {
+        // A fresh recorder for each answer: a snapshot drains the gauge, so
+        // one recorder would read 0 after either answer.
+        let recorder = DebuggingRecorder::new();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        assert_eq!(readiness(Ok(())).status().as_u16(), 200);
+        assert_eq!(media_ok(&recorder), Some(1.0));
+        drop(guard);
+
+        let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let broken = readiness(Err(MediaError::Broken("stale handle".into())));
+        assert_eq!(broken.status().as_u16(), 503);
+        assert_eq!(media_ok(&recorder), Some(0.0));
     }
 }
