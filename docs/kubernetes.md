@@ -56,8 +56,19 @@ returns the same server info (proving the UI's same-origin proxy); open
 just helm-lint
 helm install pharos charts/pharos -n pharos --create-namespace \
   --set persistence.media.type=existingClaim \
-  --set persistence.media.existingClaim=my-media-pvc
+  --set persistence.media.existingClaim=my-media-pvc \
+  --set selfHeal.enabled=true
 ```
+
+Before the first install, check these. Each one is a fault seen in a real
+deployment:
+
+1. **Media over NFS?** Give the export a fixed `fsid=` (see
+   [NFS exports and stale handles](#nfs-exports-and-stale-handles)).
+2. **Turn on `selfHeal`** so a pod whose mount goes bad is replaced, not left
+   out of its Service (see [Self-healing](#self-healing)).
+3. **Running the aligner?** Its readiness probe reads the media root, so the
+   media volume must be mounted and readable before it reports ready.
 
 Replicas + deploy strategy depend on the database backend (ADR-0015):
 
@@ -87,6 +98,82 @@ persistence:
     type: nfs
     nfs: { server: 10.0.0.5, path: /export/media }
 ```
+
+### NFS exports and stale handles
+
+An NFS client names each export by a file handle the server hands out. The
+server derives that handle from the exported filesystem's id. When the id
+changes, every handle a client holds goes stale: each `stat` answers
+`ESTALE` ("Stale file handle") until the share is mounted again.
+
+The id can change under a running cluster when the server:
+
+- re-exports after a reboot, and the filesystem has no stable UUID;
+- exports a FUSE or union filesystem (mergerfs, for example), whose id can
+  change each time it is mounted;
+- moves the export to another disk or pool.
+
+In Kubernetes the mount belongs to the pod, not the container. Restarting the
+container keeps the stale mount. Only a new pod mounts the share again.
+
+**Fix it on the server.** Give each export a fixed `fsid=` in
+`/etc/exports`, so the handle stays the same across remounts:
+
+```
+/export/media  10.0.0.0/24(ro,fsid=1,no_subtree_check)
+```
+
+Use a different number for each export. For a FUSE export, check its own docs
+for NFS settings too; mergerfs documents options for stable inode numbers.
+
+**Then turn on [`selfHeal`](#self-healing)** as the safety net for anything
+`fsid=` does not cover.
+
+## Self-healing
+
+Some faults belong to the pod rather than the process. A stale NFS mount is
+one. Kubernetes probes do not replace a pod:
+
+- a failing **readiness** probe takes the pod out of its Service;
+- a failing **liveness** probe restarts the container in the same pod.
+
+So the chart splits the work:
+
+| Piece | What it does |
+|-------|--------------|
+| Aligner `GET /readyz` | Stats the media root and reads one entry, on its own thread with a 2 s limit. Answers 503 with the error when either fails. |
+| Aligner readiness probe | Points at `/readyz`. Liveness stays on `/healthz`, because a restart would not help. |
+| `selfHeal` CronJob | Every 2 minutes, deletes this release's pods labelled `pharos.io/self-heal=true` that have been NotReady for `selfHeal.notReadyMinutes` (default 5) after starting. Their Deployment makes fresh pods, which mount the share again. |
+
+Turn it on:
+
+```yaml
+selfHeal:
+  enabled: true
+  notReadyMinutes: 5   # long enough for a short NFS server reboot to pass
+```
+
+The CronJob runs with a namespace-scoped Role that can only get, list and
+delete pods. It skips pods still starting (the aligner's startup probe can
+take minutes on a cold GPU cache) and pods already terminating. Each deletion
+logs one line:
+
+```
+self-heal: deleting pod=<name> not_ready_s=<seconds> limit_s=<seconds>
+```
+
+The image is any one with `bash`, `jq` and `kubectl` (`selfHeal.image`).
+
+**Signals to watch:**
+
+- Aligner log line `media root unreadable`, with the error.
+- Aligner log line `song file not found`, with the path. This repeating for
+  files that exist means the mount is bad.
+- Gauge `pharos_aligner_media_ok`: 1 when the last readiness check read the
+  media root, 0 when it did not. The chart's ServiceMonitor scrapes only the
+  server, so add a scrape for the aligner's `/metrics` to use it.
+- `kube_pod_status_ready{condition="false"}` from kube-state-metrics, for the
+  pod itself.
 
 ## Database: SQLite vs Postgres
 
@@ -129,6 +216,8 @@ tier scans normally. On a production cluster (real PVC, not kind's overlayfs)
 ## Observability
 
 - Liveness `GET /healthz`, readiness `GET /readyz` (probes preconfigured).
+  The aligner has both too; its `/readyz` also reads the media root (see
+  [Self-healing](#self-healing)).
 - Prometheus metrics `GET /metrics`. Enable a ServiceMonitor:
   `--set serviceMonitor.enabled=true --set serviceMonitor.labels.release=<prom-release>`.
 - OTLP traces: set `config.obs.otlpEndpoint` to an OTLP/gRPC collector
@@ -175,4 +264,5 @@ ingress:
 `config.*` maps 1:1 to `config.toml` (`[server]`/`[obs]`/`[media]`/`[database]`)
 — see `charts/pharos/values.yaml` for the full annotated list. Infra values:
 `image`, `persistence`, `service`, `ingress`, `serviceMonitor`, `scan`, `ui`,
-`gpu`, `resources`, `*SecurityContext`, `nodeSelector`/`tolerations`/`affinity`.
+`gpu`, `resources`, `*SecurityContext`, `nodeSelector`/`tolerations`/`affinity`,
+`aligner`, `selfHeal`.
