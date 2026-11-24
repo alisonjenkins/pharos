@@ -32,18 +32,25 @@ const EIO: i32 = 5;
 const ENOTCONN: i32 = 107;
 
 /// The `pharos_source_unreadable_total` reason for a failed open or read of
-/// a media file. `stale_handle` and `not_connected` name share faults;
-/// `io` stays the catch-all it always was.
+/// a media file. `stale_handle`, `not_connected` and `io_error` (EIO) name
+/// share faults, the same strings `pharos_cache::hls_cache::source_open_failure`
+/// gives; `io` stays the catch-all it always was.
 pub fn unreadable_reason(e: &io::Error) -> &'static str {
     match e.raw_os_error() {
         Some(ESTALE) => "stale_handle",
         Some(ENOTCONN) => "not_connected",
+        Some(EIO) => "io_error",
         _ => match e.kind() {
             io::ErrorKind::NotFound => "missing",
             io::ErrorKind::PermissionDenied => "permission",
             _ => "io",
         },
     }
+}
+
+/// Whether an unreadable reason names a share fault (see [`unreadable_reason`]).
+pub fn is_share_reason(reason: &str) -> bool {
+    matches!(reason, "stale_handle" | "not_connected" | "io_error")
 }
 
 /// Whether `e` says the share itself is gone, so only a fresh mount reads it.
@@ -237,9 +244,14 @@ mod tests {
                 "not_connected",
                 "missing",
                 "permission",
-                "io"
+                "io_error"
             ]
         );
+        assert_eq!(unreadable_reason(&io::Error::other("x")), "io");
+        let share_faults = [ESTALE, ENOTCONN, EIO, 2, 13]
+            .map(|errno| is_share_reason(unreadable_reason(&err(errno))));
+        assert_eq!(share_faults, [true, true, true, false, false]);
+        assert!(!is_share_reason("io"));
     }
 
     #[tokio::test]
