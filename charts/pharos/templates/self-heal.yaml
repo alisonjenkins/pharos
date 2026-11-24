@@ -102,8 +102,16 @@ spec:
                       | select(.status.phase == "Running")
                       | select((.status.containerStatuses // []) | length > 0 and all(.started == true))
                       | ((.status.conditions // []) | map(select(.type == "Ready")) | first) as $ready
-                      | select($ready != null and $ready.status != "True")
-                      | ($now - ($ready.lastTransitionTime | fromdateiso8601)) as $for
+                      | select($ready != null and $ready.status == "False")
+                      # A pod NotReady since it was made has a Ready
+                      # transition from before its containers started, so
+                      # count from the later of that and the newest
+                      # container start: the closest stamp to readiness
+                      # first being judged.
+                      | ([$ready.lastTransitionTime]
+                         + [.status.containerStatuses[].state.running.startedAt // empty]
+                         | map(fromdateiso8601) | max) as $since
+                      | ($now - $since) as $for
                       | select($for > $limit)
                       | "\(.metadata.name) \($for)"' |
                     while read -r pod seconds; do
