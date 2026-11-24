@@ -89,11 +89,16 @@ spec:
               port: http
             periodSeconds: 10
             failureThreshold: 60
+          # /readyz also reads the media root: a pod whose NFS mount went
+          # stale answers 503 there, leaves the Service, and selfHeal (when
+          # on) replaces it. Liveness stays on /healthz, because restarting
+          # the container keeps the pod's stale mount.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
             httpGet:
               path: /healthz
