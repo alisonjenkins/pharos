@@ -131,12 +131,15 @@ impl MediaShare {
 
     /// `Ok` while no read found the share broken and every root lists.
     pub async fn check(&self) -> Result<(), ShareError> {
-        if let Some(why) = self
-            .broken
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-        {
+        self.check_with(|roots| roots.iter().try_for_each(|root| list(root)))
+            .await
+    }
+
+    async fn check_with(
+        &self,
+        list_roots: impl FnOnce(&[PathBuf]) -> Result<(), ShareError> + Send + 'static,
+    ) -> Result<(), ShareError> {
+        if let Some(why) = self.broken_cause() {
             return Err(ShareError::Broken(why));
         }
         let roots = self.roots.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -151,7 +154,7 @@ impl MediaShare {
         let spawned = std::thread::Builder::new()
             .name("media-share-check".to_owned())
             .spawn(move || {
-                let result = roots.iter().try_for_each(|root| list(root));
+                let result = list_roots(&roots);
                 busy.store(false, Ordering::Release);
                 drop(tx.send(result));
             });
@@ -159,10 +162,22 @@ impl MediaShare {
             self.busy.store(false, Ordering::Release);
             return Err(ShareError::Spawn(e));
         }
-        match tokio::time::timeout(self.timeout, rx).await {
+        let listed = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => Err(ShareError::TimedOut(self.timeout)),
-        }
+        };
+        // A read may have found the share broken while the roots listed.
+        listed.and_then(|()| {
+            self.broken_cause()
+                .map_or(Ok(()), |why| Err(ShareError::Broken(why)))
+        })
+    }
+
+    fn broken_cause(&self) -> Option<String> {
+        self.broken
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
@@ -246,6 +261,28 @@ mod tests {
         assert!(matches!(e, ShareError::Broken(_)));
         assert!(e.to_string().contains("/m/a"), "{e}");
         assert!(share.check().await.is_err(), "it stays broken");
+    }
+
+    #[tokio::test]
+    async fn a_fault_found_while_the_roots_list_fails_that_check() {
+        let share = MediaShare::new(ROOT_TIMEOUT);
+        share.set_roots(vec![PathBuf::from("/m")]);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let listing = share.check_with(move |_| {
+            wait.recv().ok();
+            Ok(())
+        });
+        let fault = async {
+            // Only once the listing is under way, so the check's first look
+            // at the broken flag has already passed.
+            while !share.busy.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            share.note_read_error(Path::new("/m/a"), &err(ESTALE));
+            release.send(()).unwrap();
+        };
+        let (checked, ()) = tokio::join!(listing, fault);
+        assert!(matches!(checked, Err(ShareError::Broken(_))), "{checked:?}");
     }
 
     #[tokio::test]
