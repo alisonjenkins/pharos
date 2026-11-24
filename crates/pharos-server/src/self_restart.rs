@@ -513,7 +513,13 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 /// `2026-11-24T19:00:00+01:00` (what `kubectl rollout restart` writes);
 /// fractional seconds are ignored.
 fn parse_rfc3339(s: &str) -> Option<i64> {
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    // Digits only: `str::parse` would also take a sign.
+    let digits = |t: &str| -> Option<i64> {
+        (!t.is_empty() && t.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| t.parse().ok())
+            .flatten()
+    };
+    let num = |r: std::ops::Range<usize>| digits(s.get(r)?);
     let b = s.as_bytes();
     if b.len() < 20
         || b[4] != b'-'
@@ -537,6 +543,9 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
     let mut rest = &s[19..];
     if let Some(frac) = rest.strip_prefix('.') {
         rest = frac.trim_start_matches(|c: char| c.is_ascii_digit());
+        if rest.len() == frac.len() {
+            return None; // a '.' needs at least one digit
+        }
     }
     let offset = match rest {
         "Z" | "z" => 0,
@@ -546,9 +555,11 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
                 b'-' => -1,
                 _ => return None,
             };
-            let oh = rest.get(1..3)?.parse::<i64>().ok()?;
-            let om = rest.get(4..6)?.parse::<i64>().ok()?;
             if rest.len() != 6 || rest.as_bytes()[3] != b':' {
+                return None;
+            }
+            let (oh, om) = (digits(&rest[1..3])?, digits(&rest[4..6])?);
+            if oh > 23 || om > 59 {
                 return None;
             }
             sign * (oh * 3600 + om * 60)
@@ -608,6 +619,12 @@ mod tests {
             "2026-11-31T00:00:00Z",
             "2026-02-29T00:00:00Z",
             "1900-02-29T00:00:00Z",
+            "2026-11-24T18:00:00+25:00",
+            "2026-11-24T18:00:00+01:60",
+            "2026-11-24T18:00:00.Z",
+            "2026-11-24T18:00:00+1:000",
+            "2026-11-24T18:00:00++1:00",
+            "+026-11-24T18:00:00Z",
         ] {
             assert_eq!(parse_rfc3339(bad), None, "{bad}");
         }
