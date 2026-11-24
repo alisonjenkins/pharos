@@ -210,3 +210,10 @@ emptyDir: {}
 app.kubernetes.io/name: {{ include "pharos.name" . }}-aligner
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
+
+{{/*
+The label selfHeal's reaper looks for: only pods that carry it are replaced.
+*/}}
+{{- define "pharos.selfHeal.label" -}}
+pharos.io/self-heal: "true"
+{{- end }}

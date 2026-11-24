@@ -389,6 +389,26 @@ aligner:
       size: 1Gi
       storageClass: ""
 
+# Replaces pods that stay NotReady (docs/kubernetes.md, "Self-healing").
+# A pod-level fault, such as an NFS mount gone stale under the aligner, fails
+# its readiness probe for good; neither probe replaces the pod, so the Service
+# just loses it. With this on, a CronJob deletes pods labelled
+# pharos.io/self-heal=true (the aligners) that have been NotReady for
+# notReadyMinutes after starting, and their Deployment makes fresh ones.
+selfHeal:
+  enabled: false
+  schedule: "*/2 * * * *"
+  # Long enough that a brief blip (an NFS server reboot) heals by itself.
+  notReadyMinutes: 5
+  # Any image with bash, jq and kubectl.
+  image: alpine/k8s:1.37.2@sha256:dcb7185e112a453aa72f426754849a97357727ef8f40168fb208c8cf59952042
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+
 # pharos-ui sidecar: the old angie image serving the bundle under /ui/.
 # Superseded by ADR-0033 (pharos serves the UI itself via config.server.uiDir);
 # its image is not published.

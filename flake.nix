@@ -1607,6 +1607,10 @@
             # pushes them to the registry, the kind node pulls from it, and
             # the Helm chart deploys. helm renders/lint; kubectl for ops.
             pkgs.kubernetes-helm
+            # `just helm-test` reads rendered manifests with yq and runs the
+            # selfHeal reaper's jq against a fake kubectl.
+            pkgs.yq-go
+            pkgs.jq
             pkgs.kind
             pkgs.kubectl
             pkgs.tilt
