@@ -212,7 +212,7 @@ The image is any one with `bash`, `jq` and `kubectl` (`selfHeal.image`).
 - Gauge `pharos_media_share_ok` on the server: 0 while `/readyz` finds the
   share unusable.
 - Counter `pharos_source_unreadable_total{reason="stale_handle"}` (or
-  `not_connected`) on the server, per media read that hit a share fault.
+  `not_connected`, `io_error`) on the server, per media read that hit a share fault.
 - `kube_pod_status_ready{condition="false"}` from kube-state-metrics, for the
   pod itself.
 
