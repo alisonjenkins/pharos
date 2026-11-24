@@ -102,8 +102,10 @@ spec:
                   # NotReady and counts from that stamp. A Ready transition newer than
                   # the stamp (the pod recovered and failed again), or a container
                   # restart since the stamp (its startup runs again), starts a new
-                  # count. The stamp is "<unix seconds>/<restarts>", restarts being
-                  # the sum of the pod's container restart counts.
+                  # count. The stamp is "<unix seconds>/<containers>", containers
+                  # being the first 12 characters of each container's ID: a
+                  # replaced container has a new ID even where its restart count
+                  # was reset, as after a node restart that lost kubelet state.
                   key=pharos.io/not-ready-since
                   kubectl get pods -n "$NAMESPACE" -l "$SELECTOR" -o json |
                     jq -r --arg key "$key" '
@@ -113,16 +115,16 @@ spec:
                       | select((.status.containerStatuses // []) | length > 0 and all(.started == true))
                       | ((.status.conditions // []) | map(select(.type == "Ready")) | first) as $ready
                       | select($ready != null and $ready.status == "False")
-                      | ([.status.containerStatuses[].restartCount // 0] | add) as $restarts
+                      | ([.status.containerStatuses[].containerID // "none"
+                          | sub("^[a-z]+://"; "") | .[0:12]] | join(",")) as $containers
                       | ((.metadata.annotations // {})[$key] // "" | split("/")) as $stamp
                       | ((($stamp[0] // "0") | tonumber?) // 0) as $since
-                      | ((($stamp[1] // "-1") | tonumber?) // -1) as $stamped_restarts
-                      | (if $stamped_restarts == $restarts then $since else 0 end) as $since
-                      | "\(.metadata.name) \($since) \($ready.lastTransitionTime | fromdateiso8601) \($restarts)"' |
-                    while read -r pod since changed restarts; do
+                      | (if ($stamp[1] // "") == $containers then $since else 0 end) as $since
+                      | "\(.metadata.name) \($since) \($ready.lastTransitionTime | fromdateiso8601) \($containers)"' |
+                    while read -r pod since changed containers; do
                       if [ "$since" -lt "$changed" ]; then
-                        echo "self-heal: watching pod=$pod not_ready_since=$now restarts=$restarts"
-                        kubectl annotate pod -n "$NAMESPACE" "$pod" --overwrite "$key=$now/$restarts" >/dev/null
+                        echo "self-heal: watching pod=$pod not_ready_since=$now containers=$containers"
+                        kubectl annotate pod -n "$NAMESPACE" "$pod" --overwrite "$key=$now/$containers" >/dev/null
                       elif [ $((now - since)) -gt "$NOT_READY_SECONDS" ]; then
                         echo "self-heal: deleting pod=$pod not_ready_s=$((now - since)) limit_s=$NOT_READY_SECONDS"
                         kubectl delete pod -n "$NAMESPACE" "$pod" --wait=false
