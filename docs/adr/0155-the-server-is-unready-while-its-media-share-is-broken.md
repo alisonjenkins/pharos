@@ -33,12 +33,13 @@ chart lets `selfHeal` replace the server pod as it does the aligner's.
 
 ## Consequences
 
-- A broken share costs the whole server for about `notReadyMinutes` plus one
-  reaper run (about 7 min by default), then the pod comes back with a fresh
-  mount. Before this, playback was down until someone recreated the pod by
+- A broken share costs the whole server for about 6 to 10 minutes with the
+  defaults (readiness fails within 60 s, then the reaper's stamp, its
+  5-minute limit and its deleting run, as `docs/kubernetes.md` tabulates),
+  then the pod comes back with a fresh mount. Before this, playback was down until someone recreated the pod by
   hand, while the rest of Pharos kept working.
 - If the NAS itself is down, the new pod fails `/readyz` too. The reaper then
-  replaces it about every 7 minutes until the share answers again, and Pharos
+  replaces it about every 6 to 10 minutes until the share answers again, and Pharos
   is unreachable for that time.
 - A single file with an I/O error (`EIO`) marks the whole share broken. On
   NFS that error almost always means the share, and the cost of being wrong
