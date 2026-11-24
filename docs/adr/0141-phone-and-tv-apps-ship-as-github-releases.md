@@ -1,6 +1,6 @@
 # ADR-0141: Phone and TV apps ship as GitHub Releases for Obtainium
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-0153
 - **Date:** 2026-11-16T17:30:16Z
 - **Deciders:** Alison
 
