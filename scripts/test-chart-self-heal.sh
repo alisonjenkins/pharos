@@ -74,7 +74,7 @@ else
   fail "the server's self-restart env is missing"
 fi
 restart_role="$(helm template p "$chart" --show-only templates/self-restart.yaml | yq 'select(.kind == "Role")')"
-restart_rules="$(yq '[.rules[] | (.apiGroups[0]) + "/" + (.resources | join(",")) + "/" + (.resourceNames | join(",")) + ":" + (.verbs | join(","))] | join(" ")' <<<"$restart_role")"
+restart_rules="$(yq '[.rules[] | (.apiGroups | join(",")) + "/" + (.resources | join(",")) + "/" + (.resourceNames | join(",")) + ":" + (.verbs | join(","))] | join(" ")' <<<"$restart_role")"
 if [ "$restart_rules" = "apps/deployments/p-pharos:get,patch" ]; then
   ok "the self-restart Role may only get and patch the server's own Deployment"
 else
