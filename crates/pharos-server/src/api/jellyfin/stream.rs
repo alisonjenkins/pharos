@@ -83,6 +83,43 @@ struct MeteredBody<B> {
     /// dropped WITHOUT ever reaching one of those is the invisible case this
     /// type exists to name.
     settled: bool,
+    /// The media file this body reads, when it reads one straight off the
+    /// share: a read error here after the headers went out still marks the
+    /// share broken (B1531), though the status can no longer change.
+    source: Option<std::path::PathBuf>,
+    share: &'static crate::media_share::MediaShare,
+}
+
+/// The `io::Error` behind a body's error, if there is one.
+trait ReadFault {
+    fn io_error(&self) -> Option<&std::io::Error>;
+}
+
+impl ReadFault for std::convert::Infallible {
+    fn io_error(&self) -> Option<&std::io::Error> {
+        match *self {}
+    }
+}
+
+impl ReadFault for Box<dyn std::error::Error> {
+    fn io_error(&self) -> Option<&std::io::Error> {
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(self.as_ref());
+        while let Some(e) = cause {
+            if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                return Some(io);
+            }
+            // actix-files' chunked reader yields an `actix_web::Error`
+            // wrapping the `io::Error`.
+            if let Some(io) = e
+                .downcast_ref::<actix_web::Error>()
+                .and_then(|a| a.as_error::<std::io::Error>())
+            {
+                return Some(io);
+            }
+            cause = e.source();
+        }
+        None
+    }
 }
 
 impl<B> Drop for MeteredBody<B> {
@@ -111,7 +148,11 @@ impl<B> Drop for MeteredBody<B> {
     }
 }
 
-impl<B: actix_web::body::MessageBody + Unpin> actix_web::body::MessageBody for MeteredBody<B> {
+impl<B> actix_web::body::MessageBody for MeteredBody<B>
+where
+    B: actix_web::body::MessageBody + Unpin,
+    B::Error: ReadFault,
+{
     type Error = B::Error;
 
     fn size(&self) -> actix_web::body::BodySize {
@@ -147,8 +188,11 @@ impl<B: actix_web::body::MessageBody + Unpin> actix_web::body::MessageBody for M
                 )
                 .increment(1);
             }
-            Poll::Ready(Some(Err(_))) if !this.settled => {
+            Poll::Ready(Some(Err(e))) if !this.settled => {
                 this.settled = true;
+                if let (Some(path), Some(io)) = (&this.source, e.io_error()) {
+                    this.share.note_read_error(path, io);
+                }
                 tracing::warn!(
                     media.id = this.media_id,
                     route = this.route.label(),
@@ -180,7 +224,9 @@ fn meter_body(
     clock: Arc<AtomicI64>,
     media_id: u64,
     route: StreamBodyRoute,
+    source: Option<&std::path::Path>,
 ) -> HttpResponse {
+    let source = source.map(std::path::Path::to_path_buf);
     resp.map_body(|_, body| {
         let total = match body.size() {
             actix_web::body::BodySize::Sized(n) => Some(n),
@@ -195,6 +241,8 @@ fn meter_body(
             sent: 0,
             started: Instant::now(),
             settled: false,
+            source: source.clone(),
+            share: crate::media_share::MediaShare::global(),
         })
     })
 }
@@ -502,6 +550,7 @@ async fn audio_remux(
         clock,
         item.id,
         StreamBodyRoute::AudioRemux,
+        None,
     ))
 }
 
@@ -805,6 +854,7 @@ async fn stream_transcoded_webm(
                     clock,
                     item.id,
                     StreamBodyRoute::ProgressiveWebm,
+                    None,
                 ));
             }
             Err(e) => {
@@ -824,6 +874,7 @@ async fn stream_transcoded_webm(
         clock,
         item.id,
         StreamBodyRoute::ProgressiveWebm,
+        None,
     ))
 }
 
@@ -1131,6 +1182,7 @@ async fn deliver_stream(
         clock,
         item.id,
         StreamBodyRoute::DirectPlay,
+        Some(&item.path),
     ))
 }
 
@@ -1236,7 +1288,7 @@ async fn serve_content_range(
         .map_err(|e| source_unreadable(item, &e))?;
     file.seek(SeekFrom::Start(range.offset()))
         .await
-        .map_err(|e| error::ErrorInternalServerError(format!("seek: {e}")))?;
+        .map_err(|e| read_failure(item, "seek", &e))?;
 
     let remaining = range.content_length();
     // Same `DeliveryMime` as the plain open + HEAD, so a mkv/VP9 seek is not
@@ -1258,17 +1310,23 @@ async fn serve_content_range(
         let mut buf = vec![0u8; remaining as usize];
         file.read_exact(&mut buf)
             .await
-            .map_err(|e| error::ErrorInternalServerError(format!("read: {e}")))?;
+            .map_err(|e| read_failure(item, "read", &e))?;
         resp_builder.body(buf)
     } else {
         let limited = file.take(remaining);
         let stream = tokio_util::io::ReaderStream::with_capacity(limited, 64 * 1024);
-        let stream = futures_util::TryStreamExt::map_err(stream, |e| {
-            actix_web::error::ErrorInternalServerError(format!("read: {e}"))
-        });
+        // Errors here come after the headers went out, so the stream keeps
+        // the `io::Error` for `MeteredBody` to note against the share.
+        let stream = futures_util::TryStreamExt::map_err(stream, actix_web::Error::from);
         resp_builder.body(actix_web::body::SizedStream::new(remaining, stream))
     };
-    Ok(meter_body(resp, clock, item.id, StreamBodyRoute::Resume))
+    Ok(meter_body(
+        resp,
+        clock,
+        item.id,
+        StreamBodyRoute::Resume,
+        Some(&item.path),
+    ))
 }
 
 /// Turn a failure to OPEN a known item's file into the 404 the client sees,
@@ -1318,6 +1376,17 @@ fn source_unreadable(item: &MediaItem, e: &std::io::Error) -> actix_web::Error {
         error::ErrorServiceUnavailable("media share unreadable")
     } else {
         error::ErrorNotFound("media source unreadable")
+    }
+}
+
+/// A seek or read of an open file that failed before the response started:
+/// a share fault is [`source_unreadable`]'s 503, anything else the 500 it
+/// always was.
+fn read_failure(item: &MediaItem, what: &str, e: &std::io::Error) -> actix_web::Error {
+    if crate::media_share::breaks_the_share(e) {
+        source_unreadable(item, e)
+    } else {
+        error::ErrorInternalServerError(format!("{what}: {e}"))
     }
 }
 
@@ -1506,6 +1575,77 @@ mod tests {
         assert!(crate::media_share::MediaShare::global().is_broken());
     }
 
+    /// A read that fails after the headers went out (actix-files' chunked
+    /// reader, or the streamed resume tail) cannot turn into a 503, but a
+    /// share fault in it still marks the share broken (B1531).
+    #[tokio::test]
+    async fn a_share_fault_mid_body_breaks_the_share() {
+        use actix_web::body::MessageBody;
+        async fn drain(errno: i32, source: Option<&str>) -> bool {
+            let share: &'static crate::media_share::MediaShare = Box::leak(Box::new(
+                crate::media_share::MediaShare::new(crate::media_share::ROOT_TIMEOUT),
+            ));
+            let failing = futures_util::stream::once(async move {
+                Err::<actix_web::web::Bytes, _>(actix_web::Error::from(
+                    std::io::Error::from_raw_os_error(errno),
+                ))
+            });
+            let body = MeteredBody {
+                inner: actix_web::body::BoxBody::new(actix_web::body::SizedStream::new(
+                    10, failing,
+                )),
+                clock: Arc::new(AtomicI64::new(0)),
+                media_id: 1,
+                route: StreamBodyRoute::DirectPlay,
+                total: Some(10),
+                sent: 0,
+                started: Instant::now(),
+                settled: false,
+                source: source.map(Into::into),
+                share,
+            };
+            let mut body = Box::pin(body);
+            let polled = std::future::poll_fn(|cx| body.as_mut().poll_next(cx)).await;
+            assert!(matches!(polled, Some(Err(_))));
+            share.is_broken()
+        }
+        assert!(
+            drain(116, Some("/m/a.mkv")).await,
+            "ESTALE breaks the share"
+        );
+        assert!(drain(5, Some("/m/a.mkv")).await, "EIO breaks the share");
+        assert!(!drain(2, Some("/m/a.mkv")).await, "ENOENT does not");
+        assert!(
+            !drain(116, None).await,
+            "a body that does not read the share does not judge it"
+        );
+    }
+
+    /// A seek or read that fails before the response starts answers 503 for
+    /// a share fault and stays a 500 otherwise.
+    #[test]
+    fn a_read_failure_before_the_response_is_a_503_only_for_a_share_fault() {
+        let item = MediaItem {
+            id: 4244,
+            path: "/mnt/media/read.mkv".into(),
+            ..Default::default()
+        };
+        let stale = read_failure(&item, "read", &std::io::Error::from_raw_os_error(5));
+        assert_eq!(
+            stale.as_response_error().status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let other = read_failure(
+            &item,
+            "read",
+            &std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+        );
+        assert_eq!(
+            other.as_response_error().status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     fn item_with_bitrate(bitrate_bps: Option<u64>, size_bytes: Option<u64>) -> MediaItem {
         MediaItem {
             locked: Default::default(),
@@ -1615,6 +1755,8 @@ mod tests {
             sent: 0,
             started: Instant::now(),
             settled: false,
+            source: None,
+            share: crate::media_share::MediaShare::global(),
         };
         assert_eq!(
             clock.load(Ordering::Relaxed),
@@ -1652,6 +1794,8 @@ mod tests {
             sent: 0,
             started: Instant::now(),
             settled: false,
+            source: None,
+            share: crate::media_share::MediaShare::global(),
         };
         {
             // One successful poll (the whole 7-byte payload) — then dropped
@@ -1703,6 +1847,8 @@ mod tests {
             sent: 0,
             started: Instant::now(),
             settled: false,
+            source: None,
+            share: crate::media_share::MediaShare::global(),
         };
         {
             let mut body = std::pin::pin!(body);
@@ -1752,6 +1898,8 @@ mod tests {
             sent: 0,
             started: Instant::now(),
             settled: false,
+            source: None,
+            share: crate::media_share::MediaShare::global(),
         };
         {
             let mut body = std::pin::pin!(body);
