@@ -58,6 +58,39 @@ else
   fail "the server Deployment does not carry the self-heal label"
 fi
 
+# ADR-0156: the server asks for its own restart, through a service account
+# that may get and patch only its own Deployment.
+spec='.spec.template.spec'
+if [ "$(yq "$spec.serviceAccountName" <<<"$server")" = "p-pharos-self-restart" ]; then
+  ok "the server pod runs as its self-restart service account"
+else
+  fail "the server pod's service account is \"$(yq "$spec.serviceAccountName" <<<"$server")\""
+fi
+env_of() { yq "$spec.containers[0].env[] | select(.name == \"$1\") | (.value // .valueFrom.fieldRef.fieldPath)" <<<"$2"; }
+if [ "$(env_of PHAROS_SELF_RESTART_DEPLOYMENT "$server")" = "p-pharos" ] &&
+  [ "$(env_of POD_NAMESPACE "$server")" = "metadata.namespace" ]; then
+  ok "the server is told its Deployment and namespace"
+else
+  fail "the server's self-restart env is missing"
+fi
+restart_role="$(helm template p "$chart" --show-only templates/self-restart.yaml | yq 'select(.kind == "Role")')"
+restart_rules="$(yq '[.rules[] | (.apiGroups[0]) + "/" + (.resources | join(",")) + "/" + (.resourceNames | join(",")) + ":" + (.verbs | join(","))] | join(" ")' <<<"$restart_role")"
+if [ "$restart_rules" = "apps/deployments/p-pharos:get,patch" ]; then
+  ok "the self-restart Role may only get and patch the server's own Deployment"
+else
+  fail "the self-restart Role's rules are \"$restart_rules\""
+fi
+for off in selfHeal.enabled=false selfHeal.serverSelfRestart=false; do
+  plain="$(helm template p "$chart" --show-only templates/deployment.yaml --set "$off")"
+  if [ "$(yq "$spec.serviceAccountName" <<<"$plain")" = "null" ] &&
+    [ -z "$(env_of PHAROS_SELF_RESTART_DEPLOYMENT "$plain")" ] &&
+    [ -z "$(helm template p "$chart" --show-only templates/self-restart.yaml --set "$off" 2>/dev/null || true)" ]; then
+    ok "with $off the server gets no self-restart"
+  else
+    fail "with $off the server still gets a self-restart"
+  fi
+done
+
 yq "$container.args[0]" <<<"$cronjob" >"$work/script.sh"
 
 ago() { date -u -d "@$(($(date +%s) - $1))" +%Y-%m-%dT%H:%M:%SZ; }
