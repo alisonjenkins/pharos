@@ -218,6 +218,10 @@ const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 /// How long one API call may take.
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many times a restart reads and patches the Deployment when another
+/// writer changed it in between (a 409 on the conditional patch).
+const ATTEMPTS: usize = 3;
+
 impl KubeRestarter {
     /// From the environment the chart sets: `PHAROS_SELF_RESTART_DEPLOYMENT`
     /// names the Deployment, `POD_NAMESPACE` its namespace (else the service
@@ -291,13 +295,35 @@ impl KubeRestarter {
         url: String,
         token_path: std::path::PathBuf,
     ) -> Result<Outcome, String> {
+        for attempt in 1..=ATTEMPTS {
+            match Self::attempt(&http, &url, &token_path).await? {
+                Attempt::Done(outcome) => return Ok(outcome),
+                Attempt::Conflict => tracing::info!(
+                    attempt,
+                    "self-restart: the deployment changed since it was read; reading it again"
+                ),
+            }
+        }
+        Err(format!(
+            "PATCH deployment: 409 Conflict on all {ATTEMPTS} attempts"
+        ))
+    }
+
+    /// One read and patch. The patch carries the read's `resourceVersion`,
+    /// so a writer in between (the reaper, a rollout) makes it a 409
+    /// instead of a second restart decided on stale state.
+    async fn attempt(
+        http: &reqwest::Client,
+        url: &str,
+        token_path: &std::path::Path,
+    ) -> Result<Attempt, String> {
         // Read each time: projected service account tokens rotate.
-        let token = tokio::fs::read_to_string(&token_path)
+        let token = tokio::fs::read_to_string(token_path)
             .await
             .map_err(|e| format!("reading the service account token: {e}"))?;
         let token = token.trim();
         let got = http
-            .get(&url)
+            .get(url)
             .bearer_auth(token)
             .send()
             .await
@@ -319,18 +345,23 @@ impl KubeRestarter {
         {
             let age = now.saturating_sub(at);
             if age < RECENT_RESTART.as_secs() as i64 {
-                return Ok(Outcome::RecentlyRestarted {
+                return Ok(Attempt::Done(Outcome::RecentlyRestarted {
                     age_secs: u64::try_from(age.max(0)).unwrap_or(0),
-                });
+                }));
             }
         }
+        let version = deployment
+            .pointer("/metadata/resourceVersion")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("GET deployment body: no metadata.resourceVersion")?;
         let patch = serde_json::json!({
+            "metadata": { "resourceVersion": version },
             "spec": { "template": { "metadata": { "annotations": {
                 RESTARTED_AT: format_rfc3339(now),
             } } } }
         });
         let patched = http
-            .patch(&url)
+            .patch(url)
             .bearer_auth(token)
             .header(
                 reqwest::header::CONTENT_TYPE,
@@ -341,11 +372,21 @@ impl KubeRestarter {
             .await
             .map_err(|e| format!("PATCH deployment: {e}"))?;
         let status = patched.status();
+        if status == reqwest::StatusCode::CONFLICT {
+            return Ok(Attempt::Conflict);
+        }
         if !status.is_success() {
             return Err(format!("PATCH deployment: {status}"));
         }
-        Ok(Outcome::Restarted)
+        Ok(Attempt::Done(Outcome::Restarted))
     }
+}
+
+/// What one read and patch came to.
+enum Attempt {
+    Done(Outcome),
+    /// The Deployment changed after it was read.
+    Conflict,
 }
 
 impl Restarter for KubeRestarter {
@@ -612,49 +653,70 @@ mod tests {
         gets: usize,
     }
 
-    async fn fake_api(restarted_at: Option<String>) -> (String, Arc<Mutex<Seen>>) {
+    struct Api {
+        seen: Mutex<Seen>,
+        restarted_at: Option<String>,
+        /// How many patches answer 409 before one succeeds.
+        conflicts: usize,
+    }
+
+    async fn fake_api(restarted_at: Option<String>) -> (String, Arc<Api>) {
+        fake_api_with(restarted_at, 0).await
+    }
+
+    async fn fake_api_with(restarted_at: Option<String>, conflicts: usize) -> (String, Arc<Api>) {
         use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
-        let seen = Arc::new(Mutex::new(Seen::default()));
-        let state = web::Data::new((Arc::clone(&seen), restarted_at));
+        let api = Arc::new(Api {
+            seen: Mutex::default(),
+            restarted_at,
+            conflicts,
+        });
+        let state = web::Data::from(Arc::clone(&api));
         let path = "/apis/apps/v1/namespaces/media/deployments/pharos";
         let srv = HttpServer::new(move || {
             App::new()
                 .app_data(state.clone())
                 .route(
                     path,
-                    web::get().to(
-                        |d: web::Data<(Arc<Mutex<Seen>>, Option<String>)>| async move {
-                            d.0.lock().unwrap().gets += 1;
-                            let annotations = match &d.1 {
-                                Some(at) => serde_json::json!({ RESTARTED_AT: at }),
-                                None => serde_json::json!({}),
-                            };
-                            HttpResponse::Ok().json(serde_json::json!({
-                                "spec": { "template": { "metadata": {
-                                    "annotations": annotations
-                                } } }
-                            }))
-                        },
-                    ),
+                    web::get().to(|d: web::Data<Api>| async move {
+                        let gets = {
+                            let mut seen = d.seen.lock().unwrap();
+                            seen.gets += 1;
+                            seen.gets
+                        };
+                        let annotations = match &d.restarted_at {
+                            Some(at) => serde_json::json!({ RESTARTED_AT: at }),
+                            None => serde_json::json!({}),
+                        };
+                        HttpResponse::Ok().json(serde_json::json!({
+                            "metadata": { "resourceVersion": gets.to_string() },
+                            "spec": { "template": { "metadata": {
+                                "annotations": annotations
+                            } } }
+                        }))
+                    }),
                 )
                 .route(
                     path,
                     web::patch().to(
-                        |req: HttpRequest,
-                         body: web::Bytes,
-                         d: web::Data<(Arc<Mutex<Seen>>, Option<String>)>| async move {
+                        |req: HttpRequest, body: web::Bytes, d: web::Data<Api>| async move {
                             let header = |name| {
                                 req.headers()
                                     .get(name)
                                     .and_then(|v| v.to_str().ok())
                                     .map(str::to_owned)
                             };
-                            d.0.lock().unwrap().patches.push((
+                            let mut seen = d.seen.lock().unwrap();
+                            seen.patches.push((
                                 header(actix_web::http::header::AUTHORIZATION),
                                 header(actix_web::http::header::CONTENT_TYPE),
                                 serde_json::from_slice(&body).unwrap(),
                             ));
-                            HttpResponse::Ok().json(serde_json::json!({}))
+                            if seen.patches.len() <= d.conflicts {
+                                HttpResponse::Conflict().json(serde_json::json!({}))
+                            } else {
+                                HttpResponse::Ok().json(serde_json::json!({}))
+                            }
                         },
                     ),
                 )
@@ -663,7 +725,7 @@ mod tests {
         .unwrap();
         let port = srv.addrs()[0].port();
         tokio::spawn(srv.run());
-        (format!("http://127.0.0.1:{port}"), seen)
+        (format!("http://127.0.0.1:{port}"), api)
     }
 
     fn kube(api: String, dir: &tempfile::TempDir) -> KubeRestarter {
@@ -679,7 +741,7 @@ mod tests {
         let restarter = kube(api, &dir);
         assert_eq!(restarter.target(), "media/pharos");
         assert_eq!(restarter.restart().await, Ok(Outcome::Restarted));
-        let seen = seen.lock().unwrap();
+        let seen = seen.seen.lock().unwrap();
         assert_eq!(seen.gets, 1);
         let [(auth, content_type, patch)] = seen.patches.as_slice() else {
             panic!("one patch expected, got {}", seen.patches.len());
@@ -696,6 +758,41 @@ mod tests {
             .expect("restartedAt in the patch");
         let age = unix_now() - parse_rfc3339(at).expect("an RFC 3339 time");
         assert!((0..60).contains(&age), "{at}");
+        assert_eq!(
+            patch.pointer("/metadata/resourceVersion"),
+            Some(&serde_json::json!("1")),
+            "the patch is conditional on the version read"
+        );
+    }
+
+    /// A writer between the read and the patch gives a 409: read again and
+    /// patch on the new version, a bounded number of times.
+    #[actix_web::test]
+    async fn the_kube_restarter_rereads_after_a_conflict_and_gives_up_in_bounds() {
+        let (api, seen) = fake_api_with(None, 1).await;
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(kube(api, &dir).restart().await, Ok(Outcome::Restarted));
+        {
+            let seen = seen.seen.lock().unwrap();
+            assert_eq!(seen.gets, 2);
+            let versions: Vec<_> = seen
+                .patches
+                .iter()
+                .map(|(.., p)| p.pointer("/metadata/resourceVersion").cloned())
+                .collect();
+            assert_eq!(
+                versions,
+                [Some(serde_json::json!("1")), Some(serde_json::json!("2"))]
+            );
+        }
+
+        let (api, seen) = fake_api_with(None, usize::MAX).await;
+        let outcome = kube(api, &dir).restart().await;
+        assert!(
+            matches!(&outcome, Err(e) if e.contains("409")),
+            "{outcome:?}"
+        );
+        assert_eq!(seen.seen.lock().unwrap().patches.len(), ATTEMPTS);
     }
 
     #[actix_web::test]
@@ -708,7 +805,7 @@ mod tests {
             matches!(outcome, Ok(Outcome::RecentlyRestarted { age_secs }) if age_secs < 60),
             "{outcome:?}"
         );
-        assert!(seen.lock().unwrap().patches.is_empty());
+        assert!(seen.seen.lock().unwrap().patches.is_empty());
     }
 
     #[actix_web::test]
