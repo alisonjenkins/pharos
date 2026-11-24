@@ -157,12 +157,14 @@ selfHeal:
 ```
 
 The rollout follows the Deployment's own strategy. With `RollingUpdate`, the
-new pod starts before the old one stops, so a share that is still broken
-leaves the old pod serving what it can and nothing is lost. With `Recreate`,
-the old pod stops first. The chart uses `Recreate` for the server on SQLite
-(its database volume is ReadWriteOnce and single-writer) and for an aligner
-with a GPU or a cache volume, so those still go down while the new pod
-starts. After a rollout, the reaper leaves that Deployment alone for
+new pod is created alongside the old one where `maxSurge` allows, but the old
+pod may still go before the new one is Ready: it is NotReady, so the
+Deployment controller counts it unavailable and may scale it down at once.
+That loses nothing, since a NotReady pod is already out of its Service. With
+`Recreate`, the old pod always stops first. The chart uses `Recreate` for
+the server on SQLite (its database volume is ReadWriteOnce and
+single-writer) and for an aligner with a GPU or a cache volume; otherwise
+the server follows `strategy.type`. After a rollout, the reaper leaves that Deployment alone for
 `notReadyMinutes`, so its new pod gets the whole limit to become Ready.
 
 The CronJob runs with a namespace-scoped Role that can only get, list and
