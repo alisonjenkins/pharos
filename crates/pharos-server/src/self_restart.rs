@@ -7,14 +7,18 @@
 //! that outage is wider than the fault. Instead, the first share fault in a
 //! pod that has read the share before sets the Deployment's
 //! `kubectl.kubernetes.io/restartedAt`, as `kubectl rollout restart` does, and
-//! `/readyz` keeps passing: under `RollingUpdate` the old pod serves
-//! everything but media until the new one is Ready; under `Recreate` the
-//! outage is one restart, not the reaper's wait.
+//! `/readyz` keeps passing. Under `RollingUpdate` with `maxUnavailable: 0`
+//! and `maxSurge` above 0 (the chart's defaults), the old pod serves
+//! everything but media until the new one is Ready, provided that happens
+//! within [`GIVE_UP_AFTER`]. Other rollout settings let the Deployment stop
+//! the old pod first. Under `Recreate` the outage is one restart, not the
+//! reaper's wait.
 //!
 //! Readiness still fails, as before, whenever this cannot help: no
-//! restarter configured, the request failed or was skipped, the pod never
-//! read the share, or [`GIVE_UP_AFTER`] passed without the pod being
-//! replaced. The reaper then heals it as it did.
+//! restarter configured, the request failed or was skipped (a recent
+//! restart, a paused Deployment), the pod never read the share, or
+//! [`GIVE_UP_AFTER`] passed without the pod being replaced. The reaper,
+//! when `selfHeal` is on, then heals it as it did.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -48,6 +52,8 @@ pub enum Outcome {
     Restarted,
     /// Left alone: it was restarted `age_secs` ago.
     RecentlyRestarted { age_secs: u64 },
+    /// Left alone: the Deployment is paused, so a patch would never roll out.
+    Paused,
 }
 
 impl Outcome {
@@ -55,6 +61,7 @@ impl Outcome {
         match self {
             Self::Restarted => "restarted",
             Self::RecentlyRestarted { .. } => "recently_restarted",
+            Self::Paused => "paused",
         }
     }
 }
@@ -161,6 +168,15 @@ impl SelfRestart {
                     age_secs,
                     cause,
                     "self-restart: deployment restarted recently; going unready for the reaper"
+                );
+            }
+            Ok(Outcome::Paused) => {
+                *state = State::NotRestarted;
+                tracing::warn!(
+                    target_deployment = target,
+                    outcome = label,
+                    cause,
+                    "self-restart: deployment is paused; going unready for the reaper"
                 );
             }
             Err(error) => {
@@ -342,6 +358,13 @@ impl KubeRestarter {
             .await
             .map_err(|e| format!("GET deployment body: {e}"))?;
         let now = unix_now();
+        if deployment
+            .pointer("/spec/paused")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Ok(Attempt::Done(Outcome::Paused));
+        }
         if let Some(at) = deployment
             .pointer("/spec/template/metadata/annotations")
             .and_then(|a| a.get(RESTARTED_AT))
@@ -664,6 +687,7 @@ mod tests {
                 Ok(Outcome::RecentlyRestarted { age_secs: 30 }),
                 "recently_restarted",
             ),
+            (Ok(Outcome::Paused), "paused"),
         ] {
             let recorder = metrics_util::debugging::DebuggingRecorder::new();
             let _guard = metrics::set_default_local_recorder(&recorder);
@@ -703,6 +727,7 @@ mod tests {
         restarted_at: Option<String>,
         /// How many patches answer 409 before one succeeds.
         conflicts: usize,
+        paused: bool,
     }
 
     async fn fake_api(restarted_at: Option<String>) -> (String, Arc<Api>) {
@@ -710,12 +735,18 @@ mod tests {
     }
 
     async fn fake_api_with(restarted_at: Option<String>, conflicts: usize) -> (String, Arc<Api>) {
-        use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
-        let api = Arc::new(Api {
+        serve(Api {
             seen: Mutex::default(),
             restarted_at,
             conflicts,
-        });
+            paused: false,
+        })
+        .await
+    }
+
+    async fn serve(api: Api) -> (String, Arc<Api>) {
+        use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+        let api = Arc::new(api);
         let state = web::Data::from(Arc::clone(&api));
         let path = "/apis/apps/v1/namespaces/media/deployments/pharos";
         let srv = HttpServer::new(move || {
@@ -735,9 +766,12 @@ mod tests {
                         };
                         HttpResponse::Ok().json(serde_json::json!({
                             "metadata": { "resourceVersion": gets.to_string() },
-                            "spec": { "template": { "metadata": {
-                                "annotations": annotations
-                            } } }
+                            "spec": {
+                                "paused": d.paused,
+                                "template": { "metadata": {
+                                    "annotations": annotations
+                                } }
+                            }
                         }))
                     }),
                 )
@@ -853,6 +887,22 @@ mod tests {
         assert!(seen.seen.lock().unwrap().patches.is_empty());
     }
 
+    /// A paused Deployment would take the patch and never roll out: skip it
+    /// so the pod goes unready for the reaper instead of waiting 15 minutes.
+    #[actix_web::test]
+    async fn the_kube_restarter_skips_a_paused_deployment() {
+        let (api, seen) = serve(Api {
+            seen: Mutex::default(),
+            restarted_at: None,
+            conflicts: 0,
+            paused: true,
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(kube(api, &dir).restart().await, Ok(Outcome::Paused));
+        assert!(seen.seen.lock().unwrap().patches.is_empty());
+    }
+
     /// A restartedAt a little ahead (clock drift) is recent; one far ahead
     /// is ignored rather than holding off restarts until then.
     #[test]
@@ -881,8 +931,12 @@ mod tests {
         let labels = [
             Outcome::Restarted.label(),
             Outcome::RecentlyRestarted { age_secs: 1 }.label(),
+            Outcome::Paused.label(),
             FAILED,
         ];
-        assert_eq!(labels, ["restarted", "recently_restarted", "failed"]);
+        assert_eq!(
+            labels,
+            ["restarted", "recently_restarted", "paused", "failed"]
+        );
     }
 }
