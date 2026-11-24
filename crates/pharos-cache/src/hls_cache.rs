@@ -441,6 +441,31 @@ pub fn source_open_failure(msg: &str) -> Option<&'static str> {
     })
 }
 
+/// [`source_open_failure`] for an encode whose FIRST input is `source`: an
+/// input that failed to open is classified only when it is the source. A
+/// muxed segment also opens the title's continuous audio encode, a cache
+/// file, as a second input; that file failing to open says nothing about the
+/// source or its share, so it stays a transcode failure.
+///
+/// ffmpeg names the input both ways: `[in#N @ …] Error opening input: …`
+/// gives its index, and `Error opening input file <url>.` its URL. Either
+/// one pointing elsewhere rules the source out.
+pub fn source_open_failure_of(msg: &str, source: &Path) -> Option<&'static str> {
+    let reason = source_open_failure(msg)?;
+    let index_elsewhere = msg
+        .split("[in#")
+        .skip(1)
+        .filter_map(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .any(|n| n != "0");
+    let source_url = source.to_string_lossy();
+    let named_elsewhere = msg
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Error opening input file "))
+        .map(|url| url.strip_suffix('.').unwrap_or(url))
+        .any(|url| url != source_url);
+    (!index_elsewhere && !named_elsewhere).then_some(reason)
+}
+
 /// Whether a transcode failure message is [`pharos_transcode::protocol::WorkerError::NoFrames`],
 /// matched by its Display prefix after [`pharos_transcode::scheduler::SchedError::Failed`] wraps it.
 pub fn no_frames_failure(msg: &str) -> bool {
@@ -3919,7 +3944,8 @@ impl HlsSegmentCache {
                     // HTTP status all say "storage", and remember it so the
                     // client's retry loop does not spawn ffmpeg again (B218).
                     let e = match e {
-                        HlsCacheError::Transcode(msg) => match source_open_failure(&msg) {
+                        HlsCacheError::Transcode(msg) => match source_open_failure_of(&msg, source)
+                        {
                             Some(reason) => {
                                 record_source_unreadable(reason);
                                 self.note_source_unreadable(source, reason).await;
@@ -11768,6 +11794,51 @@ mod tests {
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
             .await;
         assert!(matches!(res, Err(HlsCacheError::Transcode(_))));
+    }
+
+    /// B1531 — only the SOURCE failing to open is classified: the muxed
+    /// segment's second input, the continuous audio encode in the cache,
+    /// failing is a transcode failure, so a cache file cannot mark the media
+    /// share broken.
+    #[test]
+    fn only_the_source_input_failing_to_open_is_classified() {
+        let source = Path::new("/media/film.mkv");
+        assert_eq!(
+            source_open_failure_of(
+                "[in#0 @ 0x1] Error opening input: Input/output error\nError opening input file /media/film.mkv.",
+                source
+            ),
+            Some("io_error")
+        );
+        assert_eq!(
+            source_open_failure_of(
+                "[in#1 @ 0x2] Error opening input: Input/output error\nError opening input file /cache/hls/7/audio/a.m4a.",
+                source
+            ),
+            None,
+            "the cached audio input is not the source"
+        );
+        assert_eq!(
+            source_open_failure_of(
+                "Error opening input: Input/output error\nError opening input file /cache/hls/7/audio/a.m4a.",
+                source
+            ),
+            None,
+            "named by URL alone"
+        );
+        assert_eq!(
+            source_open_failure_of(
+                "[in#1 @ 0x2] Error opening input: Stale file handle",
+                source
+            ),
+            None,
+            "named by index alone"
+        );
+        assert_eq!(
+            source_open_failure_of("Error opening input: Stale file handle", source),
+            Some("stale_handle"),
+            "an unnamed input is the source, as before"
+        );
     }
 
     /// B218 — the ffmpeg strings a storage incident produces are classified as
