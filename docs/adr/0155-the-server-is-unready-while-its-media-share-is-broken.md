@@ -1,6 +1,6 @@
 # ADR-0155: The server is unready while its media share is broken
 
-- **Status:** Accepted
+- **Status:** Accepted. Superseded in part by ADR-0156: where the server can restart its own Deployment, it stays Ready instead.
 - **Date:** 2026-11-24T12:45:00Z
 - **Deciders:** Alison Jenkins
 
