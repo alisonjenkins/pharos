@@ -15,7 +15,7 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
-use crate::media::{read_source, MediaError, MediaProbe, Source};
+use crate::media::{MediaError, MediaProbe, Source, Unreadable};
 use crate::obs::{
     set_remote_parent, Metrics, GPU_POOL_BYTES, MEDIA_OK, SONGS_TOTAL, SONG_SECONDS,
     SOURCE_UNREADABLE_TOTAL,
@@ -159,6 +159,25 @@ fn error(status: StatusCode, message: impl Into<String>) -> HttpResponse {
     )
 }
 
+/// Records a song file the share could not read: counts it by reason, logs
+/// it with its error, and marks the share broken when only a fresh mount
+/// reads it again. Returns the 503's message.
+fn unreadable(media: &MediaProbe, rel_path: &str, why: Unreadable, e: &std::io::Error) -> String {
+    metrics::counter!(SOURCE_UNREADABLE_TOTAL, "reason" => why.label()).increment(1);
+    let message = format!("song file unreadable: {rel_path}: {e}");
+    tracing::warn!(
+        path = %rel_path,
+        reason = why.label(),
+        error = %e,
+        breaks_the_share = why.breaks_the_share(),
+        "song file unreadable"
+    );
+    if why.breaks_the_share() {
+        media.mark_broken(message.clone());
+    }
+    message
+}
+
 async fn healthz() -> HttpResponse {
     json(StatusCode::OK, &serde_json::json!({ "ok": true }))
 }
@@ -280,36 +299,15 @@ async fn align(
     // missing either: it is counted, logged with its error and answered 503,
     // and a broken share keeps `/readyz` failing until the pod is replaced,
     // since the root can still list while the song's directory is stale.
-    let checked = {
-        let full_path = full_path.clone();
-        web::block(move || read_source(&full_path)).await
-    };
-    match checked {
-        Ok(Source::Readable) => {}
-        Ok(Source::Missing) => {
+    match state.media.read_source(full_path.clone()).await {
+        Source::Readable => {}
+        Source::Missing => {
             tracing::warn!(path = %rel_path, "song file not found");
             return fail(StatusCode::NOT_FOUND, format!("file not found: {rel_path}"));
         }
-        Ok(Source::Unreadable(why, e)) => {
-            metrics::counter!(SOURCE_UNREADABLE_TOTAL, "reason" => why.label()).increment(1);
-            let message = format!("song file unreadable: {rel_path}: {e}");
-            tracing::warn!(
-                path = %rel_path,
-                reason = why.label(),
-                error = %e,
-                breaks_the_share = why.breaks_the_share(),
-                "song file unreadable"
-            );
-            if why.breaks_the_share() {
-                state.media.mark_broken(message.clone());
-            }
+        Source::Unreadable(why, e) => {
+            let message = unreadable(&state.media, &rel_path, why, &e);
             return fail(StatusCode::SERVICE_UNAVAILABLE, message);
-        }
-        Err(e) => {
-            return fail(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("song file check failed: {e}"),
-            );
         }
     }
 
@@ -508,9 +506,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
-    use super::{accepts_events, readiness, record_gpu};
-    use crate::media::MediaError;
-    use crate::obs::{GPU_POOL_BYTES, MEDIA_OK};
+    use super::{accepts_events, readiness, record_gpu, unreadable};
+    use crate::media::{MediaError, MediaProbe, Unreadable};
+    use crate::obs::{GPU_POOL_BYTES, MEDIA_OK, SOURCE_UNREADABLE_TOTAL};
     use crate::service::{GpuMemory, GpuPool};
 
     fn gauges(recorder: &DebuggingRecorder) -> Vec<(String, f64)> {
@@ -611,5 +609,37 @@ mod tests {
         let broken = readiness(Err(MediaError::Broken("stale handle".into())));
         assert_eq!(broken.status().as_u16(), 503);
         assert_eq!(media_ok(&recorder), Some(0.0));
+    }
+
+    #[test]
+    fn an_unreadable_song_counts_its_reason_and_a_share_fault_breaks_the_share() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let media = MediaProbe::new(std::env::temp_dir());
+        let refused = std::io::Error::from_raw_os_error(13);
+        let message = unreadable(&media, "a/b.flac", Unreadable::Other, &refused);
+        assert!(message.contains("a/b.flac"), "{message}");
+        let stale = std::io::Error::from_raw_os_error(116);
+        unreadable(&media, "a/c.flac", Unreadable::StaleHandle, &stale);
+        let counts: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == SOURCE_UNREADABLE_TOTAL)
+            .map(|(k, _, _, v)| {
+                let reason = k.key().labels().find(|l| l.key() == "reason").unwrap();
+                let DebugValue::Counter(n) = v else {
+                    panic!("{v:?}")
+                };
+                (reason.value().to_owned(), n)
+            })
+            .collect();
+        let mut counts = counts;
+        counts.sort();
+        assert_eq!(
+            counts,
+            vec![("other".to_owned(), 1), ("stale_handle".to_owned(), 1)]
+        );
     }
 }

@@ -8,7 +8,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -16,6 +16,14 @@ use std::time::Duration;
 /// A `hard` NFS mount whose server is gone blocks a `stat` for minutes; a
 /// healthy one answers in milliseconds, so two seconds is generous.
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the read of one song's first byte may take. A healthy share
+/// answers in milliseconds; a hard mount whose server is gone never does.
+pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Song reads that may be stuck on the share at once. Past this every new
+/// song answers 503 at once rather than parking another thread.
+pub const MAX_STUCK_SOURCE_READS: usize = 4;
 
 /// Why the media root could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +58,9 @@ pub enum Unreadable {
     Io,
     /// The share's connection is gone (ENOTCONN).
     NotConnected,
+    /// The read did not answer within [`SOURCE_TIMEOUT`], or too many earlier
+    /// reads are still stuck: a hard mount whose server is gone.
+    TimedOut,
     /// Any other error, such as a permission refused on one file; the share
     /// itself is not taken to be broken.
     Other,
@@ -73,6 +84,7 @@ impl Unreadable {
             Self::StaleHandle => "stale_handle",
             Self::Io => "io",
             Self::NotConnected => "not_connected",
+            Self::TimedOut => "timed_out",
             Self::Other => "other",
         }
     }
@@ -132,6 +144,9 @@ pub struct MediaProbe {
     busy: Arc<AtomicBool>,
     /// The first song read that found the share broken, if one has.
     broken: Arc<Mutex<Option<String>>>,
+    source_timeout: Duration,
+    /// Song reads started and not yet returned.
+    source_reads: Arc<AtomicUsize>,
 }
 
 impl MediaProbe {
@@ -145,6 +160,56 @@ impl MediaProbe {
             timeout,
             busy: Arc::new(AtomicBool::new(false)),
             broken: Arc::default(),
+            source_timeout: SOURCE_TIMEOUT,
+            source_reads: Arc::default(),
+        }
+    }
+
+    /// The same probe with `timeout` for a song read, for tests.
+    pub fn with_source_timeout(mut self, timeout: Duration) -> Self {
+        self.source_timeout = timeout;
+        self
+    }
+
+    /// [`read_source`] on a thread of its own, given at most the source
+    /// timeout. A read that never returns keeps its thread, so at most
+    /// [`MAX_STUCK_SOURCE_READS`] run at once; past that, and on a timeout,
+    /// the song is [`Unreadable::TimedOut`].
+    pub async fn read_source(&self, path: PathBuf) -> Source {
+        if self.source_reads.fetch_add(1, Ordering::AcqRel) >= MAX_STUCK_SOURCE_READS {
+            self.source_reads.fetch_sub(1, Ordering::AcqRel);
+            return Source::Unreadable(
+                Unreadable::TimedOut,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{MAX_STUCK_SOURCE_READS} earlier reads of the share have not returned"
+                    ),
+                ),
+            );
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let reads = Arc::clone(&self.source_reads);
+        let spawned = std::thread::Builder::new()
+            .name("song-read".to_owned())
+            .spawn(move || {
+                let found = read_source(&path);
+                reads.fetch_sub(1, Ordering::AcqRel);
+                drop(tx.send(found));
+            });
+        if let Err(e) = spawned {
+            self.source_reads.fetch_sub(1, Ordering::AcqRel);
+            return Source::Unreadable(Unreadable::Other, e);
+        }
+        match tokio::time::timeout(self.source_timeout, rx).await {
+            Ok(Ok(found)) => found,
+            Ok(Err(_)) | Err(_) => Source::Unreadable(
+                Unreadable::TimedOut,
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("no answer within {:?}", self.source_timeout),
+                ),
+            ),
         }
     }
 
@@ -222,6 +287,7 @@ fn look(root: &Path) -> Result<(), MediaError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{MediaError, MediaProbe};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     fn dir(name: &str) -> std::path::PathBuf {
@@ -274,6 +340,37 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    #[tokio::test]
+    async fn song_reads_stuck_on_the_share_cap_new_ones_as_timed_out() {
+        let d = dir("stuck");
+        let song = d.join("song.flac");
+        std::fs::write(&song, b"x").unwrap();
+        let probe = MediaProbe::new(d.clone());
+        assert!(matches!(
+            probe.read_source(song.clone()).await,
+            super::Source::Readable
+        ));
+        // As if MAX_STUCK_SOURCE_READS reads were hung on a dead mount.
+        probe
+            .source_reads
+            .store(super::MAX_STUCK_SOURCE_READS, Ordering::Release);
+        let found = probe.read_source(song.clone()).await;
+        assert!(
+            matches!(
+                found,
+                super::Source::Unreadable(super::Unreadable::TimedOut, _)
+            ),
+            "{found:?}"
+        );
+        assert!(super::Unreadable::TimedOut.breaks_the_share());
+        probe.source_reads.store(0, Ordering::Release);
+        assert!(matches!(
+            probe.read_source(song).await,
+            super::Source::Readable
+        ));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     #[test]
     fn mount_errors_break_the_share_and_others_do_not() {
         use super::Unreadable;
@@ -288,12 +385,13 @@ mod tests {
             Unreadable::StaleHandle.label(),
             Unreadable::Io.label(),
             Unreadable::NotConnected.label(),
+            Unreadable::TimedOut.label(),
             Unreadable::Other.label(),
         ]
         .to_vec();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 4);
+        assert_eq!(labels.len(), 5);
     }
 
     #[test]
