@@ -98,7 +98,7 @@ jobs:
           PHAROS_ANDROID_APK_OUT: ${{ runner.temp }}/apks/pharos-phone-${{ needs.version.outputs.name }}.apk
         run: nix run .#android-phone-apk -- --release
 
-      # A different key would make every friend's update fail to install, so
+      # A different key would make every installed copy's update fail to install, so
       # refuse to publish unless both APKs carry the expected certificate.
       - name: Check both APKs carry the Pharos key
         env:

@@ -164,7 +164,7 @@ jobs:
             done
           done
 
-  # Each server release also ships the phone and TV apps to friends
+  # Each server release also publishes the phone and TV apps
   # (android-apps.yml, docs/android-apps.md).
   android-apps:
     name: android apps
