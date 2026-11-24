@@ -63,9 +63,9 @@ automatically.
 - With `RollingUpdate`, the new pod is created alongside the old one where
   `maxSurge` allows. The old pod may still be removed before the new one is
   Ready: it is NotReady, so the Deployment controller counts it unavailable
-  and may scale it down at once. A NotReady pod is already out of its
-  Service, so no new requests reach it; requests already in flight on it,
-  or a client connected to it directly, can still be cut off. With `Recreate` (the chart's choice for
+  and may scale it down at once. Once the endpoints update, its Service
+  stops routing new requests to it; requests already in flight, kept-alive
+  connections and clients that reach the pod directly can still be cut off. With `Recreate` (the chart's choice for
   an aligner with a GPU or cache volume, and for the server on SQLite) the
   old pod always stops first.
 - `pharos_aligner_media_ok` and `pharos_aligner_source_unreadable_total`
