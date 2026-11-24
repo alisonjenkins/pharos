@@ -60,17 +60,19 @@ automatically.
   the fault: up to 30 s for readiness to fail, up to one 2-minute run for
   the first stamp, `notReadyMinutes` (5), and up to one more run for the
   rollout; then the new pod starts.
-- With `RollingUpdate`, the new pod starts before the old one stops, so a
-  share still broken leaves the old pod in place and nothing is lost. With
-  `Recreate` (the aligner with a GPU or cache volume, the server on SQLite)
-  the old pod stops first, so the service is down while the new one starts.
+- With `RollingUpdate`, the new pod is created alongside the old one where
+  `maxSurge` allows. The old pod may still be removed before the new one is
+  Ready: it is NotReady, so the Deployment controller counts it unavailable
+  and may scale it down at once. Nothing is lost by that, since a NotReady
+  pod is already out of its Service. With `Recreate` (the chart's choice for
+  an aligner with a GPU or cache volume, and for the server on SQLite) the
+  old pod always stops first.
 - `pharos_aligner_media_ok` and `pharos_aligner_source_unreadable_total`
   show the fault, and the CronJob logs each Deployment it rolls out.
 - The CronJob can restart Deployments. Its Role is limited to one namespace,
   and its selector to Deployments that opt in by label.
-- A share that stays broken makes the new pod stay unready too. A `Recreate`
-  Deployment is then rolled out again every 7 to 9 minutes; a
-  `RollingUpdate` one keeps its stuck rollout and its old pod.
+- A share that stays broken makes the new pod stay unready too, and the
+  Deployment is rolled out again every 7 to 9 minutes until it reads.
 - The root cause (the NFS server changing its file handles, for example an
   export without a fixed `fsid=`) is outside Pharos. `docs/kubernetes.md`
   covers it.
