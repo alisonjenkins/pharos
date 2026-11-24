@@ -176,8 +176,9 @@ server sets that Deployment's `kubectl.kubernetes.io/restartedAt`, and
   so Pharos is down for one restart instead of the reaper's wait.
 
 `/readyz` fails as before in each of these cases. The reaper then heals
-the pod, but only when `selfHeal.enabled` is on and the pod carries the
-chart's `selfHeal` label (a pod the chart renders); otherwise it stays
+the pod, but only when `selfHeal.enabled` is on and the pod belongs to a
+Deployment labelled `pharos.io/self-heal=true` (the chart labels its own),
+which the reaper finds pods through by selector. Otherwise the pod stays
 unready until someone restarts it:
 
 - `serverSelfRestart` is off, or the server runs outside Kubernetes;
