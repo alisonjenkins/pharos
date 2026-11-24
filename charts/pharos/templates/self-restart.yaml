@@ -1,0 +1,47 @@
+{{- /*
+The server's self-restart (ADR-0156): when the server finds its media share
+broken after it has read it, it patches its own Deployment's restartedAt, as
+`kubectl rollout restart` does, and stays Ready meanwhile so browsing keeps
+working. Its service account may get and patch that one Deployment, nothing
+else.
+*/ -}}
+{{- if eq (include "pharos.selfRestart.enabled" .) "true" }}
+{{- $name := include "pharos.selfRestart.name" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: self-restart
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: self-restart
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: [{{ include "pharos.fullname" . | quote }}]
+    # get: when it was last restarted; patch: the restartedAt annotation.
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "pharos.labels" . | nindent 4 }}
+    app.kubernetes.io/component: self-restart
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

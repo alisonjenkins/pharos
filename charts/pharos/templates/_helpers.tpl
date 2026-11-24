@@ -218,3 +218,15 @@ fresh pod rolled out.
 {{- define "pharos.selfHeal.label" -}}
 pharos.io/self-heal: "true"
 {{- end }}
+
+{{/*
+The server's self-restart (ADR-0156): on when selfHeal and
+selfHeal.serverSelfRestart are both on. Names its service account.
+*/}}
+{{- define "pharos.selfRestart.enabled" -}}
+{{- and .Values.selfHeal.enabled .Values.selfHeal.serverSelfRestart -}}
+{{- end }}
+
+{{- define "pharos.selfRestart.name" -}}
+{{- printf "%s-self-restart" (include "pharos.fullname" . | trunc 50 | trimSuffix "-") }}
+{{- end }}
