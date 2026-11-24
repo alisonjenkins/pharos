@@ -21,7 +21,16 @@ pub struct Snapshot {
     /// new requests while in-flight ones finish (Phase B3).
     #[serde(default)]
     pub draining: bool,
+    /// Why the media share cannot be read, when it cannot (B1531). Set
+    /// only by `/readyz`, which then answers 503.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<String>,
 }
+
+/// The media share `/readyz` checks. Registered by the server binary; an app
+/// without it (tests, tools) skips the check.
+#[derive(Clone, Copy)]
+pub struct MediaReadiness(pub &'static crate::media_share::MediaShare);
 
 #[derive(Debug, Serialize)]
 struct Info {
@@ -80,6 +89,7 @@ impl ReadinessHandle {
                             ready,
                             probes,
                             draining,
+                            media: None,
                         });
                     }
                 }
@@ -138,11 +148,38 @@ async fn info() -> impl Responder {
     })
 }
 
-async fn readyz(handle: web::Data<ReadinessHandle>) -> impl Responder {
-    match handle.snapshot().await {
-        Ok(snap) if snap.ready => HttpResponse::Ok().json(snap),
-        Ok(snap) => HttpResponse::ServiceUnavailable().json(snap),
-        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+async fn readyz(
+    handle: web::Data<ReadinessHandle>,
+    media: Option<web::Data<MediaReadiness>>,
+) -> impl Responder {
+    let mut snap = match handle.snapshot().await {
+        Ok(snap) => snap,
+        Err(e) => return HttpResponse::InternalServerError().body(e.to_string()),
+    };
+    if let (true, Some(media)) = (snap.ready, media) {
+        if let Err(e) = media.0.check().await {
+            snap.ready = false;
+            snap.media = Some(e.to_string());
+        }
+        record_media(&snap);
+    }
+    if snap.ready {
+        HttpResponse::Ok().json(snap)
+    } else {
+        HttpResponse::ServiceUnavailable().json(snap)
+    }
+}
+
+/// Sets [`MEDIA_SHARE_OK`](crate::media_share::MEDIA_SHARE_OK) from a
+/// checked snapshot, and logs why the share failed when it did.
+fn record_media(snap: &Snapshot) {
+    use crate::media_share::MEDIA_SHARE_OK;
+    match &snap.media {
+        None => metrics::gauge!(MEDIA_SHARE_OK).set(1.0),
+        Some(why) => {
+            metrics::gauge!(MEDIA_SHARE_OK).set(0.0);
+            tracing::warn!(error = %why, "readyz: media share unreadable");
+        }
     }
 }
 
@@ -246,5 +283,64 @@ mod tests {
         let app = test::init_service(build_app(h)).await;
         let req = test::TestRequest::get().uri("/healthz").to_request();
         assert_eq!(test::call_service(&app, req).await.status(), 200);
+    }
+
+    fn build_app_with_media(
+        handle: ReadinessHandle,
+        media: &'static crate::media_share::MediaShare,
+    ) -> App<
+        impl actix_web::dev::ServiceFactory<
+            actix_web::dev::ServiceRequest,
+            Config = (),
+            Response = actix_web::dev::ServiceResponse,
+            Error = actix_web::Error,
+            InitError = (),
+        >,
+    > {
+        build_app(handle).app_data(web::Data::new(MediaReadiness(media)))
+    }
+
+    fn media_ok(recorder: &metrics_util::debugging::DebuggingRecorder) -> Option<f64> {
+        use metrics_util::debugging::DebugValue;
+        recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| k.key().name() == crate::media_share::MEDIA_SHARE_OK)
+            .map(|(.., v)| match v {
+                DebugValue::Gauge(g) => g.into_inner(),
+                other => panic!("{other:?}"),
+            })
+    }
+
+    /// B1531: a share a read found broken makes `/readyz` 503, naming the
+    /// cause, and sets the gauge to 0; a readable one stays 200 with it at 1.
+    #[actix_web::test]
+    async fn readyz_follows_the_media_share_and_sets_its_gauge() {
+        let share: &'static crate::media_share::MediaShare = Box::leak(Box::new(
+            crate::media_share::MediaShare::new(crate::media_share::ROOT_TIMEOUT),
+        ));
+        let h = ReadinessHandle::spawn(&["x"]);
+        h.mark("x").await.unwrap();
+        let app = test::init_service(build_app_with_media(h, share)).await;
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 200);
+        assert_eq!(media_ok(&recorder), Some(1.0));
+        drop(guard);
+
+        share.mark_broken("reading /m/a: Stale file handle".into());
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 503);
+        assert_eq!(media_ok(&recorder), Some(0.0));
+        let body = test::read_body(resp).await;
+        let txt = std::str::from_utf8(&body).unwrap();
+        assert!(txt.contains("Stale file handle"), "got: {txt}");
     }
 }
