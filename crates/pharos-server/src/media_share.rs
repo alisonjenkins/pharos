@@ -74,9 +74,11 @@ pub enum ShareError {
     Spawn(io::Error),
 }
 
+/// What [`MediaShare::on_broken`] registers.
+type BrokenHook = Box<dyn Fn(&str) + Send + Sync>;
+
 /// The share's state, shared by every request: once broken it stays broken
 /// until the process ends.
-#[derive(Debug)]
 pub struct MediaShare {
     roots: Mutex<Vec<PathBuf>>,
     timeout: Duration,
@@ -84,6 +86,21 @@ pub struct MediaShare {
     /// hung mount costs one thread, not one per probe.
     busy: Arc<AtomicBool>,
     broken: Mutex<Option<String>>,
+    /// Set once a check found every root listing with the share whole: a pod
+    /// that never read its share has nothing to keep serving (ADR-0156).
+    seen_whole: AtomicBool,
+    /// Told once, when the share first breaks.
+    on_broken: OnceLock<BrokenHook>,
+}
+
+impl std::fmt::Debug for MediaShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaShare")
+            .field("timeout", &self.timeout)
+            .field("broken", &self.broken_cause())
+            .field("seen_whole", &self.was_whole())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MediaShare {
@@ -93,7 +110,22 @@ impl MediaShare {
             timeout,
             busy: Arc::new(AtomicBool::new(false)),
             broken: Mutex::default(),
+            seen_whole: AtomicBool::new(false),
+            on_broken: OnceLock::new(),
         }
+    }
+
+    /// Calls `f` with the cause the first time the share breaks (the
+    /// server's self-restart, ADR-0156). Only the first `f` is kept.
+    pub fn on_broken(&self, f: impl Fn(&str) + Send + Sync + 'static) {
+        if self.on_broken.set(Box::new(f)).is_err() {
+            tracing::warn!("media share: an on_broken hook was already set; keeping the first");
+        }
+    }
+
+    /// Whether a check has found the share whole since the process started.
+    pub fn was_whole(&self) -> bool {
+        self.seen_whole.load(Ordering::Acquire)
     }
 
     /// The process's one share state: the mount belongs to the pod, so every
@@ -120,11 +152,17 @@ impl MediaShare {
 
     /// Marks the share broken, keeping the first cause.
     pub fn mark_broken(&self, why: String) {
-        let mut broken = self.broken.lock().unwrap_or_else(|p| p.into_inner());
-        if broken.is_none() {
+        {
+            let mut broken = self.broken.lock().unwrap_or_else(|p| p.into_inner());
+            if broken.is_some() {
+                return;
+            }
             tracing::error!(error = %why, "media share broken; the pod needs a fresh mount");
             metrics::gauge!(MEDIA_SHARE_OK).set(0.0);
-            *broken = Some(why);
+            *broken = Some(why.clone());
+        }
+        if let Some(f) = self.on_broken.get() {
+            f(&why);
         }
     }
 
@@ -151,6 +189,7 @@ impl MediaShare {
         }
         let roots = self.roots.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if roots.is_empty() {
+            self.seen_whole.store(true, Ordering::Release);
             return Ok(());
         }
         if self.busy.swap(true, Ordering::AcqRel) {
@@ -173,11 +212,20 @@ impl MediaShare {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => Err(ShareError::TimedOut(self.timeout)),
         };
+        // A root that fails with a share-level error is the share broken,
+        // as a read finding it would be: only a fresh mount lists it again.
+        if let Err(e @ ShareError::Io { .. }) = &listed {
+            self.mark_broken(e.to_string());
+        }
         // A read may have found the share broken while the roots listed.
-        listed.and_then(|()| {
+        let checked = listed.and_then(|()| {
             self.broken_cause()
                 .map_or(Ok(()), |why| Err(ShareError::Broken(why)))
-        })
+        });
+        if checked.is_ok() {
+            self.seen_whole.store(true, Ordering::Release);
+        }
+        checked
     }
 
     fn broken_cause(&self) -> Option<String> {
@@ -295,6 +343,36 @@ mod tests {
         };
         let (checked, ()) = tokio::join!(listing, fault);
         assert!(matches!(checked, Err(ShareError::Broken(_))), "{checked:?}");
+    }
+
+    /// ADR-0156: the first fault tells the hook once, with its cause; a
+    /// share-level error listing a root is a fault too; a whole check is
+    /// remembered.
+    #[tokio::test]
+    async fn the_first_fault_tells_the_hook_once_and_a_listing_fault_counts() {
+        let share: &'static MediaShare = Box::leak(Box::new(MediaShare::new(ROOT_TIMEOUT)));
+        let told = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&told);
+        share.on_broken(move |why| sink.lock().unwrap().push(why.to_owned()));
+        share.set_roots(vec![PathBuf::from("/m")]);
+        assert!(!share.was_whole());
+        assert!(share.check_with(|_| Ok(())).await.is_ok());
+        assert!(share.was_whole());
+
+        let listed = share
+            .check_with(|roots| {
+                Err(ShareError::Io {
+                    root: roots[0].clone(),
+                    source: err(ESTALE),
+                })
+            })
+            .await;
+        assert!(matches!(listed, Err(ShareError::Io { .. })), "{listed:?}");
+        share.note_read_error(Path::new("/m/b"), &err(EIO));
+        assert!(matches!(share.check().await, Err(ShareError::Broken(_))));
+        let told = told.lock().unwrap();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(told[0].contains("/m"), "{told:?}");
     }
 
     #[tokio::test]
