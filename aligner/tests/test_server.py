@@ -435,3 +435,62 @@ def test_a_probe_thread_that_cannot_start_frees_the_slot(monkeypatch: pytest.Mon
     assert error is not None and "can't start new thread" in error
     assert server_mod._PROBE_SLOT.acquire(blocking=False)
     server_mod._PROBE_SLOT.release()
+
+
+def test_a_song_read_past_the_limit_is_a_timeout_and_a_full_queue_is_busy() -> None:
+    from pharos_aligner import server as server_mod
+
+    release = threading.Event()
+
+    def hung(root: str, rel: str) -> tuple[str, object]:
+        release.wait(5)
+        return "ok", rel
+
+    try:
+        kinds = [
+            server_mod.song_preflight("/media", "a.mp3", timeout=0.05, check=hung)[0]
+            for _ in range(server_mod.MAX_STUCK_SONG_READS)
+        ]
+        assert kinds == ["timeout"] * server_mod.MAX_STUCK_SONG_READS
+        # Every slot holds a stuck read: the next is turned away, not started.
+        assert server_mod.song_preflight("/media", "b.mp3", timeout=0.05, check=hung) == (
+            "busy",
+            None,
+        )
+    finally:
+        release.set()
+    for _ in range(200):
+        if server_mod.song_preflight("/media", "c.mp3", timeout=1, check=lambda r, p: ("ok", p))[0] == "ok":
+            break
+        threading.Event().wait(0.01)
+    else:
+        raise AssertionError("the slots were not freed once the reads returned")
+
+
+def test_a_hung_song_read_is_a_503_that_breaks_the_share_and_busy_is_not(
+    running_server: tuple[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pharos_aligner import server as server_mod
+
+    base_url, _ = running_server
+    monkeypatch.setattr(server_mod, "_broken", None)
+    payload = {"path": "x.mp3", "lines": [{"start_ms": 0, "end_ms": 1000, "text": "a"}]}
+
+    def post() -> urllib.error.HTTPError:
+        req = urllib.request.Request(
+            f"{base_url}/align",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as info:
+            urllib.request.urlopen(req)
+        return info.value
+
+    monkeypatch.setattr(server_mod, "song_preflight", lambda root, rel: ("busy", None))
+    assert post().code == 503
+    assert server_mod.broken() is None, "a read turned away says nothing of the share"
+
+    monkeypatch.setattr(server_mod, "song_preflight", lambda root, rel: ("timeout", None))
+    assert post().code == 503
+    assert server_mod.broken() is not None
