@@ -33,7 +33,10 @@ release, on the self-hosted Nix runner.
   workflow refuses to publish when the certificate differs from the
   repository variable `PHAROS_ANDROID_CERT_SHA256`.
 - `versionCode` is minutes since 2026-01-01 UTC for every build, CI or
-  local. `versionName` and the tag are the same minute as a date.
+  local. That is the scripts' default; `PHAROS_ANDROID_VERSION_CODE`
+  overrides it and must not be set, because a code below the installed
+  release's makes Android refuse the update as a downgrade. `versionName`
+  and the tag are the same minute as a date.
 - App releases are not marked Latest, so the server release stays Latest.
 - The audience is anyone who installs the apps. They install with Obtainium
   (phone) or Downloader (TV), as `docs/android-apps.md` explains, and sign in
