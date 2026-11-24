@@ -158,9 +158,10 @@ The rollout follows the Deployment's own strategy. With `RollingUpdate`, the
 new pod is created alongside the old one where `maxSurge` allows, but the old
 pod may still go before the new one is Ready: it is NotReady, so the
 Deployment controller counts it unavailable and may scale it down at once.
-Once the endpoints update, the Service stops routing new requests to a
-NotReady pod; requests already in flight, kept-alive connections and clients
-that reach the pod directly can still be cut off. With
+Once the routing update reaches the Service proxy, new connections normally
+stop going to the NotReady pod. Existing (kept-alive) connections, and
+clients that reach the pod directly, can still carry requests to it and may
+be cut off when it stops. With
 `Recreate`, the old pod always stops first. The chart uses `Recreate` for
 the server on SQLite (its database volume is ReadWriteOnce and
 single-writer) and for an aligner with a GPU or a cache volume; otherwise
