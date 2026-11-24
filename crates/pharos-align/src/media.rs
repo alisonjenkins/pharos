@@ -138,6 +138,15 @@ pub fn read_source(path: &Path) -> Source {
     }
 }
 
+/// Gives back one song-read slot when dropped.
+struct SlotGuard(Arc<AtomicUsize>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Looks at the media root on its own thread, so a hung mount cannot take an
 /// actix worker or the blocking pool that `/align` needs.
 #[derive(Debug, Clone)]
@@ -181,6 +190,11 @@ impl MediaProbe {
     /// never returns keeps its thread, so at most [`MAX_STUCK_SOURCE_READS`]
     /// run at once; past that the song is [`Unreadable::Busy`].
     pub async fn read_source(&self, path: PathBuf) -> Source {
+        self.read_bounded(move || read_source(&path)).await
+    }
+
+    /// Runs `read` as [`Self::read_source`] runs a song read.
+    async fn read_bounded(&self, read: impl FnOnce() -> Source + Send + 'static) -> Source {
         if self.source_reads.fetch_add(1, Ordering::AcqRel) >= MAX_STUCK_SOURCE_READS {
             self.source_reads.fetch_sub(1, Ordering::AcqRel);
             return Source::Unreadable(
@@ -198,9 +212,10 @@ impl MediaProbe {
         let spawned = std::thread::Builder::new()
             .name("song-read".to_owned())
             .spawn(move || {
-                let found = read_source(&path);
-                reads.fetch_sub(1, Ordering::AcqRel);
-                drop(tx.send(found));
+                // Frees the slot when the thread ends, even by a panic, so a
+                // read that panicked does not hold a slot for good.
+                let _slot = SlotGuard(reads);
+                drop(tx.send(read()));
             });
         if let Err(e) = spawned {
             self.source_reads.fetch_sub(1, Ordering::AcqRel);
@@ -381,6 +396,31 @@ mod tests {
             super::Source::Readable
         ));
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_song_read_that_panics_frees_its_slot() {
+        let probe = MediaProbe::new(std::env::temp_dir());
+        for _ in 0..super::MAX_STUCK_SOURCE_READS + 1 {
+            let found = probe.read_bounded(|| panic!("a read that panics")).await;
+            assert!(
+                matches!(
+                    found,
+                    super::Source::Unreadable(super::Unreadable::Other, _)
+                ),
+                "{found:?}"
+            );
+        }
+        for _ in 0..200 {
+            if probe.source_reads.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "slots still held: {}",
+            probe.source_reads.load(Ordering::Acquire)
+        );
     }
 
     #[test]
