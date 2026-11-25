@@ -178,6 +178,8 @@ async fn readyz(
         if snap.ready && handle.snapshot().await.map_or(true, |now| now.draining) {
             snap.draining = true;
             snap.ready = false;
+            // Not staying ready after all; the cause under `media` stays.
+            snap.media_restart = None;
         }
         record_media(&snap);
     }
