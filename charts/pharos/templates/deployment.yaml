@@ -37,6 +37,9 @@ spec:
         {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- if eq (include "pharos.selfRestart.enabled" .) "true" }}
+      serviceAccountName: {{ include "pharos.selfRestart.name" . }}
+      {{- end }}
       {{- with .Values.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -96,6 +99,16 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["--config", "/etc/pharos/config.toml", "serve"]
           env:
+            {{- if eq (include "pharos.selfRestart.enabled" .) "true" }}
+            # ADR-0156: a broken media share asks for this Deployment's
+            # rollout restart instead of failing /readyz.
+            - name: PHAROS_SELF_RESTART_DEPLOYMENT
+              value: {{ include "pharos.fullname" . | quote }}
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- end }}
             - name: PHAROS_BIND
               value: {{ .Values.config.server.bind | quote }}
             - name: PHAROS_LOG_LEVEL
