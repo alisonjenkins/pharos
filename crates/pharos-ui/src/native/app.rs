@@ -6833,12 +6833,15 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         };
         let asked = p.0.asked();
         let kind = p.0.kind;
+        let attempt_slot = Rc::clone(&renew_slot);
         spawn(async move {
+            // The song can become Outgoing while a retry waits (B1536).
+            let still_playing = move || attempt_slot.get().negotiates_on_reconnect();
             let info = call("watch", "renew");
             let mut wait_ms = RENEW_FIRST_WAIT_MS;
             for attempt in 1..=RENEW_ATTEMPTS {
                 // A newer reconnect has taken over.
-                if *api_gen.peek() != gen {
+                if *api_gen.peek() != gen || !still_playing() {
                     return;
                 }
                 match api
@@ -6852,7 +6855,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     )
                     .await
                 {
-                    Ok((decision, grant)) if *api_gen.peek() == gen => {
+                    Ok((decision, grant)) if *api_gen.peek() == gen && still_playing() => {
                         *p.0.grant.borrow_mut() = Some(grant);
                         // The play session id is a stream credential (B256).
                         let adopted = decision.play_session == p.0.session;
@@ -6868,7 +6871,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         return;
                     }
                     Ok(_) => return,
-                    Err(_) if *api_gen.peek() != gen => return,
+                    Err(_) if *api_gen.peek() != gen || !still_playing() => return,
                     Err(e) if attempt == RENEW_ATTEMPTS => {
                         // No grant holds the stream's session now: it ends with the grace.
                         p.0.session_suspect.set(true);
