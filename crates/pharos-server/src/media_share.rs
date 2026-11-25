@@ -229,6 +229,15 @@ impl MediaShare {
         &self,
         list_roots: impl FnOnce(&[PathBuf]) -> Result<bool, ShareError> + Send + 'static,
     ) -> Result<(), ShareError> {
+        self.check_within(self.timeout, list_roots).await
+    }
+
+    /// [`Self::check_with`], waiting at most `timeout` for the listing.
+    async fn check_within(
+        &self,
+        timeout: Duration,
+        list_roots: impl FnOnce(&[PathBuf]) -> Result<bool, ShareError> + Send + 'static,
+    ) -> Result<(), ShareError> {
         if let Some(why) = self.broken_cause() {
             return Err(ShareError::Broken(why));
         }
@@ -257,9 +266,9 @@ impl MediaShare {
             self.busy.store(false, Ordering::Release);
             return Err(ShareError::Spawn(e));
         }
-        let listed = match tokio::time::timeout(self.timeout, rx).await {
+        let listed = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) | Err(_) => Err(ShareError::TimedOut(self.timeout)),
+            Ok(Err(_)) | Err(_) => Err(ShareError::TimedOut(timeout)),
         };
         let all_listed = listed?;
         // A read may have found the share broken while the roots listed;
@@ -463,7 +472,7 @@ mod tests {
     /// still breaks the share and tells the hook, once.
     #[tokio::test]
     async fn a_listing_fault_after_the_probe_timed_out_still_tells_the_hook() {
-        let share = MediaShare::new(Duration::from_millis(10));
+        let share = MediaShare::new(ROOT_TIMEOUT);
         let told = Arc::new(Mutex::new(0_u32));
         let sink = Arc::clone(&told);
         share.on_broken(move |_| *sink.lock().unwrap() += 1);
@@ -472,7 +481,7 @@ mod tests {
 
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let listed = share
-            .check_with(move |roots| {
+            .check_within(Duration::from_millis(10), move |roots| {
                 wait.recv().ok();
                 Err(ShareError::Io {
                     root: roots[0].clone(),
