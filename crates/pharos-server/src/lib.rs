@@ -66,6 +66,7 @@ pub mod router;
 #[cfg(unix)]
 pub mod scan_tasks;
 pub mod segment_backfill;
+pub mod self_restart;
 pub mod series_hand_fix;
 pub mod series_identity;
 pub mod services;
