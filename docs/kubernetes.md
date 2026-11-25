@@ -161,7 +161,7 @@ selfHeal:
 ### The server restarts itself
 
 The server does not wait for the reaper (ADR-0156). Its pod runs as the
-service account `<release>-pharos-self-restart`, whose Role may only `get`
+service account `<fullname>-self-restart`, whose Role may only `get`
 and `patch` the server's own Deployment. On the first share fault, the
 server sets that Deployment's `kubectl.kubernetes.io/restartedAt`, and
 `/readyz` keeps answering 200 so browsing, sign-in and search stay up:
@@ -196,8 +196,9 @@ and the cause, and counts
 Charts from before the self-restart leave `serviceAccountName` out of the
 server Deployment. Kubernetes fills a missing name back in from the old
 one, so a `helm rollback` (or Flux upgrade remediation) to such a chart
-deletes the `<release>-pharos-self-restart` ServiceAccount but leaves the
-Deployment naming it. No new server pod can start: its ReplicaSet reports
+deletes the `<fullname>-self-restart` ServiceAccount but leaves the
+Deployment naming it (`<fullname>` is the chart's full name: `pharos`
+for a release named `pharos`). No new server pod can start: its ReplicaSet reports
 `FailedCreate` with `serviceaccount "…-self-restart" not found` (B1533).
 Charts with V1533 always name the account, so a rollback between them is
 safe.
@@ -206,14 +207,14 @@ If it happens, do one of these, then let the rollback or next upgrade run:
 
 ```bash
 # Put the name back to default:
-kubectl -n <ns> patch deployment <release>-pharos --type=json \
+kubectl -n <ns> patch deployment <fullname> --type=json \
   -p '[{"op":"replace","path":"/spec/template/spec/serviceAccountName","value":"default"},
        {"op":"replace","path":"/spec/template/spec/serviceAccount","value":"default"}]'
 
 # Or recreate the account so a later Helm upgrade adopts it:
-kubectl -n <ns> create serviceaccount <release>-pharos-self-restart
-kubectl -n <ns> label sa <release>-pharos-self-restart app.kubernetes.io/managed-by=Helm
-kubectl -n <ns> annotate sa <release>-pharos-self-restart \
+kubectl -n <ns> create serviceaccount <fullname>-self-restart
+kubectl -n <ns> label sa <fullname>-self-restart app.kubernetes.io/managed-by=Helm
+kubectl -n <ns> annotate sa <fullname>-self-restart \
   meta.helm.sh/release-name=<release> meta.helm.sh/release-namespace=<ns>
 ```
 
