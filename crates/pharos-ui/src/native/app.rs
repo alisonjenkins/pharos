@@ -6652,14 +6652,19 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             }
             .await;
             let result = match result {
-                Ok(None) => {
+                Ok(Some(started)) => Ok(started),
+                Err(e) if !handing_over() => Err(e),
+                dropped => {
+                    // A failure still signs out a revoked session.
+                    let outcome = settle_start(ctx.machine, dropped).map_or_else(
+                        |e| format!("failed reason={:?}", e.reason),
+                        |_| "ok".to_owned(),
+                    );
                     platform::info(&format!(
-                        "pharos: playback negotiation dropped item={id} slot=outgoing api_gen={grant_gen}"
+                        "pharos: playback negotiation dropped item={id} slot=outgoing api_gen={grant_gen} outcome={outcome}"
                     ));
                     return late_kept.borrow().clone();
                 }
-                Ok(Some(started)) => Ok(started),
-                Err(e) => Err(e),
             };
             Some(
                 settle_start(ctx.machine, result).and_then(|(detail, version, decision, grant, asked, track_map)| {
