@@ -143,7 +143,8 @@ So the chart splits the work:
 |-------|--------------|
 | Aligner `GET /readyz` | Stats the media root and reads one entry, on its own thread with a 2 s limit. Answers 503 with the error when either fails. |
 | Aligner readiness probe | Points at `/readyz`. Liveness stays on `/healthz`, because a restart would not help. |
-| Server `GET /readyz` | Lists each media root on its own thread with a 2 s limit, and fails from the first media read that hits a stale handle, lost connection or I/O error until the pod is replaced. Answers 503 with the cause under `media`. A missing or refused library folder does not fail it, so one deleted folder cannot take the whole server out of its Service. |
+| Server `GET /readyz` | Lists each media root on its own thread with a 2 s limit. From the first media read that hits a stale handle, lost connection or I/O error, the share counts as broken until the pod is replaced, and the cause shows under `media`. A missing or refused library folder does not fail it, so one deleted folder cannot take the whole server out of its Service. |
+| Server self-restart | When the share breaks in a pod that has read it, the server rolls out its own Deployment straight away and stays Ready (`media_restart: requested`), so browsing keeps working while only media answers 503. It falls back to failing `/readyz` for the reaper when it cannot do that (see below). |
 | Server media routes | A file the share cannot read answers 503, not 404: the file is not missing, this pod cannot reach it. |
 | `selfHeal` CronJob | Every 2 minutes, finds this release's Deployments labelled `pharos.io/self-heal=true` whose pod has been NotReady for `selfHeal.notReadyMinutes` (default 5) after starting, and rolls each one out again, as `kubectl rollout restart` does. The new pod mounts the share afresh. |
 
@@ -152,9 +153,36 @@ not grant a Role that patches pods and Deployments:
 
 ```yaml
 selfHeal:
-  enabled: true        # false renders no CronJob, Role or ServiceAccount
-  notReadyMinutes: 5   # long enough for a short NFS server reboot to pass
+  enabled: true            # false renders no CronJob, Role or ServiceAccount
+  notReadyMinutes: 5       # long enough for a short NFS server reboot to pass
+  serverSelfRestart: true  # the server restarts its own Deployment (ADR-0156)
 ```
+
+### The server restarts itself
+
+The server does not wait for the reaper (ADR-0156). Its pod runs as the
+service account `<release>-pharos-self-restart`, whose Role may only `get`
+and `patch` the server's own Deployment. On the first share fault, the
+server sets that Deployment's `kubectl.kubernetes.io/restartedAt`, and
+`/readyz` keeps answering 200 so browsing, sign-in and search stay up:
+
+- With `RollingUpdate` (Postgres), the old pod serves everything but media
+  until the new pod is Ready. Browsing never goes down.
+- With `Recreate` (SQLite), the old pod stops as soon as the restart lands,
+  so Pharos is down for one restart instead of the reaper's wait.
+
+`/readyz` fails as before, and the reaper heals the pod, in each of these
+cases:
+
+- `serverSelfRestart` is off, or the server runs outside Kubernetes;
+- the API call fails, for example when the Role is missing;
+- the Deployment was restarted in the last 10 minutes;
+- the pod never saw its share whole;
+- no new pod replaced it within 15 minutes.
+
+Each request logs one `self-restart:` line with the Deployment, the outcome
+and the cause, and counts
+`pharos_media_share_restart_total{outcome="restarted"|"recently_restarted"|"failed"}`.
 
 The rollout follows the Deployment's own strategy. With `RollingUpdate`, the
 new pod is created alongside the old one where `maxSurge` allows, but the old
@@ -210,7 +238,10 @@ The image is any one with `bash`, `jq` and `kubectl` (`selfHeal.image`).
 - Server log line `readyz: media share unreadable` and the one-off
   `media share broken; the pod needs a fresh mount`, each with the cause.
 - Gauge `pharos_media_share_ok` on the server: 0 while `/readyz` finds the
-  share unusable.
+  share unusable, even while the pod stays Ready for its own restart.
+- Counter `pharos_media_share_restart_total{outcome}` and the log lines
+  `self-restart: asked for a rollout restart; staying ready until replaced`
+  or `self-restart: … going unready for the reaper`.
 - Counter `pharos_source_unreadable_total{reason="stale_handle"}` (or
   `not_connected`, `io_error`) on the server, per media read that hit a share fault.
 - `kube_pod_status_ready{condition="false"}` from kube-state-metrics, for the
