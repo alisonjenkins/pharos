@@ -181,7 +181,7 @@ async fn readyz(
             // Not staying ready after all; the cause under `media` stays.
             snap.media_restart = None;
         }
-        record_media(&snap);
+        record_media(&snap, media.share);
     }
     if snap.ready {
         HttpResponse::Ok().json(snap)
@@ -206,10 +206,11 @@ fn stays_ready(media: &MediaReadiness, e: &crate::media_share::ShareError) -> Op
 
 /// Sets [`MEDIA_SHARE_OK`](crate::media_share::MEDIA_SHARE_OK) from a
 /// checked snapshot, and logs why the share failed when it did.
-fn record_media(snap: &Snapshot) {
+fn record_media(snap: &Snapshot, share: &crate::media_share::MediaShare) {
     use crate::media_share::MEDIA_SHARE_OK;
     match &snap.media {
-        None => metrics::gauge!(MEDIA_SHARE_OK).set(1.0),
+        // Only if no fault latched since the check: its 0 must stand.
+        None => share.publish_ok(),
         Some(why) => {
             metrics::gauge!(MEDIA_SHARE_OK).set(0.0);
             tracing::warn!(

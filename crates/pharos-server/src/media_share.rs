@@ -283,6 +283,15 @@ impl MediaShare {
         Ok(())
     }
 
+    /// Sets [`MEDIA_SHARE_OK`] to 1, unless the share is broken. Under the
+    /// lock a fault takes, so a fault's 0 is never overwritten.
+    pub fn publish_ok(&self) {
+        let broken = self.latch.broken.lock().unwrap_or_else(|p| p.into_inner());
+        if broken.is_none() {
+            metrics::gauge!(MEDIA_SHARE_OK).set(1.0);
+        }
+    }
+
     fn broken_cause(&self) -> Option<String> {
         self.latch
             .broken
@@ -498,6 +507,33 @@ mod tests {
         assert_eq!(*told.lock().unwrap(), 1);
         assert!(matches!(share.check().await, Err(ShareError::Broken(_))));
         assert_eq!(*told.lock().unwrap(), 1);
+    }
+
+    /// A healthy check finishing after a fault latched must not set the
+    /// gauge back to 1.
+    #[test]
+    fn publish_ok_leaves_a_latched_fault_at_zero() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let gauge = || {
+            recorder
+                .snapshotter()
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(k, ..)| k.key().name() == MEDIA_SHARE_OK)
+                .map(|(.., v)| match v {
+                    DebugValue::Gauge(g) => g.into_inner(),
+                    other => panic!("{other:?}"),
+                })
+        };
+        let share = MediaShare::new(ROOT_TIMEOUT);
+        share.publish_ok();
+        assert_eq!(gauge(), Some(1.0));
+        share.note_read_error(Path::new("/m/a"), &err(EIO));
+        share.publish_ok();
+        assert_eq!(gauge(), Some(0.0));
     }
 
     #[tokio::test]
