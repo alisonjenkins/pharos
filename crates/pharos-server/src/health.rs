@@ -22,7 +22,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub draining: bool,
     /// Why the media share cannot be read, when it cannot (B1531). Set
-    /// only by `/readyz`, which then answers 503.
+    /// only by `/readyz`. It answers 503 with it, or 200 while
+    /// `media_restart` is set (ADR-0156).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<String>,
     /// Set while the pod stays Ready through a broken share because it asked
