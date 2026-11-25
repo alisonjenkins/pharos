@@ -1987,7 +1987,109 @@ struct CacheState {
     /// success, and when. A reader waiting on that directory gives up at once
     /// instead of spending the 12 s no-progress grace on a process that is
     /// already gone (B217). Cleared when a new session is spawned there.
-    audio_session_failures: HashMap<PathBuf, std::time::Instant>,
+    audio_session_failures: HashMap<PathBuf, AudioFailure>,
+}
+
+/// An audio session that exited without success.
+#[derive(Debug, Clone)]
+struct AudioFailure {
+    at: std::time::Instant,
+    /// Set when its stderr says the SOURCE would not open: the reason
+    /// [`source_open_failure_of`] gave, and the stderr tail. A reader then
+    /// answers [`HlsCacheError::SourceUnreadable`], as the video path does,
+    /// instead of a bare "not ready" (B1532).
+    unreadable: Option<(&'static str, String)>,
+}
+
+impl AudioFailure {
+    fn now(unreadable: Option<(&'static str, String)>) -> Self {
+        Self {
+            at: std::time::Instant::now(),
+            unreadable,
+        }
+    }
+}
+
+/// Remembers that `source` would not open, so the next request refuses
+/// without spawning ffmpeg (B218). Bounded: expired entries are dropped
+/// whenever one is added, so an incident touching every file in the library
+/// does not leave the map holding every path forever.
+fn note_unreadable(state: &mut CacheState, source: &Path, reason: &'static str) {
+    state
+        .unreadable_sources
+        .retain(|_, (at, _)| at.elapsed() < HlsSegmentCache::UNREADABLE_SOURCE_MEMORY);
+    state
+        .unreadable_sources
+        .insert(source.to_path_buf(), (std::time::Instant::now(), reason));
+}
+
+/// How much of an audio encode's stderr is kept: enough for the
+/// "Error opening input" lines, which ffmpeg prints last.
+const AUDIO_STDERR_KEEP: usize = 4096;
+
+/// How a detached audio encode ended.
+enum AudioEncodeEnd {
+    Succeeded,
+    /// Exited non-zero, or its wait failed. Carries its stderr's tail.
+    Failed {
+        status: Option<std::process::ExitStatus>,
+        stderr: String,
+    },
+    SpawnFailed(std::io::Error),
+}
+
+/// Runs a detached audio encode to its end, heartbeating `marker`, and keeps
+/// the tail of its stderr so a failure can name its cause (B1532).
+async fn run_audio_encode(mut cmd: tokio::process::Command, marker: &Path) -> AudioEncodeEnd {
+    use tokio::io::AsyncReadExt;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return AudioEncodeEnd::SpawnFailed(e),
+    };
+    let reader = child.stderr.take().map(|mut pipe| {
+        tokio::spawn(async move {
+            let mut kept: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = pipe.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                kept.extend_from_slice(&buf[..n]);
+                if kept.len() > AUDIO_STDERR_KEEP {
+                    kept.drain(..kept.len() - AUDIO_STDERR_KEEP);
+                }
+            }
+            String::from_utf8_lossy(&kept).into_owned()
+        })
+    });
+    let status = wait_with_heartbeat(&mut child, marker).await;
+    let stderr = match reader {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    match status {
+        Ok(s) if s.success() => AudioEncodeEnd::Succeeded,
+        Ok(s) => AudioEncodeEnd::Failed {
+            status: Some(s),
+            stderr,
+        },
+        Err(_) => AudioEncodeEnd::Failed {
+            status: None,
+            stderr,
+        },
+    }
+}
+
+/// The last `max` characters of `s`, for a log or an error detail.
+fn last_chars(s: &str, max: usize) -> &str {
+    let s = s.trim_end();
+    match s.char_indices().rev().nth(max.saturating_sub(1)) {
+        Some((i, _)) if max > 0 => &s[i..],
+        _ => s,
+    }
 }
 
 /// One file of the demuxed audio rendition, with the session that produced it.
@@ -4908,44 +5010,43 @@ impl HlsSegmentCache {
         let spawned_at = SystemTime::now();
         // Detached: run the encode to completion, then drop the `.running`
         // marker (the from-0 session leaves `audio.m3u8` as the done-marker).
+        let source_path = source.to_path_buf();
         tokio::spawn(async move {
             let mut cmd = tokio::process::Command::new(&bin);
-            cmd.args(&args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            let failed = match cmd.spawn() {
-                Ok(mut child) => {
-                    let status = wait_with_heartbeat(&mut child, &running_marker).await;
-                    match status {
-                        Ok(s) if !s.success() => {
-                            tracing::warn!(
-                                media.id = media,
-                                ?s,
-                                "audio HLS session exited non-zero"
-                            );
-                            true
-                        }
-                        Ok(_) => {
-                            sync_session_output(&written_dir, spawned_at).await;
-                            false
-                        }
-                        Err(_) => true,
-                    }
+            cmd.args(&args);
+            let failure = match run_audio_encode(cmd, &running_marker).await {
+                AudioEncodeEnd::Succeeded => {
+                    sync_session_output(&written_dir, spawned_at).await;
+                    None
                 }
-                Err(e) => {
+                AudioEncodeEnd::Failed { status, stderr } => {
+                    let unreadable = source_open_failure_of(&stderr, &source_path, false);
+                    tracing::warn!(
+                        media.id = media,
+                        status = ?status,
+                        source_unreadable = unreadable,
+                        error = last_chars(&stderr, 400),
+                        "audio HLS session exited non-zero"
+                    );
+                    Some(unreadable.map(|reason| (reason, last_chars(&stderr, 400).to_owned())))
+                }
+                AudioEncodeEnd::SpawnFailed(e) => {
                     tracing::warn!(media.id = media, error = %e, "failed to spawn audio HLS session");
-                    true
+                    Some(None)
                 }
             };
-            if failed {
+            if let Some(unreadable) = failure {
                 // Told to the readers, not just the log: a wait on this
-                // rendition now ends at its next poll (B217).
-                failures
-                    .lock()
-                    .await
+                // rendition now ends at its next poll (B217), naming an
+                // unreadable source as such (B1532).
+                let mut state = failures.lock().await;
+                if let Some((reason, _)) = &unreadable {
+                    record_source_unreadable(reason);
+                    note_unreadable(&mut state, &source_path, reason);
+                }
+                state
                     .audio_session_failures
-                    .insert(failed_dir, std::time::Instant::now());
+                    .insert(failed_dir, AudioFailure::now(unreadable));
             }
             let _ = tokio::fs::remove_file(&running_marker).await;
         });
@@ -5665,27 +5766,33 @@ impl HlsSegmentCache {
                     "start" => if start_secs > 0.0 { "seek" } else { "from_zero" },
                 )
                 .increment(1);
+                let state = self.state.clone();
+                let source_path = source.to_path_buf();
                 tokio::spawn(async move {
                     let mut cmd = tokio::process::Command::new(&bin);
-                    cmd.args(&args)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null());
-                    match cmd.spawn() {
-                        Ok(mut child) => {
-                            if let Ok(s) = wait_with_heartbeat(&mut child, &marker).await {
-                                if s.success() {
-                                    sync_session_output(&written_dir, spawned_at).await;
-                                } else {
-                                    tracing::warn!(
-                                        media.id = media_id,
-                                        ?s,
-                                        "continuous audio encode exited non-zero"
-                                    );
-                                }
+                    cmd.args(&args);
+                    match run_audio_encode(cmd, &marker).await {
+                        AudioEncodeEnd::Succeeded => {
+                            sync_session_output(&written_dir, spawned_at).await;
+                        }
+                        AudioEncodeEnd::Failed { status, stderr } => {
+                            let unreadable = source_open_failure_of(&stderr, &source_path, false);
+                            tracing::warn!(
+                                media.id = media_id,
+                                status = ?status,
+                                source_unreadable = unreadable,
+                                error = last_chars(&stderr, 400),
+                                "continuous audio encode exited non-zero"
+                            );
+                            // The muxed segments waiting on this encode, and
+                            // the next ones asked for, refuse as the source
+                            // being unreadable (B1532).
+                            if let Some(reason) = unreadable {
+                                record_source_unreadable(reason);
+                                note_unreadable(&mut *state.lock().await, &source_path, reason);
                             }
                         }
-                        Err(e) => tracing::warn!(
+                        AudioEncodeEnd::SpawnFailed(e) => tracing::warn!(
                             media.id = media_id,
                             error = %e,
                             "failed to spawn continuous audio encode"
@@ -5706,6 +5813,13 @@ impl HlsSegmentCache {
                 return Ok(pharos_transcode::MuxedAudio {
                     start_seconds: self.probed_session_start(&file, start_secs).await,
                     ..produced
+                });
+            }
+            // The encode could not open the source: no wait helps (B1532).
+            if let Some(reason) = self.source_unreadable_recently(source).await {
+                return Err(HlsCacheError::SourceUnreadable {
+                    reason,
+                    detail: format!("continuous audio encode could not open the source ({reason})"),
                 });
             }
             // The encode finished without reaching the request: it ran out of
@@ -5810,7 +5924,11 @@ impl HlsSegmentCache {
             // The session that would write this file has already died: no
             // grace can help. Checked before the progress read so a session
             // that produced something and then died is not waited on either.
-            if self.audio_session_failed_recently(dir).await {
+            if let Some(failure) = self.audio_session_failure_recent(dir).await {
+                if let Some((reason, detail)) = failure.unreadable {
+                    record_audio_wait(AudioWaitGiveUp::SessionFailed.label());
+                    return Err(HlsCacheError::SourceUnreadable { reason, detail });
+                }
                 give_up = AudioWaitGiveUp::SessionFailed;
                 break;
             }
@@ -5905,13 +6023,14 @@ impl HlsSegmentCache {
     /// failure recorded while a rendition was unreadable (a stale NFS handle,
     /// 2026-09-04) does not outlive the condition and refuse a later, healthy
     /// session that the spawn path did not happen to clear.
-    async fn audio_session_failed_recently(&self, dir: &Path) -> bool {
+    async fn audio_session_failure_recent(&self, dir: &Path) -> Option<AudioFailure> {
         self.state
             .lock()
             .await
             .audio_session_failures
             .get(dir)
-            .is_some_and(|at| at.elapsed() < Self::AUDIO_FAILURE_MEMORY)
+            .filter(|f| f.at.elapsed() < Self::AUDIO_FAILURE_MEMORY)
+            .cloned()
     }
 
     /// How long a recorded audio-session failure short-circuits reads.
@@ -5934,16 +6053,7 @@ impl HlsSegmentCache {
     }
 
     async fn note_source_unreadable(&self, source: &Path, reason: &'static str) {
-        let mut state = self.state.lock().await;
-        // Bounded: expired entries are dropped whenever one is added, so an
-        // incident touching every file in the library does not leave the map
-        // holding every path forever.
-        state
-            .unreadable_sources
-            .retain(|_, (at, _)| at.elapsed() < Self::UNREADABLE_SOURCE_MEMORY);
-        state
-            .unreadable_sources
-            .insert(source.to_path_buf(), (std::time::Instant::now(), reason));
+        note_unreadable(&mut *self.state.lock().await, source, reason);
     }
 
     #[cfg(test)]
@@ -5952,7 +6062,7 @@ impl HlsSegmentCache {
             .lock()
             .await
             .audio_session_failures
-            .insert(dir.to_path_buf(), std::time::Instant::now());
+            .insert(dir.to_path_buf(), AudioFailure::now(None));
     }
 
     async fn touch(&self, key: SegmentIdentity) {
@@ -12953,6 +13063,76 @@ mod tests {
             started.elapsed() < std::time::Duration::from_millis(100),
             "a known-dead session must not be waited on"
         );
+    }
+
+    /// B1532 — an audio session whose source would not open makes its
+    /// reader answer `SourceUnreadable` with the reason, as the video path
+    /// does, so the server can judge the share; any other death stays
+    /// `SessionFailed`.
+    #[tokio::test]
+    async fn a_dead_audio_session_whose_source_would_not_open_says_so() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let dir = td.path().join("s");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        cache.state.lock().await.audio_session_failures.insert(
+            dir.clone(),
+            AudioFailure::now(Some((
+                "stale_handle",
+                "Error opening input: Stale file handle".into(),
+            ))),
+        );
+        let res = cache.audio_hls_file_budget(&dir, "a3.m4s", 200, 6, 6).await;
+        assert!(
+            matches!(
+                &res,
+                Err(HlsCacheError::SourceUnreadable { reason: "stale_handle", detail })
+                    if detail.contains("Stale file handle")
+            ),
+            "{:?}",
+            res.as_ref().err()
+        );
+    }
+
+    /// B1532 — an audio encode's stderr is kept, so its failure can be
+    /// classified: a source that would not open names its reason.
+    #[tokio::test]
+    async fn a_failed_audio_encode_keeps_its_stderr_for_the_cause() {
+        let td = TempDir::new().unwrap();
+        let marker = td.path().join(".running");
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args([
+            "-c",
+            "printf 'noise\\n%.0s' $(seq 1 2000) >&2; \
+             echo '[in#0 @ 0x1] Error opening input: Stale file handle' >&2; \
+             echo 'Error opening input file /media/film.mkv.' >&2; exit 1",
+        ]);
+        let AudioEncodeEnd::Failed { status, stderr } = run_audio_encode(cmd, &marker).await else {
+            panic!("the encode exited 1");
+        };
+        assert_eq!(status.and_then(|s| s.code()), Some(1));
+        assert!(stderr.len() <= AUDIO_STDERR_KEEP, "{}", stderr.len());
+        assert_eq!(
+            source_open_failure_of(&stderr, Path::new("/media/film.mkv"), false),
+            Some("stale_handle"),
+            "{}",
+            last_chars(&stderr, 200)
+        );
+
+        let mut ok = tokio::process::Command::new("true");
+        ok.arg("x");
+        assert!(matches!(
+            run_audio_encode(ok, &marker).await,
+            AudioEncodeEnd::Succeeded
+        ));
+    }
+
+    #[test]
+    fn last_chars_keeps_the_tail_on_char_boundaries() {
+        assert_eq!(last_chars("abcdef", 3), "def");
+        assert_eq!(last_chars("ab", 5), "ab");
+        assert_eq!(last_chars("héllo\n", 4), "éllo");
+        assert_eq!(last_chars("aé", 1), "é");
     }
 
     #[tokio::test]
