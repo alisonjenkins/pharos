@@ -191,6 +191,32 @@ Each request logs one `self-restart:` line with the Deployment, the outcome
 and the cause, and counts
 `pharos_media_share_restart_total{outcome="restarted"|"recently_restarted"|"paused"|"failed"}`.
 
+#### Rolling back to a chart without the self-restart
+
+Charts from before the self-restart leave `serviceAccountName` out of the
+server Deployment. Kubernetes fills a missing name back in from the old
+one, so a `helm rollback` (or Flux upgrade remediation) to such a chart
+deletes the `<release>-pharos-self-restart` ServiceAccount but leaves the
+Deployment naming it. No new server pod can start: its ReplicaSet reports
+`FailedCreate` with `serviceaccount "…-self-restart" not found` (B1533).
+Charts with V1533 always name the account, so a rollback between them is
+safe.
+
+If it happens, do one of these, then let the rollback or next upgrade run:
+
+```bash
+# Put the name back to default:
+kubectl -n <ns> patch deployment <release>-pharos --type=json \
+  -p '[{"op":"replace","path":"/spec/template/spec/serviceAccountName","value":"default"},
+       {"op":"replace","path":"/spec/template/spec/serviceAccount","value":"default"}]'
+
+# Or recreate the account so a later Helm upgrade adopts it:
+kubectl -n <ns> create serviceaccount <release>-pharos-self-restart
+kubectl -n <ns> label sa <release>-pharos-self-restart app.kubernetes.io/managed-by=Helm
+kubectl -n <ns> annotate sa <release>-pharos-self-restart \
+  meta.helm.sh/release-name=<release> meta.helm.sh/release-namespace=<ns>
+```
+
 The rollout follows the Deployment's own strategy. With `RollingUpdate`, the
 new pod is created alongside the old one where `maxSurge` allows, but the old
 pod may still go before the new one is Ready: it is NotReady, so the
