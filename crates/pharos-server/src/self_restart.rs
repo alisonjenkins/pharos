@@ -91,6 +91,9 @@ enum State {
 /// The process's restart state.
 pub struct SelfRestart {
     restarter: OnceLock<Arc<dyn Restarter>>,
+    /// The runtime `set_restarter` ran on, for a fault found off it (the
+    /// media share's listing thread).
+    runtime: OnceLock<tokio::runtime::Handle>,
     state: Mutex<State>,
     give_up_after: Duration,
 }
@@ -99,6 +102,7 @@ impl SelfRestart {
     pub fn new(give_up_after: Duration) -> Self {
         Self {
             restarter: OnceLock::new(),
+            runtime: OnceLock::new(),
             state: Mutex::new(State::Idle),
             give_up_after,
         }
@@ -115,6 +119,9 @@ impl SelfRestart {
         if self.restarter.set(restarter).is_err() {
             tracing::warn!("self-restart: a restarter was already set; keeping the first");
         }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(self.runtime.set(runtime));
+        }
     }
 
     /// Called once, when the share first breaks. Asks for the restart on
@@ -123,7 +130,10 @@ impl SelfRestart {
         let Some(restarter) = self.restarter.get().cloned() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        let Some(runtime) = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.runtime.get().cloned())
+        else {
             tracing::warn!("self-restart: no runtime to ask for the restart on");
             return;
         };
@@ -698,6 +708,19 @@ mod tests {
             assert_eq!(restart.status(), None, "{label}");
             assert_eq!(restarts(&recorder), vec![(label.to_owned(), 1)]);
         }
+    }
+
+    /// A fault found off the runtime (the share's listing thread) still asks
+    /// for the restart, on the runtime the restarter was set on.
+    #[tokio::test]
+    async fn a_fault_found_off_the_runtime_still_asks_for_the_restart() {
+        let (restart, calls) = restart_with(Ok(Outcome::Restarted), GIVE_UP_AFTER);
+        std::thread::spawn(move || restart.on_share_broken("listing /m: Input/output error"))
+            .join()
+            .unwrap();
+        settle(restart).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(restart.status(), Some("requested"));
     }
 
     #[tokio::test]
