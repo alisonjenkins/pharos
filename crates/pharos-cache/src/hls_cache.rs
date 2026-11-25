@@ -12142,7 +12142,7 @@ mod tests {
             "refused from memory; got {res:?}"
         );
         assert!(
-            !td.path().join("_audiohls").exists(),
+            !cache.root().join("_audiohls").exists(),
             "no session was opened"
         );
     }
