@@ -25,6 +25,11 @@ const DEFAULT_UP_INTERVAL_MS: u64 = 10_000;
 /// Forward buffer threshold in milliseconds below which segment download time governs down-switching.
 const DEFAULT_LOW_BUFFER_MS: u64 = 8_000;
 
+/// A down-switch by buffer must arrive this much sooner than the current rung
+/// would: a switch fetches a new init and the lower rung may need an encode
+/// first, which the recent first-byte times (`cold_ms`) cannot see.
+const MIN_BUFFER_SWITCH_SAVING_MS: u64 = 1_000;
+
 /// Initial target bandwidth in bits per second before the estimator has enough samples.
 const DEFAULT_START_BPS: u64 = 2_500_000;
 
@@ -316,7 +321,8 @@ impl Abr {
 
         if current > 0 && inputs.buffer_ms < self.config.low_buffer_ms {
             let cur_bw = self.ladder.get(current)?.bandwidth_bps;
-            if download_ms(cur_bw, inputs.segment_ms, estimate_bps) > inputs.buffer_ms {
+            let current_ms = download_ms(cur_bw, inputs.segment_ms, estimate_bps);
+            if current_ms > inputs.buffer_ms {
                 let to = self
                     .ladder
                     .get(..current)
@@ -328,12 +334,18 @@ impl Abr {
                         })
                     })
                     .unwrap_or(0);
-                self.current = Some(to);
-                return Some(Switch {
-                    from: Some(current),
-                    to,
-                    reason: Reason::Buffer,
+                let to_ms = self.ladder.get(to).map_or(0, |r| {
+                    download_ms(r.bandwidth_bps, inputs.segment_ms, estimate_bps)
                 });
+                let switch_cost_ms = inputs.cold_ms.max(MIN_BUFFER_SWITCH_SAVING_MS);
+                if current_ms.saturating_sub(to_ms) > switch_cost_ms {
+                    self.current = Some(to);
+                    return Some(Switch {
+                        from: Some(current),
+                        to,
+                        reason: Reason::Buffer,
+                    });
+                }
             }
         }
 
@@ -669,6 +681,51 @@ mod tests {
         );
     }
 
+    // B1535: right after a seek the forward buffer is empty, and the buffer rule
+    // dropped a fast link to the lowest, uncached rung, whose cold start took far
+    // longer than the top rung's download would have.
+    #[test]
+    fn an_empty_buffer_on_a_fast_link_keeps_the_rung() {
+        let mut abr = Abr::new(sample_ladder(), AbrConfig::default());
+        abr.start(0, Some(337_000_000), None);
+        assert_eq!(abr.current(), Some(3));
+        assert_eq!(
+            abr.decide(&Inputs {
+                now_ms: 4_000,
+                estimate_bps: Some(337_000_000),
+                buffer_ms: 0,
+                segment_ms: 6_000,
+                cold_ms: 60,
+                ceiling_bps: None,
+            }),
+            None
+        );
+    }
+
+    // B1535: the step down is still taken where it saves more than a switch
+    // costs, as on a link slower than the rung with an empty buffer.
+    #[test]
+    fn an_empty_buffer_on_a_slow_link_still_steps_down() {
+        let mut abr = Abr::new(sample_ladder(), AbrConfig::default());
+        abr.start(0, Some(15_000_000), None);
+        assert_eq!(abr.current(), Some(3));
+        assert_eq!(
+            abr.decide(&Inputs {
+                now_ms: 4_000,
+                estimate_bps: Some(13_000_000),
+                buffer_ms: 0,
+                segment_ms: 6_000,
+                cold_ms: 500,
+                ceiling_bps: None,
+            }),
+            Some(Switch {
+                from: Some(3),
+                to: 0,
+                reason: Reason::Buffer,
+            })
+        );
+    }
+
     #[test]
     fn decide_rules_and_guards_fire_in_order() {
         let mut abr = Abr::new(sample_ladder(), AbrConfig::default());
@@ -980,6 +1037,16 @@ mod tests {
                                 est,
                             );
                             prop_assert!(sw.to == 0 || dl_ms < step.buffer_ms);
+                            // V1535: the step down arrives sooner by more than a switch costs.
+                            let before_ms = download_ms(
+                                abr.ladder()[before].bandwidth_bps,
+                                step.segment_ms,
+                                est,
+                            );
+                            prop_assert!(
+                                before_ms.saturating_sub(dl_ms)
+                                    > step.cold_ms.max(super::MIN_BUFFER_SWITCH_SAVING_MS)
+                            );
                         }
                         Reason::Ceiling => {
                             prop_assert!(sw.to < before);
