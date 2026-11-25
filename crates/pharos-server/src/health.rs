@@ -417,6 +417,8 @@ mod tests {
         };
 
         let share = leak();
+        let root = tempfile::tempdir().unwrap();
+        share.set_roots(vec![root.path().to_owned()]);
         assert_eq!(get(share, None).await.0, 200, "a whole share is ready");
         share.mark_broken("reading /m/a: Stale file handle".into());
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
