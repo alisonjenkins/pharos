@@ -181,6 +181,16 @@ async fn readyz(
             // Not staying ready after all; the cause under `media` stays.
             snap.media_restart = None;
         }
+        // The restart may also have failed, or passed its deadline, during
+        // that await: read it once more so a stale `requesting` never
+        // answers 200.
+        if snap.media_restart.is_some() {
+            snap.media_restart = media
+                .restart
+                .filter(|r| r.keeps_ready())
+                .and_then(|r| r.status());
+            snap.ready = snap.media_restart.is_some();
+        }
         record_media(&snap, media.share);
     }
     if snap.ready {
