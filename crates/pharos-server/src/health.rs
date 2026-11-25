@@ -159,6 +159,10 @@ async fn info() -> impl Responder {
     })
 }
 
+/// A point-in-time answer: a share fault latched after the media check
+/// (during the second actor read below) shows on the next probe, not this
+/// one. Re-reading again would only move the window, and a probe runs every
+/// few seconds, so one late 200 costs nothing the next probe does not fix.
 async fn readyz(
     handle: web::Data<ReadinessHandle>,
     media: Option<web::Data<MediaReadiness>>,
