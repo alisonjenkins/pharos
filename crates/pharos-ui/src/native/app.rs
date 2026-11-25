@@ -3356,6 +3356,13 @@ impl Slot {
             Slot::Outgoing(_) => OUTGOING_ID,
         }
     }
+
+    /// Negotiates its playback again on a new connection. A song handing over
+    /// is going: a new grant for it would supersede the playing item's
+    /// session on the same device (B1536).
+    fn negotiates_on_reconnect(self) -> bool {
+        matches!(self, Slot::Current { .. })
+    }
 }
 
 type OnMedia = Box<dyn FnMut(MediaEvent)>;
@@ -6778,8 +6785,18 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // names the stream's session so a server that lost its grant in a
     // rollout keeps it rather than listing a second one (B1490).
     let owner_last_ms = Rc::clone(&last_ms);
+    // The effect keeps the slot it first saw; a song becomes Outgoing later.
+    let slot_now = use_hook(|| Rc::new(Cell::new(slot)));
+    slot_now.set(slot);
+    let renew_slot = Rc::clone(&slot_now);
     use_effect(move || {
         let gen = api_gen();
+        if !renew_slot.get().negotiates_on_reconnect() {
+            platform::info(&format!(
+                "pharos: playback grant renewal skipped item={id} slot=outgoing api_gen={gen}"
+            ));
+            return;
+        }
         let current = playing.read().clone();
         let p = match current {
             Some(Some(Ok(p))) => p,
@@ -9980,6 +9997,32 @@ fn Player(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    // B1536: a song left handing over renegotiated on every reconnect and
+    // took the device's play session from the episode playing.
+    #[test]
+    fn only_the_playing_slot_negotiates_on_reconnect() {
+        use super::{Handoff, ItemRef, Slot};
+        assert!(Slot::Current {
+            play: 2,
+            waiting: false
+        }
+        .negotiates_on_reconnect());
+        assert!(Slot::Current {
+            play: 2,
+            waiting: true
+        }
+        .negotiates_on_reconnect());
+        for ready in [false, true] {
+            let handoff = Handoff {
+                from: ItemRef::Real(7),
+                from_play: 1,
+                fade_ms: 0,
+                ready,
+            };
+            assert!(!Slot::Outgoing(handoff).negotiates_on_reconnect());
+        }
+    }
 
     /// CR review 6018104500 (app.rs:2166): a standing whose device library
     /// could not be read is not remembered as decided, so a store published
