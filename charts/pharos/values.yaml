@@ -403,6 +403,12 @@ selfHeal:
   schedule: "*/2 * * * *"
   # Long enough that a brief blip (an NFS server reboot) heals by itself.
   notReadyMinutes: 5
+  # The server asks for its own rollout restart when its media share breaks
+  # after it has read it, and stays Ready meanwhile, so browsing keeps
+  # working (ADR-0156). Gives the server pod a service account that may get
+  # and patch its own Deployment. Off: the share fails /readyz and the
+  # reaper above replaces the pod.
+  serverSelfRestart: true
   # Any image with bash, jq and kubectl.
   image: alpine/k8s:1.37.2@sha256:dcb7185e112a453aa72f426754849a97357727ef8f40168fb208c8cf59952042
   resources:
