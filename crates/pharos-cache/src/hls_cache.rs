@@ -4975,6 +4975,19 @@ impl HlsSegmentCache {
         if start_seg == 0 && tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
             return Ok(dir);
         }
+        // As the segment path does (B218, V166): a source that would not open
+        // moments ago is refused without a new session or ffmpeg, so a
+        // client's retries inside the window do not each spawn one.
+        if let Some(reason) = self.source_unreadable_recently(source).await {
+            record_source_unreadable(reason);
+            return Err(HlsCacheError::SourceUnreadable {
+                reason,
+                detail: format!(
+                    "audio session refused for {}s after the last open failure",
+                    Self::UNREADABLE_SOURCE_MEMORY.as_secs()
+                ),
+            });
+        }
         tokio::fs::create_dir_all(&session_dir).await?;
         tokio::fs::write(&running, process_marker_id()).await?;
         // A fresh session supersedes any failure recorded for this rendition.
@@ -12104,6 +12117,33 @@ mod tests {
             ),
             "refused from memory, not re-attempted; got {:?}",
             res.as_ref().err()
+        );
+    }
+
+    /// B218 for the continuous-audio route: a retry inside the memory window
+    /// opens no session (no session dir, no `.running`, no ffmpeg).
+    #[tokio::test]
+    async fn a_recently_unreadable_source_opens_no_audio_session() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
+        let source = Path::new("/media/missing.mkv");
+        cache.note_source_unreadable(source, "missing").await;
+        let res = cache
+            .ensure_audio_hls_covering(source, None, 8, None, Some(128_000), 0)
+            .await;
+        assert!(
+            matches!(
+                res,
+                Err(HlsCacheError::SourceUnreadable {
+                    reason: "missing",
+                    ..
+                })
+            ),
+            "refused from memory; got {res:?}"
+        );
+        assert!(
+            !td.path().join("_audiohls").exists(),
+            "no session was opened"
         );
     }
 
