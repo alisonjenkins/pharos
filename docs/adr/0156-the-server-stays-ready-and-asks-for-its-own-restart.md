@@ -33,8 +33,9 @@ rollout restart straight away, and it stays Ready while that is pending.
 - Media routes still answer 503 for the broken share. Everything else keeps
   working.
 - `/readyz` keeps answering 200 while all of these hold. Its body carries
-  the cause under `media` and `media_restart: requested`, and
-  `pharos_media_share_ok` stays 0.
+  the cause under `media` and `media_restart`, and `pharos_media_share_ok`
+  stays 0. `media_restart` is `requesting` while the API call is in flight,
+  then `requested` once it succeeded.
   - The fault is a broken share: a read's stale handle, lost connection or
     I/O error, or a share-level error listing a root. A slow listing is not
     a broken share, and it still fails `/readyz`.
@@ -45,8 +46,9 @@ rollout restart straight away, and it stays Ready while that is pending.
   heals the pod. That covers: no self-restart configured, the API call
   failing, a Deployment restarted in the last 10 minutes, a pod that never
   read its share, and a replacement that is not Ready within 15 minutes.
-- A share-level error while listing a root now marks the share broken for
-  the life of the process, as a failed read does.
+- With the self-restart on, a share-level error while listing a root now
+  marks the share broken for the life of the process, as a failed read
+  does. With it off, a listing error fails only that check, as before.
 - Each request counts `pharos_media_share_restart_total{outcome}`, where
   `outcome` is `restarted`, `recently_restarted` or `failed`. Each request
   also logs a `self-restart:` line naming the Deployment, the outcome and
@@ -54,16 +56,22 @@ rollout restart straight away, and it stays Ready while that is pending.
 
 ## Consequences
 
-- With `RollingUpdate` (Postgres), browsing never goes down. The old pod
+- With `RollingUpdate` (Postgres, `strategy.type: RollingUpdate`) and the
+  chart's default `maxUnavailable: 0` and `maxSurge: 1`, browsing never
+  goes down. A `maxUnavailable` above 0 or a `maxSurge` of 0 lets the
+  Deployment stop the old pod first, which brings back an outage. The old pod
   keeps serving everything but media until the new pod is Ready, and the
   Deployment then retires the old pod. Media is down from the fault until
   then, which is about one pod startup.
 - With `Recreate` (SQLite), the old pod stops as soon as the restart
   lands. All of Pharos is down for one restart, not for the reaper's
   5-minute wait first.
-- The server's pod can now patch its own Deployment. The Role cannot touch
-  any other object, and a patch can only change the pod template, which
-  the chart already owns.
+- The server's pod can now patch its own Deployment. The Role names only
+  that Deployment, so no other object can be touched. RBAC cannot limit a
+  verb to some fields, though: `patch` covers the whole Deployment (image,
+  replicas, volumes), not just the restart annotation. A server that is
+  taken over could change its own Deployment. Limiting the fields needs an
+  admission policy, which is left to the cluster's operator.
 - If the NAS is down, the new pod never sees its share whole. Its
   `/readyz` fails, so the rollout stalls and the old pod keeps serving
   browsing. After 15 minutes the old pod gives up and goes unready too, and
