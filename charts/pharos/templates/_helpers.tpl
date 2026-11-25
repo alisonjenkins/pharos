@@ -227,6 +227,16 @@ selfHeal.serverSelfRestart are both on. Names its service account.
 {{- and .Values.selfHeal.enabled .Values.selfHeal.serverSelfRestart -}}
 {{- end }}
 
+{{/*
+The self-restart service account, Role and RoleBinding name. A fullname
+longer than 50 characters is cut to 41 plus an 8-character hash of the
+whole name, so two long names sharing a prefix still differ (63 at most).
+*/}}
 {{- define "pharos.selfRestart.name" -}}
-{{- printf "%s-self-restart" (include "pharos.fullname" . | trunc 50 | trimSuffix "-") }}
+{{- $full := include "pharos.fullname" . -}}
+{{- if gt (len $full) 50 -}}
+{{- printf "%s-%s-self-restart" ($full | trunc 41 | trimSuffix "-") ($full | sha256sum | trunc 8) }}
+{{- else -}}
+{{- printf "%s-self-restart" $full }}
+{{- end }}
 {{- end }}

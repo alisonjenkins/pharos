@@ -91,6 +91,21 @@ for off in selfHeal.enabled=false selfHeal.serverSelfRestart=false; do
   fi
 done
 
+# Long names: the self-restart objects stay within 63 characters and two
+# fullnames sharing a long prefix do not collide.
+long="$(printf 'r%.0s' $(seq 1 55))"
+sa_of() {
+  helm template p "$chart" --show-only templates/self-restart.yaml --set fullnameOverride="$1" |
+    yq 'select(.kind == "ServiceAccount") | .metadata.name'
+}
+sa_a="$(sa_of "${long}-a")"
+sa_b="$(sa_of "${long}-b")"
+if [ "$sa_a" != "$sa_b" ] && [ "${#sa_a}" -le 63 ] && [ "${#sa_b}" -le 63 ]; then
+  ok "long fullnames get distinct self-restart names within 63 characters"
+else
+  fail "long fullnames give self-restart names \"$sa_a\" and \"$sa_b\""
+fi
+
 yq "$container.args[0]" <<<"$cronjob" >"$work/script.sh"
 
 ago() { date -u -d "@$(($(date +%s) - $1))" +%Y-%m-%dT%H:%M:%SZ; }
