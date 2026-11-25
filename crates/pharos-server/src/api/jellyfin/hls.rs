@@ -2649,9 +2649,14 @@ async fn vp9_audio_file(
                     started,
                 );
             }
-            return Err(error::ErrorInternalServerError(format!(
-                "audio session: {e}"
-            )));
+            // A source that would not open answers as a segment's does (503
+            // for the share, 404 otherwise), not as a blanket 500.
+            return Err(match e {
+                e @ pharos_cache::hls_cache::HlsCacheError::SourceUnreadable { .. } => {
+                    segment_cache_error(e, share_of(&item.path))
+                }
+                other => error::ErrorInternalServerError(format!("audio session: {other}")),
+            });
         }
     };
     // `ensure` returns once the session is running, not once it has written, so
