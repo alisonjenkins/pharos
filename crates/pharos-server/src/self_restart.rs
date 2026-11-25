@@ -449,6 +449,16 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Days in month `m` (1-12) of year `y`, proleptic Gregorian.
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        4 | 6 | 9 | 11 => 30,
+        2 if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) => 29,
+        2 => 28,
+        _ => 31,
+    }
+}
+
 /// Unix seconds for an RFC 3339 time such as `2026-11-24T18:00:00Z` or
 /// `2026-11-24T19:00:00+01:00` (what `kubectl rollout restart` writes);
 /// fractional seconds are ignored.
@@ -466,7 +476,12 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
     }
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
     let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+    if !(1..=12).contains(&mo)
+        || !(1..=days_in_month(y, mo)).contains(&d)
+        || h > 23
+        || mi > 59
+        || sec > 60
+    {
         return None;
     }
     let mut rest = &s[19..];
@@ -529,6 +544,8 @@ mod tests {
         assert_eq!(parse_rfc3339("2026-11-24T13:00:00-05:00"), Some(t));
         assert_eq!(parse_rfc3339("2026-11-24T18:00:00.123Z"), Some(t));
         assert_eq!(parse_rfc3339("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+        assert!(parse_rfc3339("2000-02-29T00:00:00Z").is_some());
+        assert!(parse_rfc3339("2026-12-31T00:00:00Z").is_some());
         assert_eq!(format_rfc3339(0), "1970-01-01T00:00:00Z");
         for bad in [
             "",
@@ -538,6 +555,9 @@ mod tests {
             "2026-11-24T18:00:00",
             "2026-11-24T18-00-00Z",
             "2026-11-24T18:00.00Z",
+            "2026-11-31T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
         ] {
             assert_eq!(parse_rfc3339(bad), None, "{bad}");
         }
