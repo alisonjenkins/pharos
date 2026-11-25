@@ -6559,6 +6559,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let wanted = wanted.filter(|_| reachable);
         let downloaded = downloaded_copy(id, wanted.as_deref(), signed_in);
         let offline_key = Rc::clone(&offline_key);
+        let (late_slot, late_kept) = (Rc::clone(&play_slot), Rc::clone(&kept_play));
+        let handing_over = move || !late_slot.get().negotiates_on_reconnect();
         async move {
             if let Some(kept) = keep {
                 return kept;
@@ -6637,11 +6639,28 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         asked,
                     )
                 });
+                // The song may have turned Outgoing while the details loaded.
+                if handing_over() {
+                    return Ok(None);
+                }
                 let caps = negotiation_capabilities(detail.item.kind, auto);
                 let (decision, grant) = api.play(&info, id, &version, &caps, asked).await?;
-                Ok::<_, ClientError>((detail, version, decision, grant, asked, track_map))
+                if handing_over() {
+                    return Ok(None);
+                }
+                Ok::<_, ClientError>(Some((detail, version, decision, grant, asked, track_map)))
             }
             .await;
+            let result = match result {
+                Ok(None) => {
+                    platform::info(&format!(
+                        "pharos: playback negotiation dropped item={id} slot=outgoing api_gen={grant_gen}"
+                    ));
+                    return late_kept.borrow().clone();
+                }
+                Ok(Some(started)) => Ok(started),
+                Err(e) => Err(e),
+            };
             Some(
                 settle_start(ctx.machine, result).and_then(|(detail, version, decision, grant, asked, track_map)| {
                     let verdict = resolve_engine(
