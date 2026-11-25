@@ -44,13 +44,13 @@ rollout restart straight away, and it stays Ready while that is pending.
     ago.
 - In every other case `/readyz` fails as ADR-0155 decided, and the reaper
   heals the pod. That covers: no self-restart configured, the API call
-  failing, a Deployment restarted in the last 10 minutes, a pod that never
+  failing, a Deployment restarted in the last 10 minutes or paused, a pod that never
   read its share, and a replacement that is not Ready within 15 minutes.
 - With the self-restart on, a share-level error while listing a root now
   marks the share broken for the life of the process, as a failed read
   does. With it off, a listing error fails only that check, as before.
 - Each request counts `pharos_media_share_restart_total{outcome}`, where
-  `outcome` is `restarted`, `recently_restarted` or `failed`. Each request
+  `outcome` is `restarted`, `recently_restarted`, `paused` or `failed`. Each request
   also logs a `self-restart:` line naming the Deployment, the outcome and
   the cause.
 
