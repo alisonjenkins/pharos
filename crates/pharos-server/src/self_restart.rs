@@ -33,6 +33,11 @@ pub const GIVE_UP_AFTER: Duration = Duration::from_secs(15 * 60);
 /// may be the one whose share broke, and another restart would only churn.
 pub const RECENT_RESTART: Duration = Duration::from_secs(10 * 60);
 
+/// How far in the future a `restartedAt` may be and still count as recent:
+/// node clocks drift a little. One further ahead is ignored, so a badly
+/// skewed writer cannot hold off restarts for hours.
+pub const CLOCK_SKEW: Duration = Duration::from_secs(60);
+
 /// The annotation `kubectl rollout restart` and the reaper both set.
 const RESTARTED_AT: &str = "kubectl.kubernetes.io/restartedAt";
 
@@ -343,11 +348,8 @@ impl KubeRestarter {
             .and_then(serde_json::Value::as_str)
             .and_then(parse_rfc3339)
         {
-            let age = now.saturating_sub(at);
-            if age < RECENT_RESTART.as_secs() as i64 {
-                return Ok(Attempt::Done(Outcome::RecentlyRestarted {
-                    age_secs: u64::try_from(age.max(0)).unwrap_or(0),
-                }));
+            if let Some(age_secs) = recent_age(now, at) {
+                return Ok(Attempt::Done(Outcome::RecentlyRestarted { age_secs }));
             }
         }
         let version = deployment
@@ -380,6 +382,21 @@ impl KubeRestarter {
         }
         Ok(Attempt::Done(Outcome::Restarted))
     }
+}
+
+/// How long ago `at` was, when it counts as a recent restart: within
+/// [`RECENT_RESTART`] before `now`, or at most [`CLOCK_SKEW`] after it. A
+/// time further ahead is a skewed clock and is ignored.
+fn recent_age(now: i64, at: i64) -> Option<u64> {
+    let age = now.saturating_sub(at);
+    if age < -(CLOCK_SKEW.as_secs() as i64) {
+        tracing::warn!(
+            ahead_secs = -age,
+            "self-restart: restartedAt is in the future beyond the clock skew allowed; ignoring it"
+        );
+        return None;
+    }
+    (age < RECENT_RESTART.as_secs() as i64).then(|| u64::try_from(age.max(0)).unwrap_or(0))
 }
 
 /// What one read and patch came to.
@@ -834,6 +851,17 @@ mod tests {
             "{outcome:?}"
         );
         assert!(seen.seen.lock().unwrap().patches.is_empty());
+    }
+
+    /// A restartedAt a little ahead (clock drift) is recent; one far ahead
+    /// is ignored rather than holding off restarts until then.
+    #[test]
+    fn a_future_restarted_at_counts_only_within_the_clock_skew() {
+        let now = 1_795_543_200;
+        assert_eq!(recent_age(now, now - 30), Some(30));
+        assert_eq!(recent_age(now, now + 30), Some(0));
+        assert_eq!(recent_age(now, now + 3 * 3600), None);
+        assert_eq!(recent_age(now, now - 11 * 60), None);
     }
 
     #[actix_web::test]
