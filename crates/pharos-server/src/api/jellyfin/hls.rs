@@ -1710,6 +1710,22 @@ async fn serve_segment(
 /// always was. Splitting them matters during a storage incident — on
 /// 2026-09-04 every one of a viewer's init retries was a 500 that read as an
 /// encoder fault (B218).
+/// The HTTP answer for an audio-rendition file the cache could not read: a
+/// session that could not open its source is answered as a segment would be
+/// ([`segment_cache_error`], B1532), anything else is the 404 it always was,
+/// carrying the cache's give-up reason.
+fn audio_read_error(
+    e: pharos_cache::hls_cache::HlsCacheError,
+    share: Option<&crate::media_share::MediaShare>,
+) -> actix_web::Error {
+    match e {
+        e @ pharos_cache::hls_cache::HlsCacheError::SourceUnreadable { .. } => {
+            segment_cache_error(e, share)
+        }
+        other => error::ErrorNotFound(other.to_string()),
+    }
+}
+
 /// The media share an item's bytes come off, or `None` for a URL-backed
 /// source ffmpeg reads over the network.
 fn share_of(item_path: &std::path::Path) -> Option<&'static crate::media_share::MediaShare> {
@@ -2664,7 +2680,7 @@ async fn vp9_audio_file(
         // "audio segment not ready" made the Film AH stall
         // indistinguishable from a request past the end of the media, and
         // reconstructing which of the three budgets expired took a code read.
-        .map_err(|e| error::ErrorNotFound(e.to_string()))?;
+        .map_err(|e| audio_read_error(e, share_of(&item.path)))?;
     let mut bytes = file.bytes;
     // B186 / V141 — the shared init must describe the timeline the fragments
     // are served on, and the fragments below are re-anchored ABSOLUTELY. A seek
@@ -2747,7 +2763,7 @@ async fn vp9_audio_file(
         let init = cache
             .audio_hls_file(&dir, "init.mp4")
             .await
-            .map_err(|e| error::ErrorNotFound(format!("audio init: {e}")))?;
+            .map_err(|e| audio_read_error(e, share_of(&item.path)))?;
         let Some(timescale) = fmp4::init_timescale(&init.bytes) else {
             return Err(error::ErrorInternalServerError(
                 "audio rendition init carries no media timescale — cannot anchor \
@@ -5601,6 +5617,42 @@ mod tests {
             assert_eq!(status(e), StatusCode::SERVICE_UNAVAILABLE, "{reason}");
             assert!(share.is_broken(), "{reason}");
         }
+    }
+
+    /// B1532: an audio session whose source would not open answers as a
+    /// segment does, judging the share; any other audio miss stays a 404.
+    #[actix_web::test]
+    async fn an_audio_read_of_an_unopenable_source_judges_the_share() {
+        use pharos_cache::hls_cache::{AudioWaitGiveUp, HlsCacheError};
+        let share: &'static crate::media_share::MediaShare = Box::leak(Box::new(
+            crate::media_share::MediaShare::new(crate::media_share::ROOT_TIMEOUT),
+        ));
+        let not_ready = audio_read_error(
+            HlsCacheError::AudioNotReady {
+                name: "a3.m4s".into(),
+                reason: AudioWaitGiveUp::SessionFailed,
+                waited_ms: 0,
+                last_progress: None,
+            },
+            Some(share),
+        );
+        assert_eq!(
+            not_ready.as_response_error().status_code(),
+            actix_web::http::StatusCode::NOT_FOUND
+        );
+        assert!(!share.is_broken());
+        let stale = audio_read_error(
+            HlsCacheError::SourceUnreadable {
+                reason: "stale_handle",
+                detail: "Error opening input: Stale file handle".into(),
+            },
+            Some(share),
+        );
+        assert_eq!(
+            stale.as_response_error().status_code(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(share.is_broken());
     }
 
     /// A URL-backed source that fails with the same errors says nothing
