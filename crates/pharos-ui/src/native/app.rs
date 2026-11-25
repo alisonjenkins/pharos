@@ -6497,11 +6497,28 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let retry_key = Rc::clone(&offline_key);
     let renegotiations = use_hook(|| Rc::new(Cell::new(0u32)));
     let renegotiated = Rc::clone(&renegotiations);
+    // Hooks keep the slot they first saw; a song becomes Outgoing later.
+    let slot_now = use_hook(|| Rc::new(Cell::new(slot)));
+    slot_now.set(slot);
+    let play_slot = Rc::clone(&slot_now);
+    // What the playback last settled on, which a song handing over keeps.
+    let settled = use_hook(|| Rc::new(RefCell::new(None)));
+    let kept_play = Rc::clone(&settled);
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
         let grant_gen = *api_gen.peek();
-        negotiated_at.set(grant_gen);
+        // A song handing over never negotiates again: its grant would
+        // supersede the playing item's session on the device (B1536).
+        let keep = (!play_slot.get().negotiates_on_reconnect()).then(|| {
+            platform::info(&format!(
+                "pharos: playback negotiation skipped item={id} slot=outgoing api_gen={grant_gen}"
+            ));
+            kept_play.borrow().clone()
+        });
+        if keep.is_none() {
+            negotiated_at.set(grant_gen);
+        }
         let resume_from = Rc::clone(&resume_from);
         let notify = Rc::clone(&gap_notify);
         let picks_in_primary = Rc::clone(&carry_flag);
@@ -6517,6 +6534,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         // screen then remembers it until the player has a position.
         let previous = queue.is_some_and(|QueueCtx(q)| q.peek().plays_from_start(id));
         let pressed = api.is_some()
+            && keep.is_none()
             && start_over.is_some_and(|StartOver(mut asked)| {
                 let hit = *asked.peek() == Some(id);
                 if hit {
@@ -6542,6 +6560,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let downloaded = downloaded_copy(id, wanted.as_deref(), signed_in);
         let offline_key = Rc::clone(&offline_key);
         async move {
+            if let Some(kept) = keep {
+                return kept;
+            }
             if let Some((copy, user, store)) = downloaded {
                 let resume = resume_from.get();
                 // Stable across a reconnect's re-render, fresh after a
@@ -6720,6 +6741,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             )
         }
     });
+    use_effect(move || {
+        if let Some(out) = playing.read().clone() {
+            settled.replace(out);
+        }
+    });
     // What plays after this video: the video queue's first, unless a group
     // decides what plays (V853).
     let video_next = use_memo(move || {
@@ -6785,9 +6811,6 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // names the stream's session so a server that lost its grant in a
     // rollout keeps it rather than listing a second one (B1490).
     let owner_last_ms = Rc::clone(&last_ms);
-    // The effect keeps the slot it first saw; a song becomes Outgoing later.
-    let slot_now = use_hook(|| Rc::new(Cell::new(slot)));
-    slot_now.set(slot);
     let renew_slot = Rc::clone(&slot_now);
     use_effect(move || {
         let gen = api_gen();
