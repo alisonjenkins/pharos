@@ -82,7 +82,10 @@ else
 fi
 for off in selfHeal.enabled=false selfHeal.serverSelfRestart=false; do
   plain="$(helm template p "$chart" --show-only templates/deployment.yaml --set "$off")"
-  if [ "$(yq "$spec.serviceAccountName" <<<"$plain")" = "null" ] &&
+  # Named, not left out: a dropped name is filled back in from the
+  # deprecated serviceAccount field, so the pod would keep naming the
+  # self-restart account this render deletes (B1533).
+  if [ "$(yq "$spec.serviceAccountName" <<<"$plain")" = "default" ] &&
     [ -z "$(env_of PHAROS_SELF_RESTART_DEPLOYMENT "$plain")" ] &&
     [ -z "$(helm template p "$chart" --show-only templates/self-restart.yaml --set "$off" 2>/dev/null || true)" ]; then
     ok "with $off the server gets no self-restart"

@@ -37,8 +37,15 @@ spec:
         {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- /* Always named, never left out (B1533): a pod spec that drops
+      serviceAccountName keeps the old name, because the API server fills it
+      back in from the deprecated serviceAccount field. Turning the
+      self-restart off, or rolling back past it, would then leave the pod
+      naming a service account the release just deleted, and no pod starts. */}}
       {{- if eq (include "pharos.selfRestart.enabled" .) "true" }}
       serviceAccountName: {{ include "pharos.selfRestart.name" . }}
+      {{- else }}
+      serviceAccountName: default
       {{- end }}
       {{- with .Values.pullSecrets }}
       imagePullSecrets:
