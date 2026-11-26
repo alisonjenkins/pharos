@@ -2568,7 +2568,14 @@ async fn vp9_audio_playlist(
             Some(128_000),
         )
         .await
-        .map_err(|e| error::ErrorInternalServerError(format!("audio session: {e}")))?;
+        // A source that would not open answers as a segment's does (503 for
+        // a broken or absent share, 404 otherwise), not as a blanket 500.
+        .map_err(|e| match e {
+            e @ pharos_cache::hls_cache::HlsCacheError::SourceUnreadable { .. } => {
+                segment_cache_error(e, share_of(&item.path))
+            }
+            other => error::ErrorInternalServerError(format!("audio session: {other}")),
+        })?;
     // B103 — take duration through `load_hls_item`, which falls back to a live
     // ffprobe when the persisted probe lacks it. The old `unwrap_or(0.0)` had
     // NO fallback, so a row missing `duration_ms` collapsed the whole audio
