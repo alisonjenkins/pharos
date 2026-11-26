@@ -272,6 +272,13 @@ impl MediaShare {
         self.absent.load(Ordering::Acquire)
     }
 
+    /// Whether a media read that failed for `reason` (an
+    /// [`unreadable_reason`]) is the share's absence: a missing file while
+    /// no root holds an entry. Such a read answers 503, not 404 (V1538).
+    pub fn explains_missing(&self, reason: &str) -> bool {
+        reason == "missing" && self.is_absent()
+    }
+
     /// `Ok` while no read found the share broken, every root lists, and
     /// some root holds an entry.
     pub async fn check(&self) -> Result<(), ShareError> {

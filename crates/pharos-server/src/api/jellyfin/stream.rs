@@ -1361,19 +1361,34 @@ pub(crate) async fn open_named_file(
 /// missing, this pod just cannot reach it. It also marks the share broken,
 /// so `/readyz` fails and the pod is replaced with a fresh mount (B1531).
 fn source_unreadable(item: &MediaItem, e: &std::io::Error) -> actix_web::Error {
+    source_unreadable_on(crate::media_share::MediaShare::global(), item, e)
+}
+
+/// [`source_unreadable`] against `share`. A missing file while the share is
+/// absent (no media root holds an entry) is the share's, not the file's: a
+/// 503 too, though nothing is latched (V1538).
+fn source_unreadable_on(
+    share: &crate::media_share::MediaShare,
+    item: &MediaItem,
+    e: &std::io::Error,
+) -> actix_web::Error {
     let reason = crate::media_share::unreadable_reason(e);
-    let share_broken = crate::media_share::MediaShare::global().note_read_error(&item.path, e);
+    let share_broken = share.note_read_error(&item.path, e);
+    let share_absent = !share_broken && share.explains_missing(reason);
     tracing::warn!(
         media.id = item.id,
         path = %item.path.display(),
         reason,
         share_broken,
+        share_absent,
         error = %e,
         "media source is catalogued but unreadable on disk"
     );
     metrics::counter!("pharos_source_unreadable_total", "reason" => reason).increment(1);
     if share_broken {
         error::ErrorServiceUnavailable("media share unreadable")
+    } else if share_absent {
+        error::ErrorServiceUnavailable("media share absent")
     } else {
         error::ErrorNotFound("media source unreadable")
     }
@@ -1545,6 +1560,34 @@ mod tests {
             "a vanished source must be countable apart from an unknown id; \
              rendered:\n{rendered}"
         );
+    }
+
+    /// B1538: a missing file while the share is absent is a 503 that
+    /// latches nothing, still counted as `missing`.
+    #[actix_web::test]
+    async fn a_missing_file_on_an_absent_share_is_a_503() {
+        let share = crate::media_share::MediaShare::new(crate::media_share::ROOT_TIMEOUT);
+        let root = tempfile::tempdir().unwrap();
+        share.set_roots(vec![root.path().to_owned()]);
+        assert!(share.check().await.is_err());
+        let item = MediaItem {
+            id: 4244,
+            path: "/mnt/media/absent.mkv".into(),
+            ..Default::default()
+        };
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let err = source_unreadable_on(&share, &item, &missing);
+        assert_eq!(
+            err.as_response_error().status_code(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!err.to_string().contains("/mnt/media"), "{err}");
+        assert!(!share.is_broken());
+
+        std::fs::write(root.path().join("a.mkv"), b"x").unwrap();
+        assert!(share.check().await.is_ok());
+        let err = source_unreadable_on(&share, &item, &missing);
+        assert_eq!(err.as_response_error().status_code(), StatusCode::NOT_FOUND);
     }
 
     /// A stale handle is not a missing file: the client gets a 503, the
