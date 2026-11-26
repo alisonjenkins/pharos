@@ -1,6 +1,6 @@
 # ADR-0156: The server stays Ready and asks for its own restart when its media share breaks
 
-- **Status:** Accepted. Supersedes ADR-0155 in part: the server no longer goes unready as its first answer to a broken share.
+- **Status:** Accepted. Supersedes ADR-0155 in part: the server no longer goes unready as its first answer to a broken share. Superseded in part by ADR-0158: no 15-minute give-up, no seen-whole condition, and a recent restart waits instead of going unready.
 - **Date:** 2026-11-24T18:30:00Z
 - **Deciders:** Alison Jenkins
 
