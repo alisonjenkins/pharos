@@ -887,6 +887,10 @@ impl<P: Prober> FsScanner<P> {
         } = walk(root.to_path_buf(), self.extensions.clone())
             .instrument(tracing::info_span!("scan.walk"))
             .await?;
+        // B1538 — a root that walks to no media file at all is far likelier an
+        // export serving its bare mountpoint than a library emptied by hand;
+        // the sweep's fraction guard skips small roots, so keep them here.
+        let walked_nothing = paths.is_empty();
         // A course's lessons are neither a show to split nor copies of one
         // another: two modules can each hold an `Introduction` (ADR-0126).
         let (lessons, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
@@ -1481,7 +1485,7 @@ impl<P: Prober> FsScanner<P> {
         // A fold is final only on the pass whose sweep removes the copy's row;
         // folding on a pass that keeps the row would repeat the merge next
         // pass and re-mark watched what a viewer since marked unwatched.
-        if !cancelled && walk_errors == 0 {
+        if !cancelled && walk_errors == 0 && !walked_nothing {
             self.settle_series_identity(store, series_plan.as_ref(), &root_prefix)
                 .instrument(tracing::info_span!("scan.series_identity"))
                 .await;
@@ -1497,6 +1501,13 @@ impl<P: Prober> FsScanner<P> {
         }
         let swept = if cancelled {
             tracing::info!(scan_id, "scan cancelled mid-run; skipping deletion sweep");
+            Vec::new()
+        } else if walked_nothing {
+            tracing::warn!(
+                scan_id,
+                root = %root.display(),
+                "walk found no media file under the root; skipping deletion sweep (an empty root reads as an absent share, not a deleted library)",
+            );
             Vec::new()
         } else if walk_errors == 0 {
             store
@@ -8828,6 +8839,9 @@ mod tests {
     async fn a_scan_never_sweeps_a_url_backed_row() {
         let root = TempDir::new().unwrap();
         write_file(root.path(), "local.mkv", b"local").await;
+        // A file that stays, so the rescan's walk is not empty (B1538 keeps
+        // every row of a root that walks to nothing).
+        write_file(root.path(), "stays.mkv", b"stays").await;
 
         let prober = FakeProber::default();
         let s = FsScanner::new(prober.clone());
@@ -8849,7 +8863,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(store.list().await.unwrap().len(), 2);
+        assert_eq!(store.list().await.unwrap().len(), 3);
 
         // A full, CLEAN rescan — walk_errors == 0, so the sweep really runs.
         // (If it were skipped the test would pass for the wrong reason, which
@@ -8897,6 +8911,29 @@ mod tests {
             store.get(remote_id).await.is_ok(),
             "while the correctly-placed row is still there"
         );
+    }
+
+    /// B1538 — a root that walks to no media file keeps every row: an export
+    /// whose disks are gone serves an empty mountpoint, and the store's
+    /// fraction guard (B98) does not cover a root under 100 items.
+    #[tokio::test]
+    async fn a_root_that_walks_to_nothing_keeps_its_rows() {
+        let root = TempDir::new().unwrap();
+        write_file(root.path(), "a.mkv", b"a").await;
+        write_file(root.path(), "b.mkv", b"b").await;
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        s.scan_into(root.path(), &store).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 2);
+
+        for name in ["a.mkv", "b.mkv"] {
+            tokio::fs::remove_file(root.path().join(name))
+                .await
+                .unwrap();
+        }
+        let outcome = s.scan_into(root.path(), &store).await.unwrap();
+        assert!(outcome.removed.is_empty(), "{:?}", outcome.removed);
+        assert_eq!(store.list().await.unwrap().len(), 2, "rows kept");
     }
 
     #[tokio::test]
