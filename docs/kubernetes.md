@@ -144,7 +144,7 @@ So the chart splits the work:
 | Aligner `GET /readyz` | Stats the media root and reads one entry, on its own thread with a 2 s limit. Answers 503 with the error when either fails. |
 | Aligner readiness probe | Points at `/readyz`. Liveness stays on `/healthz`, because a restart would not help. |
 | Server `GET /readyz` | Lists each media root on its own thread with a 2 s limit. From the first media read that hits a stale handle, lost connection or I/O error, the share counts as broken until the pod is replaced, and the cause shows under `media`. A missing or refused library folder does not fail it, so one deleted folder cannot take the whole server out of its Service. |
-| Server self-restart | When the share breaks in a pod that has read it, the server rolls out its own Deployment straight away and stays Ready (`media_restart: requested`), so browsing keeps working while only media answers 503. It falls back to failing `/readyz` for the reaper when it cannot do that (see below). |
+| Server self-restart | When the share breaks, the server rolls out its own Deployment straight away and stays Ready (`media_restart: requested`) until the new pod is Ready, so browsing keeps working while only media answers 503. It falls back to failing `/readyz` for the reaper only when it cannot ask for the restart (see below). |
 | Server media routes | A file the share cannot read answers 503, not 404: the file is not missing, this pod cannot reach it. |
 | `selfHeal` CronJob | Every 2 minutes, finds this release's Deployments labelled `pharos.io/self-heal=true` whose pod has been NotReady for `selfHeal.notReadyMinutes` (default 5) after starting, and rolls each one out again, as `kubectl rollout restart` does. The new pod mounts the share afresh. |
 
@@ -203,9 +203,10 @@ missing. The server calls the share absent (B1538):
 - It logs `media share absent` once when this starts and
   `media share back` once a root holds entries again.
 
-The library scan does not delete items while this lasts: its sweep guard
-skips a pass that would remove more than a quarter of a root (and at
-least 100 items).
+The library scan does not delete items while this lasts. A root that
+walks to no media file at all keeps every row, and the sweep guard also
+skips any pass that would remove more than a quarter of a root (once that
+is at least 100 items).
 
 Each request logs one `self-restart:` line with the Deployment, the outcome
 and the cause, and counts
