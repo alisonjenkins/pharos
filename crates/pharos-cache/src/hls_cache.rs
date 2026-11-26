@@ -4465,6 +4465,32 @@ impl HlsSegmentCache {
         sync_file(&tmp)
             .await
             .map_err(|e| counted("publish_sync", e.into()))?;
+        // What the segment was SUPPOSED to contain, and what ffmpeg says it
+        // did (see the frame-deficit check below).
+        let expected_frames = opts.window.expected_frames();
+        let produced_frames = reported.map(|(f, _)| f);
+        let transcode_ms = started.elapsed().as_millis();
+        // The facts the miss line below carries, made DURABLE beside the bytes
+        // they describe (T122). Written BEFORE the rename (B1539): a reader
+        // that finds the segment must also find whether it is a filler, or it
+        // serves a filler `immutable`. The line is the signal while it is
+        // fresh; this is the signal once the segment outlives it, which is the
+        // case that matters when a cached file turns out to be bad days later.
+        let device = timing.as_ref().map(|t| t.device.to_string());
+        write_provenance(
+            &path,
+            SegmentProvenance {
+                device: device.as_deref(),
+                generation: generation(),
+                transcode_ms: transcode_ms as u64,
+                encode_ms: timing.as_ref().map(|t| t.encode_ms),
+                queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
+                produced_frames,
+                expected_frames,
+                filler: is_filler,
+            },
+        )
+        .await;
         // Raised BEFORE the rename, not after: a flag set afterwards leaves the
         // window it exists to close. Setting it early can only cost a
         // cancellation that was about to become unsafe anyway — the encode is
@@ -4476,7 +4502,6 @@ impl HlsSegmentCache {
         if let Some(parent) = path.parent() {
             sync_dir(parent).await;
         }
-        let transcode_ms = started.elapsed().as_millis();
         record_segment_outcome(
             if is_filler {
                 SegmentOutcome::Filler
@@ -4569,8 +4594,6 @@ impl HlsSegmentCache {
         // its duration — at 6 s that is 600 ms, ~14 frames, a plainly visible
         // stutter that reads as a healthy segment. These fields make the
         // difference queryable instead of invisible.
-        let expected_frames = opts.window.expected_frames();
-        let produced_frames = reported.map(|(f, _)| f);
         let frame_deficit = match (expected_frames, produced_frames) {
             // Only meaningful when this segment actually encodes video.
             (Some(want), Some(got)) if opts.video.is_some() => Some(want as i64 - got as i64),
@@ -4601,25 +4624,6 @@ impl HlsSegmentCache {
             produced_secs = reported.map(|(_, s)| s),
             "hls segment transcoded (cache miss)"
         );
-        // The same facts the line above carries, made DURABLE beside the bytes
-        // they describe (T122). The line is the signal while it is fresh; this
-        // is the signal once the segment outlives it, which is the case that
-        // matters when a cached file turns out to be bad days later.
-        let device = timing.as_ref().map(|t| t.device.to_string());
-        write_provenance(
-            &path,
-            SegmentProvenance {
-                device: device.as_deref(),
-                generation: generation(),
-                transcode_ms: transcode_ms as u64,
-                encode_ms: timing.as_ref().map(|t| t.encode_ms),
-                queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
-                produced_frames,
-                expected_frames,
-                filler: is_filler,
-            },
-        )
-        .await;
         // A segment short by even ONE frame is a visible hitch at its boundary,
         // and it is cached — so it replays identically on every later view.
         // Counted (bounded label: whether the source rate was known at all) and
