@@ -3147,16 +3147,17 @@ impl HlsSegmentCache {
 
     /// B1539/V1540 — take a cached filler older than
     /// [`FILLER_RETRY_AFTER_SECS`] out of service so the read re-encodes it from
-    /// the source. Never fails the request, like the defect path.
+    /// the source. Never fails the request, like the defect path. `false` when
+    /// the file was already replaced since it was read, so the caller looks again.
     async fn retire_stale_filler(
         &self,
         key: SegmentIdentity,
         path: &Path,
         read: &std::fs::Metadata,
         age_secs: u64,
-    ) {
+    ) -> bool {
         let Some(kept) = self.take_out_of_service(key, path, read).await else {
-            return;
+            return false;
         };
         metrics::counter!("pharos_segment_filler_retry_total").increment(1);
         tracing::info!(
@@ -3168,6 +3169,7 @@ impl HlsSegmentCache {
             kept,
             "cached filler segment is older than the retry interval; taken out of service and re-encoding from source (B1539)"
         );
+        true
     }
 
     /// Move a cached segment (and its provenance sidecar) into the quarantine
@@ -3503,47 +3505,58 @@ impl HlsSegmentCache {
         // there?" and carries the mtime the hit line reports as `age_secs`, so
         // the added observability costs no extra stat.
         let hit_started = std::time::Instant::now();
-        if let Ok(meta) = tokio::fs::metadata(&path).await {
-            match tokio::fs::read(&path).await {
-                Ok(b) => match segment_defect(&b, opts.container) {
-                    // Fall through and encode it again.
-                    Some(defect) => {
-                        self.quarantine_defective_segment(key, &path, &meta, defect)
-                            .await;
-                    }
-                    None => {
-                        // B1539/V1540 — a filler is only trusted for
-                        // `FILLER_RETRY_AFTER_SECS`; an older one is taken out
-                        // of service and the read falls through to a fresh
-                        // encode of the source.
-                        let filler = filler_provenance(&path).await;
-                        let stale_age = filler
-                            .as_ref()
-                            .and_then(|p| filler_age_secs(&meta, p))
-                            .filter(|age| filler_is_stale(Some(*age)));
-                        if let Some(age) = stale_age {
-                            self.retire_stale_filler(key, &path, &meta, age).await;
-                        } else {
-                            self.touch(key).await;
-                            record_cache_hit(
-                                media_id,
-                                seg_index,
-                                b.len(),
-                                opts,
-                                class,
-                                CacheHitPath::Fast,
-                                hit_started.elapsed().as_millis() as u64,
-                                cached_age_secs(&meta),
-                            );
-                            self.note_client_playhead(class, stream, seg_index);
-                            return Ok((b, SegmentServed::Hit, filler.is_some()));
+        // Two looks at most: the second only when retiring a stale filler found
+        // the file already replaced by a concurrent request (B1539).
+        for _look in 0..2 {
+            if let Ok(meta) = tokio::fs::metadata(&path).await {
+                match tokio::fs::read(&path).await {
+                    Ok(b) => match segment_defect(&b, opts.container) {
+                        // Fall through and encode it again.
+                        Some(defect) => {
+                            self.quarantine_defective_segment(key, &path, &meta, defect)
+                                .await;
                         }
+                        None => {
+                            // B1539/V1540 — a filler is only trusted for
+                            // `FILLER_RETRY_AFTER_SECS`; an older one is taken out
+                            // of service and the read falls through to a fresh
+                            // encode of the source.
+                            let filler = filler_provenance(&path).await;
+                            let stale_age = filler
+                                .as_ref()
+                                .and_then(|p| filler_age_secs(&meta, p))
+                                .filter(|age| filler_is_stale(Some(*age)));
+                            if let Some(age) = stale_age {
+                                if !self.retire_stale_filler(key, &path, &meta, age).await {
+                                    // B1539 — another request already replaced
+                                    // this file (most likely with its own fresh
+                                    // encode): look again rather than starting a
+                                    // second re-encode inside the interval.
+                                    continue;
+                                }
+                            } else {
+                                self.touch(key).await;
+                                record_cache_hit(
+                                    media_id,
+                                    seg_index,
+                                    b.len(),
+                                    opts,
+                                    class,
+                                    CacheHitPath::Fast,
+                                    hit_started.elapsed().as_millis() as u64,
+                                    cached_age_secs(&meta),
+                                );
+                                self.note_client_playhead(class, stream, seg_index);
+                                return Ok((b, SegmentServed::Hit, filler.is_some()));
+                            }
+                        }
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
                     }
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
+                    Err(e) => return Err(e.into()),
                 }
-                Err(e) => return Err(e.into()),
             }
+            break;
         }
 
         // A source that could not be opened moments ago cannot be opened now:
