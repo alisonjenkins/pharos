@@ -160,7 +160,7 @@ selfHeal:
 
 ### The server restarts itself
 
-The server does not wait for the reaper (ADR-0156). Its pod runs as the
+The server does not wait for the reaper (ADR-0156, ADR-0158). Its pod runs as the
 service account `<fullname>-self-restart`, whose Role may only `get`
 and `patch` the server's own Deployment. On the first share fault, the
 server sets that Deployment's `kubectl.kubernetes.io/restartedAt`, and
@@ -170,8 +170,9 @@ server sets that Deployment's `kubectl.kubernetes.io/restartedAt`, and
   pod serves everything but media until the new pod is Ready. Browsing
   never goes down as long as `strategy.rollingUpdate.maxUnavailable` is 0
   and `maxSurge` is above 0, the chart's defaults. Other values let the
-  Deployment stop the old pod first. The new pod must also be Ready within
-  15 minutes; past that the old pod goes unready too (see below).
+  Deployment stop the old pod first. The old pod stays Ready however long
+  the new one takes, so a new pod that cannot mount the share (the storage
+  host down) leaves browsing up, not the site down.
 - With `Recreate` (SQLite), the old pod stops as soon as the restart lands,
   so Pharos is down for one restart instead of the reaper's wait.
 
@@ -183,9 +184,28 @@ unready until someone restarts it:
 
 - `serverSelfRestart` is off, or the server runs outside Kubernetes;
 - the API call fails, for example when the Role is missing;
-- the Deployment was restarted in the last 10 minutes, or is paused;
-- the pod never saw its share whole;
-- no new pod replaced it within 15 minutes.
+- the Deployment is paused.
+
+A Deployment restarted in the last 10 minutes is not restarted again at
+once. The pod stays Ready (`media_restart: waiting`) and asks again when
+the 10 minutes are up.
+
+### An empty share
+
+When the storage host loses its disks, it can keep exporting the bare,
+empty mountpoint. Every media root then lists with no entries, or is
+missing. The server calls the share absent (B1538):
+
+- `/readyz` stays 200, with `the media share is absent` under `media`.
+- `pharos_media_share_ok` is 0.
+- Each video or song answers 503 `media share absent`, not 404.
+- Nothing restarts, because a fresh mount would be just as empty.
+- It logs `media share absent` once when this starts and
+  `media share back` once a root holds entries again.
+
+The library scan does not delete items while this lasts: its sweep guard
+skips a pass that would remove more than a quarter of a root (and at
+least 100 items).
 
 Each request logs one `self-restart:` line with the Deployment, the outcome
 and the cause, and counts
