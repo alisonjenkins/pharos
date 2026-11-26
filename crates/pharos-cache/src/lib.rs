@@ -26,7 +26,8 @@ pub mod trickplay_cache;
 
 pub use hls_cache::{
     compose_generation, generation, install_placement_fingerprint, AudioDropReport,
-    AudioRenditionFile, HlsSegmentCache, KnownSourceEnd, SourceEndHint, HLS_GEN_VERSION,
+    AudioRenditionFile, HlsSegmentCache, KnownSourceEnd, SegmentKind, SourceEndHint,
+    HLS_GEN_VERSION,
 };
 pub use image_cache::{encode_width, EncodeLookup, Encoded, EncodedFormat, ImageCache, ImageRole};
 pub use single_flight::KeyedLocks;

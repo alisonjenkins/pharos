@@ -21,7 +21,7 @@ use crate::{
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
 use futures_util::FutureExt;
-use pharos_cache::HlsSegmentCache;
+use pharos_cache::{HlsSegmentCache, SegmentKind};
 use pharos_core::{PlaySessionId, Prober};
 use pharos_scanner::FfmpegProber;
 use pharos_transcode::scheduler::{JobClass, PlayheadSeed, StreamKey};
@@ -1591,11 +1591,16 @@ async fn serve_segment(
         .and_then(|v| v.to_str().ok())
     {
         if inm.split(',').any(|t| t.trim() == etag) {
+            // Answered before the cache is read, so the segment's kind is not
+            // known here: a 304 refreshes the client's stored freshness, and
+            // `immutable` would pin an unconfirmed segment (B1539) for a year.
+            // The short lifetime costs a real segment one revalidation per
+            // interval, which is this same cheap 304.
             return Ok(HttpResponse::NotModified()
                 .insert_header((actix_web::http::header::ETAG, etag.as_str()))
                 .insert_header((
                     actix_web::http::header::CACHE_CONTROL,
-                    "private, max-age=31536000, immutable",
+                    segment_cache_control(SegmentKind::Unconfirmed),
                 ))
                 .finish());
         }
@@ -1622,7 +1627,7 @@ async fn serve_segment(
             .map(StreamKey::of)
             .unwrap_or(StreamKey::NONE);
         let waited = std::time::Instant::now();
-        let (bytes, served, filler) = cache
+        let (bytes, served, kind) = cache
             .segment_bytes_keyed_served(
                 id_num,
                 seg,
@@ -1643,7 +1648,7 @@ async fn serve_segment(
             .insert_header((actix_web::http::header::ETAG, etag.as_str()))
             .insert_header((
                 actix_web::http::header::CACHE_CONTROL,
-                segment_cache_control(filler),
+                segment_cache_control(kind),
             ))
             .body(bytes));
     }
@@ -1702,15 +1707,22 @@ async fn serve_segment(
         .streaming(stream.into_stream()))
 }
 
-/// `Cache-Control` for a media segment body. A synthesized filler (B1539/V1540)
-/// is `no-store`: the cache re-encodes it from the source once it is older than
-/// `FILLER_RETRY_AFTER_SECS`, and a client holding it `immutable` for a year
-/// would keep the black bytes after the server had healed.
-fn segment_cache_control(filler: bool) -> &'static str {
-    if filler {
-        "no-store"
-    } else {
-        "private, max-age=31536000, immutable"
+/// `Cache-Control` for a media segment body (B1539/V1540).
+///
+/// - `Real`: immutable for a year; the bytes never change for this ETag.
+/// - `Filler`: `no-store`. The cache re-encodes it from the source once it is
+///   older than `FILLER_RETRY_AFTER_SECS`, and a client holding it `immutable`
+///   for a year would keep the black bytes after the server had healed.
+/// - `Unconfirmed`: five minutes. The cache could not confirm what these bytes
+///   are: the segment predates provenance records, or the reader lost a race
+///   with a retirement that moved the record. It may be a filler, so it must
+///   never be pinned without confirmation, but a short life keeps a one-off
+///   race from costing a refetch on every request.
+fn segment_cache_control(kind: SegmentKind) -> &'static str {
+    match kind {
+        SegmentKind::Real => "private, max-age=31536000, immutable",
+        SegmentKind::Filler => "no-store",
+        SegmentKind::Unconfirmed => "private, max-age=300",
     }
 }
 
@@ -3149,7 +3161,7 @@ async fn vp9_segment(
         q.play_session_id.as_deref(),
     )
     .await;
-    let (raw, filler) = vp9_segment_raw(
+    let (raw, kind) = vp9_segment_raw(
         &state,
         &req,
         &item,
@@ -3186,7 +3198,7 @@ async fn vp9_segment(
         .content_type(Container::Fmp4.content_type())
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            segment_cache_control(filler),
+            segment_cache_control(kind),
         ))
         .body(processed.media))
 }
@@ -3463,7 +3475,7 @@ async fn h264cmaf_segment_for(
         q.play_session_id.as_deref(),
     )
     .await;
-    let (raw, filler) = vp9_segment_raw(
+    let (raw, kind) = vp9_segment_raw(
         &state,
         &req,
         &item,
@@ -3479,7 +3491,7 @@ async fn h264cmaf_segment_for(
         .content_type(Container::Fmp4.content_type())
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            segment_cache_control(filler),
+            segment_cache_control(kind),
         ))
         .body(processed.media))
 }
@@ -5408,14 +5420,14 @@ async fn vp9_segment_raw(
     seg: u32,
     opts: &SegmentOpts,
     play_session_id: Option<&str>,
-) -> Result<(Vec<u8>, bool), actix_web::Error> {
+) -> Result<(Vec<u8>, SegmentKind), actix_web::Error> {
     // 008 — resolved once, so the cache key and the ffmpeg input agree.
     let source = transcode_source(state, &item.path, opts.video.is_some()).await?;
     vp9_segment_raw_from(state, req, item, seg, opts, play_session_id, source).await
 }
 
 /// [`vp9_segment_raw`] for a caller that already resolved the source locator.
-/// The `bool` is whether the bytes are a synthesized filler (B1539).
+/// The [`SegmentKind`] says what the cache knows about the bytes (B1539).
 async fn vp9_segment_raw_from(
     state: &AppState,
     req: &HttpRequest,
@@ -5424,13 +5436,13 @@ async fn vp9_segment_raw_from(
     opts: &SegmentOpts,
     play_session_id: Option<&str>,
     source: std::path::PathBuf,
-) -> Result<(Vec<u8>, bool), actix_web::Error> {
+) -> Result<(Vec<u8>, SegmentKind), actix_web::Error> {
     if let Some(cache) = state.hls.as_ref() {
         let stream = play_session_id
             .map(StreamKey::of)
             .unwrap_or(StreamKey::NONE);
         let waited = std::time::Instant::now();
-        let (bytes, served, filler) = cache
+        let (bytes, served, kind) = cache
             .segment_bytes_keyed_served(
                 item.id,
                 seg,
@@ -5446,7 +5458,7 @@ async fn vp9_segment_raw_from(
             .await
             .map_err(|e| segment_cache_error(e, share_of(&item.path)))?;
         crate::media_telemetry::note_segment_served(req, seg, served, waited.elapsed());
-        return Ok((bytes, filler));
+        return Ok((bytes, kind));
     }
     // Same as the h264 live fallback: no cache means no continuous audio
     // encode, so a muxed rung cannot be served here. (VP9 rungs are
@@ -5462,7 +5474,7 @@ async fn vp9_segment_raw_from(
             .submit_live(source.clone(), resolved.to_transcode_options())
             .await
         {
-            Ok(stream) => return Ok((collect_stream(stream).await?, false)),
+            Ok(stream) => return Ok((collect_stream(stream).await?, SegmentKind::Real)),
             Err(e) => {
                 tracing::warn!(error = %e, "vp9 scheduler live transcode failed; inline fallback")
             }
@@ -5473,7 +5485,10 @@ async fn vp9_segment_raw_from(
         .transcode(&source, &resolved.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
-    Ok((collect_stream(stream.into_stream()).await?, false))
+    Ok((
+        collect_stream(stream.into_stream()).await?,
+        SegmentKind::Real,
+    ))
 }
 
 /// Drain a byte stream (`io::Result<Bytes>` items) into a single `Vec<u8>`.
@@ -5594,12 +5609,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    /// B1539/V1540 — a filler segment must not be held by the client for a year
-    /// while the cache re-encodes it from source once it is stale.
+    /// B1539/V1540 — only a confirmed-real segment is immutable: a filler is
+    /// re-encoded from source once stale, and an unconfirmed one may be a filler.
     #[actix_web::test]
-    async fn a_filler_segment_is_never_served_immutable() {
-        assert_eq!(segment_cache_control(true), "no-store");
-        assert!(segment_cache_control(false).contains("immutable"));
+    async fn only_a_real_segment_is_served_immutable() {
+        assert!(segment_cache_control(SegmentKind::Real).contains("immutable"));
+        assert_eq!(segment_cache_control(SegmentKind::Filler), "no-store");
+        let unconfirmed = segment_cache_control(SegmentKind::Unconfirmed);
+        assert!(!unconfirmed.contains("immutable"));
+        assert!(unconfirmed.contains("max-age=300"));
     }
 
     /// A source on the share that ffmpeg could not open for a share fault is
