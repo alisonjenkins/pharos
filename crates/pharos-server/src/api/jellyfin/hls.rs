@@ -1746,12 +1746,23 @@ fn segment_cache_error(
             // marked for a fresh mount (B1531). The same error from a
             // URL-backed source is the network's, and says nothing about the
             // mount.
+            // A missing file while no media root holds an entry is the
+            // share's absence: 503 too, with nothing latched (V1538).
+            let share_absent = share.is_some_and(|s| s.explains_missing(reason));
             let share = share.filter(|_| crate::media_share::is_share_reason(reason));
             let share_broken = share.is_some();
-            tracing::warn!(reason, share_broken, error = %detail, "hls: media source unreadable");
+            tracing::warn!(
+                reason,
+                share_broken,
+                share_absent,
+                error = %detail,
+                "hls: media source unreadable"
+            );
             if let Some(share) = share {
                 share.mark_broken(format!("hls source open ({reason}): {detail}"));
                 error::ErrorServiceUnavailable("media share unreadable")
+            } else if share_absent {
+                error::ErrorServiceUnavailable("media share absent")
             } else {
                 error::ErrorNotFound("media source unreadable")
             }
@@ -5622,6 +5633,44 @@ mod tests {
             assert_eq!(status(e), StatusCode::SERVICE_UNAVAILABLE, "{reason}");
             assert!(share.is_broken(), "{reason}");
         }
+    }
+
+    /// B1538: a missing source while the share is absent (no media root
+    /// holds an entry) is a 503 that latches nothing; once a root has
+    /// entries again a missing source is the 404 it was.
+    #[actix_web::test]
+    async fn a_missing_source_on_an_absent_share_is_a_503() {
+        use actix_web::http::StatusCode;
+        use pharos_cache::hls_cache::HlsCacheError;
+        let missing = || HlsCacheError::SourceUnreadable {
+            reason: "missing",
+            detail: "Error opening input: No such file or directory".into(),
+        };
+        let status = |e: actix_web::Error| e.as_response_error().status_code();
+        let share: &'static crate::media_share::MediaShare = Box::leak(Box::new(
+            crate::media_share::MediaShare::new(crate::media_share::ROOT_TIMEOUT),
+        ));
+        let root = tempfile::tempdir().unwrap();
+        share.set_roots(vec![root.path().to_owned()]);
+        assert!(share.check().await.is_err());
+        assert!(share.is_absent());
+        assert_eq!(
+            status(segment_cache_error(missing(), Some(share))),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!share.is_broken(), "an absent share is not latched");
+        assert_eq!(
+            status(segment_cache_error(missing(), None)),
+            StatusCode::NOT_FOUND,
+            "a URL-backed source says nothing about the share"
+        );
+
+        std::fs::write(root.path().join("a.mkv"), b"x").unwrap();
+        assert!(share.check().await.is_ok());
+        assert_eq!(
+            status(segment_cache_error(missing(), Some(share))),
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// B1532: an audio session whose source would not open answers as a
