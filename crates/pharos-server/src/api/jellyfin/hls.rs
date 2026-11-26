@@ -1590,17 +1590,20 @@ async fn serve_segment(
         .get(actix_web::http::header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
     {
-        if inm.split(',').any(|t| t.trim() == etag) {
-            // Answered before the cache is read, so the segment's kind is not
-            // known here: a 304 refreshes the client's stored freshness, and
-            // `immutable` would pin an unconfirmed segment (B1539) for a year.
-            // The short lifetime costs a real segment one revalidation per
-            // interval, which is this same cheap 304.
+        if if_none_match_is_real(inm, &etag) {
+            // Answered before the cache is read, which is safe only because the
+            // matched ETag is the Real-form one: only a confirmed-real segment
+            // is ever given it (B1539), and a real segment's bytes do not
+            // change. A filler or unconfirmed copy carries no ETag, so it can
+            // never be answered 304 here after the cache re-encoded it.
             return Ok(HttpResponse::NotModified()
-                .insert_header((actix_web::http::header::ETAG, etag.as_str()))
+                .insert_header((
+                    actix_web::http::header::ETAG,
+                    real_segment_etag(&etag).as_str(),
+                ))
                 .insert_header((
                     actix_web::http::header::CACHE_CONTROL,
-                    segment_cache_control(SegmentKind::Unconfirmed),
+                    segment_cache_control(SegmentKind::Real),
                 ))
                 .finish());
         }
@@ -1643,14 +1646,12 @@ async fn serve_segment(
             .await
             .map_err(|e| segment_cache_error(e, share_of(&item.path)))?;
         crate::media_telemetry::note_segment_served(&req, seg, served, waited.elapsed());
-        return Ok(HttpResponse::Ok()
-            .content_type(opts.container.content_type())
-            .insert_header((actix_web::http::header::ETAG, etag.as_str()))
-            .insert_header((
-                actix_web::http::header::CACHE_CONTROL,
-                segment_cache_control(kind),
-            ))
-            .body(bytes));
+        return Ok(segment_ok_response(
+            opts.container.content_type(),
+            &etag,
+            kind,
+            bytes,
+        ));
     }
 
     // Uncached live path. Prefer the load-balancing scheduler (spreads
@@ -1677,7 +1678,10 @@ async fn serve_segment(
             Ok(stream) => {
                 return Ok(HttpResponse::Ok()
                     .content_type(opts.container.content_type())
-                    .insert_header((actix_web::http::header::ETAG, etag.as_str()))
+                    .insert_header((
+                        actix_web::http::header::ETAG,
+                        real_segment_etag(&etag).as_str(),
+                    ))
                     .insert_header((
                         actix_web::http::header::CACHE_CONTROL,
                         "private, max-age=31536000, immutable",
@@ -1699,12 +1703,56 @@ async fn serve_segment(
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     Ok(HttpResponse::Ok()
         .content_type(opts.container.content_type())
-        .insert_header((actix_web::http::header::ETAG, etag.as_str()))
+        .insert_header((
+            actix_web::http::header::ETAG,
+            real_segment_etag(&etag).as_str(),
+        ))
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
             "private, max-age=31536000, immutable",
         ))
         .streaming(stream.into_stream()))
+}
+
+/// The ETag a confirmed-real segment is served under: the key's ETag with a
+/// `-real` marker. The marker scopes the validator to the kind, so an ETag
+/// from before kinds existed (which was handed out for fillers too) never
+/// matches and cannot buy a 304 (B1539).
+fn real_segment_etag(key_etag: &str) -> String {
+    match key_etag.strip_suffix('"') {
+        Some(head) => format!("{head}-real\""),
+        None => format!("{key_etag}-real"),
+    }
+}
+
+/// Whether an `If-None-Match` names the Real-form ETag of this segment key.
+fn if_none_match_is_real(inm: &str, key_etag: &str) -> bool {
+    let real = real_segment_etag(key_etag);
+    inm.split(',').any(|t| t.trim() == real)
+}
+
+/// The 200 answer for a cached segment. Only a `Real` segment carries an ETag:
+/// the ETag comes from the segment's key, not its bytes, so one sent with a
+/// filler or an unconfirmed segment would keep matching after the cache
+/// re-encoded it (B1539).
+fn segment_ok_response(
+    content_type: &str,
+    key_etag: &str,
+    kind: SegmentKind,
+    bytes: Vec<u8>,
+) -> HttpResponse {
+    let mut ok = HttpResponse::Ok();
+    ok.content_type(content_type).insert_header((
+        actix_web::http::header::CACHE_CONTROL,
+        segment_cache_control(kind),
+    ));
+    if kind == SegmentKind::Real {
+        ok.insert_header((
+            actix_web::http::header::ETAG,
+            real_segment_etag(key_etag).as_str(),
+        ));
+    }
+    ok.body(bytes)
 }
 
 /// `Cache-Control` for a media segment body (B1539/V1540).
@@ -5611,6 +5659,32 @@ mod tests {
 
     /// B1539/V1540 — only a confirmed-real segment is immutable: a filler is
     /// re-encoded from source once stale, and an unconfirmed one may be a filler.
+    /// B1539 — only a Real answer carries an ETag, and it is the kind-scoped
+    /// one; an `If-None-Match` with the old-form or any other ETag is not a 304.
+    #[actix_web::test]
+    async fn only_a_real_segment_carries_an_etag_and_only_it_is_revalidated() {
+        use actix_web::http::header::ETAG;
+        let key = "W/\"seg-0123456789abcdef\"";
+        for kind in [SegmentKind::Filler, SegmentKind::Unconfirmed] {
+            let r = segment_ok_response("video/mp4", key, kind, vec![1]);
+            assert!(
+                r.headers().get(ETAG).is_none(),
+                "{kind:?} must have no ETag"
+            );
+        }
+        let r = segment_ok_response("video/mp4", key, SegmentKind::Real, vec![1]);
+        let real = r.headers().get(ETAG).unwrap().to_str().unwrap().to_string();
+        assert_eq!(real, "W/\"seg-0123456789abcdef-real\"");
+        assert!(if_none_match_is_real(&real, key));
+        assert!(if_none_match_is_real(&format!("\"x\", {real}"), key));
+        assert!(
+            !if_none_match_is_real(key, key),
+            "the old-form ETag must not be answered 304"
+        );
+        assert!(!if_none_match_is_real("W/\"seg-other-real\"", key));
+        assert!(!if_none_match_is_real("*", key));
+    }
+
     #[actix_web::test]
     async fn only_a_real_segment_is_served_immutable() {
         assert!(segment_cache_control(SegmentKind::Real).contains("immutable"));
