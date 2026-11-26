@@ -209,13 +209,13 @@ async fn readyz(
 }
 
 /// Whether a pod whose share check failed with `e` stays Ready, and why: the
-/// share is broken (not merely slow), the pod has read it before, and it
-/// asked for its own restart less than its give-up time ago (ADR-0156).
+/// share is broken (not merely slow) and the pod's own restart is asked for,
+/// in flight, or waiting out a recent one (ADR-0156, ADR-0158).
 fn stays_ready(media: &MediaReadiness, e: &crate::media_share::ShareError) -> Option<&'static str> {
     use crate::media_share::ShareError;
     let restart = media.restart?;
     let broken = matches!(e, ShareError::Broken(_) | ShareError::Io { .. });
-    if broken && media.share.was_whole() && restart.keeps_ready() {
+    if broken && restart.keeps_ready() {
         restart.status()
     } else {
         None
@@ -247,7 +247,6 @@ mod tests {
 
     use super::*;
     use actix_web::{test, App};
-    use std::time::Duration;
 
     fn build_app(
         handle: ReadinessHandle,
@@ -446,12 +445,13 @@ mod tests {
         assert!(!txt.contains("media_restart"), "got: {txt}");
     }
 
-    /// ADR-0156: a pod that read its share and asked for its own restart
-    /// stays Ready through the fault, saying so, with the gauge still 0. A
-    /// pod that never read its share, or whose request gave up, does not.
+    /// ADR-0156: a pod that asked for its own restart stays Ready through
+    /// the fault, saying so, with the gauge still 0. ADR-0158: so does a pod
+    /// that never saw its share whole; one with no restart asked for does
+    /// not.
     #[actix_web::test]
     async fn readyz_stays_up_while_an_asked_for_restart_is_pending() {
-        use crate::self_restart::{SelfRestart, GIVE_UP_AFTER};
+        use crate::self_restart::SelfRestart;
         let leak = || -> &'static crate::media_share::MediaShare {
             Box::leak(Box::new(crate::media_share::MediaShare::new(
                 crate::media_share::ROOT_TIMEOUT,
@@ -476,22 +476,23 @@ mod tests {
         share.mark_broken("reading /m/a: Stale file handle".into());
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let guard = metrics::set_default_local_recorder(&recorder);
-        let (status, body) = get(share, Some(SelfRestart::requested(GIVE_UP_AFTER))).await;
+        let (status, body) = get(share, Some(SelfRestart::requested())).await;
         assert_eq!(status, 200, "{body}");
         assert!(body.contains("\"media_restart\":\"requested\""), "{body}");
         assert!(body.contains("Stale file handle"), "{body}");
         assert_eq!(media_ok(&recorder), Some(0.0));
         drop(guard);
 
-        let (status, _) = get(share, Some(SelfRestart::requested(Duration::ZERO))).await;
-        assert_eq!(status, 503, "past the give-up time the reaper takes over");
+        let idle: &'static SelfRestart = Box::leak(Box::new(SelfRestart::new()));
+        let (status, _) = get(share, Some(idle)).await;
+        assert_eq!(status, 503, "no restart asked for: the reaper takes over");
 
         let never_read = leak();
         never_read.mark_broken("reading /m/a: Stale file handle".into());
-        let (status, _) = get(never_read, Some(SelfRestart::requested(GIVE_UP_AFTER))).await;
+        let (status, body) = get(never_read, Some(SelfRestart::requested())).await;
         assert_eq!(
-            status, 503,
-            "a pod that never read its share has nothing to keep up"
+            status, 200,
+            "a pod that never saw its share whole still serves browsing: {body}"
         );
     }
 }

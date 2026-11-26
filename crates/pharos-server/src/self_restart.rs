@@ -1,5 +1,6 @@
 //! The server asks Kubernetes for its own rollout restart when its media
-//! share breaks, and stays Ready meanwhile (ADR-0156, V1532).
+//! share breaks, and stays Ready meanwhile (ADR-0156, ADR-0158, V1532,
+//! V1539).
 //!
 //! Without this, a broken share fails `/readyz` (B1531) and the whole of
 //! Pharos is out of its Service until the `selfHeal` reaper notices and a
@@ -9,33 +10,34 @@
 //! `kubectl.kubernetes.io/restartedAt`, as `kubectl rollout restart` does, and
 //! `/readyz` keeps passing. Under `RollingUpdate` with `maxUnavailable: 0`
 //! and `maxSurge` above 0 (the chart's defaults), the old pod serves
-//! everything but media until the new one is Ready, provided that happens
-//! within [`GIVE_UP_AFTER`]. Other rollout settings let the Deployment stop
-//! the old pod first. Under `Recreate` the outage is one restart, not the
-//! reaper's wait.
+//! everything but media until the new one is Ready, however long that takes:
+//! a new pod that cannot mount the share (the storage host down) leaves the
+//! old one serving browsing, never nothing (ADR-0158). Other rollout settings
+//! let the Deployment stop the old pod first. Under `Recreate` the outage is
+//! one restart, not the reaper's wait.
 //!
-//! Readiness still fails, as before, whenever this cannot help: no
-//! restarter configured, the request failed or was skipped (a recent
-//! restart, a paused Deployment), the pod never read the share, or
-//! [`GIVE_UP_AFTER`] passed without the pod being replaced. The reaper,
-//! when `selfHeal` is on, then heals it as it did.
+//! A Deployment restarted in the last [`RECENT_RESTART`] is not restarted
+//! again at once; the pod stays Ready and asks again once that window has
+//! passed. Readiness still fails, as before, only when this cannot help: no
+//! restarter configured, or the request failed or found the Deployment
+//! paused. The reaper, when `selfHeal` is on, then heals it as it did.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// `pharos_media_share_restart_total{outcome}`: one per restart request.
 pub const RESTART_TOTAL: &str = "pharos_media_share_restart_total";
 
-/// How long a pod that asked for its restart stays Ready while not replaced.
-/// Past it, `/readyz` fails so the reaper takes over (a rollout that cannot
-/// start a Ready pod would otherwise leave this one up for good).
-pub const GIVE_UP_AFTER: Duration = Duration::from_secs(15 * 60);
-
-/// A Deployment restarted this recently is not restarted again: its new pod
-/// may be the one whose share broke, and another restart would only churn.
+/// A Deployment restarted this recently is not restarted again yet: its new
+/// pod may be the one whose share broke, and another restart would only churn.
 pub const RECENT_RESTART: Duration = Duration::from_secs(10 * 60);
+
+/// How long past the end of [`RECENT_RESTART`] a waiting pod asks again, so
+/// a little clock drift between it and the writer of `restartedAt` does not
+/// find the restart still recent.
+pub const RETRY_MARGIN: Duration = Duration::from_secs(5);
 
 /// How far in the future a `restartedAt` may be and still count as recent:
 /// node clocks drift a little. One further ahead is ignored, so a badly
@@ -83,8 +85,10 @@ pub trait Restarter: Send + Sync {
 #[derive(Debug, Clone)]
 enum State {
     Idle,
-    Requesting(Instant),
-    Requested(Instant),
+    Requesting,
+    Requested,
+    /// The Deployment was restarted recently; asking again once that passes.
+    Waiting,
     NotRestarted,
 }
 
@@ -95,22 +99,26 @@ pub struct SelfRestart {
     /// media share's listing thread).
     runtime: OnceLock<tokio::runtime::Handle>,
     state: Mutex<State>,
-    give_up_after: Duration,
+}
+
+impl Default for SelfRestart {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SelfRestart {
-    pub fn new(give_up_after: Duration) -> Self {
+    pub fn new() -> Self {
         Self {
             restarter: OnceLock::new(),
             runtime: OnceLock::new(),
             state: Mutex::new(State::Idle),
-            give_up_after,
         }
     }
 
     pub fn global() -> &'static Self {
         static RESTART: OnceLock<SelfRestart> = OnceLock::new();
-        RESTART.get_or_init(|| Self::new(GIVE_UP_AFTER))
+        RESTART.get_or_init(Self::new)
     }
 
     /// Registers how to restart; without one the share fault fails
@@ -142,27 +150,36 @@ impl SelfRestart {
             if !matches!(*state, State::Idle) {
                 return;
             }
-            *state = State::Requesting(Instant::now());
+            *state = State::Requesting;
         }
         let target = restarter.target();
         let cause = cause.to_owned();
         runtime.spawn(async move {
-            let result = restarter.restart().await;
-            self.finish(&target, &cause, result);
+            loop {
+                let result = restarter.restart().await;
+                let Some(wait) = self.finish(&target, &cause, result) else {
+                    break;
+                };
+                tokio::time::sleep(wait).await;
+                *self.lock() = State::Requesting;
+            }
         });
     }
 
-    fn finish(&self, target: &str, cause: &str, result: Result<Outcome, String>) {
+    /// Records what a request did; `Some` is how long to wait before asking
+    /// again.
+    fn finish(
+        &self,
+        target: &str,
+        cause: &str,
+        result: Result<Outcome, String>,
+    ) -> Option<Duration> {
         let label = result.as_ref().map_or(FAILED, Outcome::label);
         metrics::counter!(RESTART_TOTAL, "outcome" => label).increment(1);
         let mut state = self.lock();
         match result {
             Ok(Outcome::Restarted) => {
-                let since = match *state {
-                    State::Requesting(at) => at,
-                    _ => Instant::now(),
-                };
-                *state = State::Requested(since);
+                *state = State::Requested;
                 tracing::warn!(
                     target_deployment = target,
                     outcome = label,
@@ -171,14 +188,19 @@ impl SelfRestart {
                 );
             }
             Ok(Outcome::RecentlyRestarted { age_secs }) => {
-                *state = State::NotRestarted;
+                *state = State::Waiting;
+                let wait = RECENT_RESTART
+                    .saturating_sub(Duration::from_secs(age_secs))
+                    .saturating_add(RETRY_MARGIN);
                 tracing::warn!(
                     target_deployment = target,
                     outcome = label,
                     age_secs,
+                    retry_in_secs = wait.as_secs(),
                     cause,
-                    "self-restart: deployment restarted recently; going unready for the reaper"
+                    "self-restart: deployment restarted recently; staying ready and asking again after"
                 );
+                return Some(wait);
             }
             Ok(Outcome::Paused) => {
                 *state = State::NotRestarted;
@@ -200,31 +222,33 @@ impl SelfRestart {
                 );
             }
         }
+        None
     }
 
     /// Whether a share fault may leave this pod Ready: a restart was asked
-    /// for (or is being asked for) less than `give_up_after` ago.
+    /// for, is being asked for, or will be asked for once a recent one is
+    /// old enough. With no deadline: a replacement that cannot start (its
+    /// share will not mount) must not take this pod's browsing down with it
+    /// (ADR-0158).
     pub fn keeps_ready(&self) -> bool {
-        match *self.lock() {
-            State::Requesting(at) | State::Requested(at) => at.elapsed() < self.give_up_after,
-            State::Idle | State::NotRestarted => false,
-        }
+        self.status().is_some()
     }
 
     /// The `/readyz` note for a share fault this pod stays Ready through.
     pub fn status(&self) -> Option<&'static str> {
         match *self.lock() {
-            State::Requesting(_) => Some("requesting"),
-            State::Requested(_) => Some("requested"),
+            State::Requesting => Some("requesting"),
+            State::Requested => Some("requested"),
+            State::Waiting => Some("waiting"),
             State::Idle | State::NotRestarted => None,
         }
     }
 
     /// A state that has already asked for its restart (other modules' tests).
     #[cfg(test)]
-    pub(crate) fn requested(give_up_after: Duration) -> &'static Self {
-        let restart = Box::leak(Box::new(Self::new(give_up_after)));
-        *restart.lock() = State::Requested(Instant::now());
+    pub(crate) fn requested() -> &'static Self {
+        let restart = Box::leak(Box::new(Self::new()));
+        *restart.lock() = State::Requested;
         restart
     }
 
@@ -648,9 +672,8 @@ mod tests {
 
     fn restart_with(
         outcome: Result<Outcome, String>,
-        give_up_after: Duration,
     ) -> (&'static SelfRestart, Arc<std::sync::atomic::AtomicUsize>) {
-        let restart: &'static SelfRestart = Box::leak(Box::new(SelfRestart::new(give_up_after)));
+        let restart: &'static SelfRestart = Box::leak(Box::new(SelfRestart::new()));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         restart.set_restarter(Arc::new(Fake {
             outcome,
@@ -695,7 +718,7 @@ mod tests {
     async fn a_restart_is_asked_for_once_and_keeps_the_pod_ready() {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let (restart, calls) = restart_with(Ok(Outcome::Restarted), GIVE_UP_AFTER);
+        let (restart, calls) = restart_with(Ok(Outcome::Restarted));
         assert!(!restart.keeps_ready(), "nothing asked for yet");
         restart.on_share_broken("reading /m/a: Stale file handle");
         restart.on_share_broken("reading /m/b: Stale file handle");
@@ -707,18 +730,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_or_skipped_restart_leaves_the_pod_to_go_unready() {
+    async fn a_failed_or_paused_restart_leaves_the_pod_to_go_unready() {
         for (outcome, label) in [
             (Err("PATCH deployment: 403 Forbidden".to_owned()), "failed"),
-            (
-                Ok(Outcome::RecentlyRestarted { age_secs: 30 }),
-                "recently_restarted",
-            ),
             (Ok(Outcome::Paused), "paused"),
         ] {
             let recorder = metrics_util::debugging::DebuggingRecorder::new();
             let _guard = metrics::set_default_local_recorder(&recorder);
-            let (restart, _) = restart_with(outcome, GIVE_UP_AFTER);
+            let (restart, _) = restart_with(outcome);
             restart.on_share_broken("reading /m/a: Input/output error");
             settle(restart).await;
             assert!(!restart.keeps_ready(), "{label}");
@@ -731,7 +750,7 @@ mod tests {
     /// for the restart, on the runtime the restarter was set on.
     #[tokio::test]
     async fn a_fault_found_off_the_runtime_still_asks_for_the_restart() {
-        let (restart, calls) = restart_with(Ok(Outcome::Restarted), GIVE_UP_AFTER);
+        let (restart, calls) = restart_with(Ok(Outcome::Restarted));
         std::thread::spawn(move || restart.on_share_broken("listing /m: Input/output error"))
             .join()
             .unwrap();
@@ -740,17 +759,52 @@ mod tests {
         assert_eq!(restart.status(), Some("requested"));
     }
 
-    #[tokio::test]
-    async fn a_pod_not_replaced_in_time_stops_staying_ready() {
-        let (restart, _) = restart_with(Ok(Outcome::Restarted), Duration::ZERO);
+    /// ADR-0158: a pod whose replacement never becomes Ready (its share will
+    /// not mount) stays Ready however long that takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_pod_not_yet_replaced_stays_ready_with_no_deadline() {
+        let (restart, _) = restart_with(Ok(Outcome::Restarted));
         restart.on_share_broken("reading /m/a: Stale file handle");
         settle(restart).await;
-        assert!(!restart.keeps_ready());
+        tokio::time::advance(Duration::from_secs(24 * 3600)).await;
+        assert!(restart.keeps_ready());
+        assert_eq!(restart.status(), Some("requested"));
+    }
+
+    /// ADR-0158: a Deployment restarted recently is left alone for now, but
+    /// the pod stays Ready (`waiting`) and asks again once the window has
+    /// passed, rather than going unready and taking browsing down.
+    #[tokio::test(start_paused = true)]
+    async fn a_recent_restart_keeps_the_pod_ready_and_asks_again_after_it() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (restart, calls) = restart_with(Ok(Outcome::RecentlyRestarted { age_secs: 60 }));
+        restart.on_share_broken("reading /m/a: Stale file handle");
+        settle(restart).await;
+        assert!(restart.keeps_ready());
+        assert_eq!(restart.status(), Some("waiting"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let wait = RECENT_RESTART - Duration::from_secs(60) + RETRY_MARGIN;
+        tokio::time::sleep(wait - Duration::from_secs(1)).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "not before the window has passed"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        settle(restart).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(restart.keeps_ready());
+        assert_eq!(
+            restarts(&recorder),
+            vec![("recently_restarted".to_owned(), 2)]
+        );
     }
 
     #[tokio::test]
     async fn without_a_restarter_nothing_is_asked_for() {
-        let restart: &'static SelfRestart = Box::leak(Box::new(SelfRestart::new(GIVE_UP_AFTER)));
+        let restart: &'static SelfRestart = Box::leak(Box::new(SelfRestart::new()));
         restart.on_share_broken("reading /m/a: Stale file handle");
         assert!(!restart.keeps_ready());
     }

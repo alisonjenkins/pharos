@@ -104,11 +104,6 @@ impl Listed {
         self
     }
 
-    /// Every root listed, empty or not.
-    fn all_listed(&self) -> bool {
-        self.unreadable == 0
-    }
-
     /// Roots were listed and none holds an entry.
     fn absent(&self) -> bool {
         self.with_entries == 0 && self.empty + self.unreadable > 0
@@ -145,12 +140,7 @@ pub struct MediaShare {
 #[derive(Default)]
 struct Latch {
     broken: Mutex<Option<String>>,
-    /// Set once a check found every root listing with the share whole: a pod
-    /// that never read its share has nothing to keep serving (ADR-0156).
-    /// Written only while `broken` is locked, so a fault and a whole check
-    /// cannot interleave.
-    seen_whole: AtomicBool,
-    /// Told once, when the share first breaks after it was seen whole.
+    /// Told once, when the share first breaks.
     on_broken: OnceLock<BrokenHook>,
 }
 
@@ -162,16 +152,11 @@ impl Latch {
         }
         tracing::error!(error = %why, "media share broken; the pod needs a fresh mount");
         metrics::gauge!(MEDIA_SHARE_OK).set(0.0);
-        let whole = self.seen_whole.load(Ordering::Acquire);
         // Under the lock: a probe that sees the cause also sees what the
-        // hook decided.
-        match self.on_broken.get() {
-            Some(f) if whole => f(&why),
-            Some(_) => tracing::warn!(
-                error = %why,
-                "media share broke before any check found it whole; not telling the hook"
-            ),
-            None => {}
+        // hook decided. Told even if no check found the share whole yet: the
+        // pod still serves browsing, which a restart keeps up (ADR-0158).
+        if let Some(f) = self.on_broken.get() {
+            f(&why);
         }
         *broken = Some(why);
     }
@@ -193,7 +178,7 @@ impl std::fmt::Debug for MediaShare {
         f.debug_struct("MediaShare")
             .field("timeout", &self.timeout)
             .field("broken", &self.broken_cause())
-            .field("seen_whole", &self.was_whole())
+            .field("absent", &self.is_absent())
             .finish_non_exhaustive()
     }
 }
@@ -209,8 +194,8 @@ impl MediaShare {
         }
     }
 
-    /// Calls `f` with the cause the first time the share breaks, if a check
-    /// had found it whole before (the server's self-restart, ADR-0156). Only
+    /// Calls `f` with the cause the first time the share breaks (the
+    /// server's self-restart, ADR-0156, ADR-0158). Only
     /// the first `f` is kept. `f` runs with the share's state locked, so a
     /// probe sees the break and whatever `f` set together; it must not call
     /// back into this share.
@@ -222,11 +207,6 @@ impl MediaShare {
         if self.latch.on_broken.set(Box::new(f)).is_err() {
             tracing::warn!("media share: an on_broken hook was already set; keeping the first");
         }
-    }
-
-    /// Whether a check has found the share whole since the process started.
-    pub fn was_whole(&self) -> bool {
-        self.latch.seen_whole.load(Ordering::Acquire)
     }
 
     /// The process's one share state: the mount belongs to the pod, so every
@@ -292,7 +272,7 @@ impl MediaShare {
     }
 
     /// `list_roots` answers how each root listed: with entries, empty, or
-    /// missing or refused (tolerated, but not the share seen whole).
+    /// missing or refused (tolerated).
     async fn check_with(
         &self,
         list_roots: impl FnOnce(&[PathBuf]) -> Result<Listed, ShareError> + Send + 'static,
@@ -311,7 +291,7 @@ impl MediaShare {
         }
         let roots = self.roots.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if roots.is_empty() {
-            // No share to read, so none seen whole.
+            // No share to read.
             return Ok(());
         }
         if self.busy.swap(true, Ordering::AcqRel) {
@@ -351,9 +331,6 @@ impl MediaShare {
                 empty: listed.empty,
                 unreadable: listed.unreadable,
             });
-        }
-        if listed.all_listed() {
-            self.latch.seen_whole.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -523,8 +500,7 @@ mod tests {
     }
 
     /// ADR-0156: the first fault tells the hook once, with its cause; a
-    /// share-level error listing a root is a fault too; a whole check is
-    /// remembered.
+    /// share-level error listing a root is a fault too.
     #[tokio::test]
     async fn the_first_fault_tells_the_hook_once_and_a_listing_fault_counts() {
         let share: &'static MediaShare = Box::leak(Box::new(MediaShare::new(ROOT_TIMEOUT)));
@@ -532,18 +508,12 @@ mod tests {
         let sink = Arc::clone(&told);
         share.on_broken(move |why| sink.lock().unwrap().push(why.to_owned()));
         share.set_roots(vec![PathBuf::from("/m")]);
-        assert!(!share.was_whole());
         let tolerated = Listed {
             unreadable: 1,
             ..WHOLE
         };
         assert!(share.check_with(move |_| Ok(tolerated)).await.is_ok());
-        assert!(
-            !share.was_whole(),
-            "a tolerated root is not the share whole"
-        );
         assert!(share.check_with(|_| Ok(WHOLE)).await.is_ok());
-        assert!(share.was_whole());
 
         let listed = share
             .check_with(|roots| {
@@ -561,17 +531,24 @@ mod tests {
         assert!(told[0].contains("/m"), "{told:?}");
     }
 
-    /// A fault before any whole check does not tell the hook: the pod never
-    /// read its share, so a restart has nothing to keep serving.
+    /// ADR-0158: a fault before any check found the share whole (a pod that
+    /// started on an absent share) still tells the hook: the pod serves
+    /// browsing, and its restart keeps that up while a fresh mount is tried.
     #[tokio::test]
-    async fn a_fault_before_the_share_was_whole_does_not_tell_the_hook() {
+    async fn a_fault_before_any_whole_check_still_tells_the_hook() {
         let share = MediaShare::new(ROOT_TIMEOUT);
         let told = Arc::new(Mutex::new(0_u32));
         let sink = Arc::clone(&told);
         share.on_broken(move |_| *sink.lock().unwrap() += 1);
+        let empty = tempfile::tempdir().unwrap();
+        share.set_roots(vec![empty.path().to_owned()]);
+        assert!(matches!(
+            share.check().await,
+            Err(ShareError::Absent { .. })
+        ));
         share.note_read_error(Path::new("/m/a"), &err(ESTALE));
         assert!(share.is_broken());
-        assert_eq!(*told.lock().unwrap(), 0);
+        assert_eq!(*told.lock().unwrap(), 1);
     }
 
     /// Without a hook (self-restart off) a listing error fails only that
@@ -668,7 +645,6 @@ mod tests {
             "{checked:?}"
         );
         assert!(!share.is_broken(), "a fresh mount would not change it");
-        assert!(!share.was_whole(), "a missing root was not read");
     }
 
     /// B1538: an export whose disks are gone serves an empty mountpoint.
@@ -726,7 +702,6 @@ mod tests {
     async fn no_roots_is_ready() {
         let share = MediaShare::new(ROOT_TIMEOUT);
         assert!(share.check().await.is_ok());
-        assert!(!share.was_whole(), "no share, none seen whole");
     }
 
     #[tokio::test]

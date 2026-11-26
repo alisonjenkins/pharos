@@ -2525,9 +2525,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // chart's selfHeal reaper replaces the pod with a fresh mount.
     let media_share = pharos_server::media_share::MediaShare::global();
     media_share.set_roots(cfg.media.scan_roots());
-    // ADR-0156 — when the chart names this pod's Deployment, a share that
-    // breaks after it was read asks for a rollout restart, and /readyz stays
-    // up meanwhile so browsing keeps working.
+    // ADR-0156, ADR-0158 — when the chart names this pod's Deployment, a
+    // share that breaks asks for a rollout restart, and /readyz stays up
+    // until the pod is replaced so browsing keeps working.
     let self_restart = pharos_server::self_restart::SelfRestart::global();
     match pharos_server::self_restart::KubeRestarter::from_env() {
         Some(Ok(restarter)) => {
@@ -2536,7 +2536,6 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 "self-restart: on; a broken media share asks for a rollout restart"
             );
             self_restart.set_restarter(std::sync::Arc::new(restarter));
-            // Told only when the share was seen whole first.
             media_share.on_broken(move |why| self_restart.on_share_broken(why));
         }
         Some(Err(error)) => tracing::error!(
