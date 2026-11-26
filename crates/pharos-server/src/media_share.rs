@@ -12,6 +12,12 @@
 //! A root that is missing or refused is NOT a broken share: a library folder
 //! deleted or re-permissioned must not take the whole server out of its
 //! Service. Only the errors a fresh mount fixes count.
+//!
+//! When no root holds a single entry, though, the share is absent (B1538,
+//! V1538): an export whose disks are gone serves its bare, empty mountpoint,
+//! and every catalogued file reads as missing. The pod stays Ready (browsing
+//! needs no share) and a fresh mount would be just as empty, so nothing is
+//! latched or restarted; each check says so until a root has entries again.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-/// 1 while every media root lists and no read found the share broken, 0 once
-/// `/readyz` found otherwise.
+/// 1 while every media root lists, some root holds entries and no read found
+/// the share broken, 0 once `/readyz` found otherwise.
 pub const MEDIA_SHARE_OK: &str = "pharos_media_share_ok";
 
 /// How long `/readyz` waits for the media roots to list.
@@ -72,6 +78,49 @@ pub enum ShareError {
     StillWaiting,
     #[error("starting the media check thread: {0}")]
     Spawn(io::Error),
+    /// No root holds an entry: the share serves an empty mountpoint.
+    #[error("the media share is absent: no media root holds any entry ({empty} empty, {unreadable} missing or refused)")]
+    Absent { empty: usize, unreadable: usize },
+}
+
+/// What one listing of every media root found.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Listed {
+    /// Roots that listed with at least one entry.
+    pub with_entries: usize,
+    /// Roots that listed with none.
+    pub empty: usize,
+    /// Roots missing or refused (tolerated, see [`list`]).
+    pub unreadable: usize,
+}
+
+impl Listed {
+    fn add(mut self, root: RootListing) -> Self {
+        match root {
+            RootListing::Entries => self.with_entries += 1,
+            RootListing::Empty => self.empty += 1,
+            RootListing::Unreadable => self.unreadable += 1,
+        }
+        self
+    }
+
+    /// Every root listed, empty or not.
+    fn all_listed(&self) -> bool {
+        self.unreadable == 0
+    }
+
+    /// Roots were listed and none holds an entry.
+    fn absent(&self) -> bool {
+        self.with_entries == 0 && self.empty + self.unreadable > 0
+    }
+}
+
+/// How one media root looked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootListing {
+    Entries,
+    Empty,
+    Unreadable,
 }
 
 /// What [`MediaShare::on_broken`] registers.
@@ -88,6 +137,8 @@ pub struct MediaShare {
     /// Shared with the listing thread, so a listing that fails after its
     /// probe stopped waiting still marks the share broken.
     latch: Arc<Latch>,
+    /// Whether the last completed check found no root with an entry.
+    absent: AtomicBool,
 }
 
 /// Whether the share broke, and what to tell when it does.
@@ -128,7 +179,7 @@ impl Latch {
     /// With a self-restart hook, a root that fails with a share-level error
     /// is the share broken, as a read finding it would be: only a fresh
     /// mount lists it again. Without one, nothing is latched.
-    fn note_listing(&self, listed: &Result<bool, ShareError>) {
+    fn note_listing(&self, listed: &Result<Listed, ShareError>) {
         if let Err(e @ ShareError::Io { .. }) = listed {
             if self.on_broken.get().is_some() {
                 self.mark_broken(e.to_string());
@@ -154,6 +205,7 @@ impl MediaShare {
             timeout,
             busy: Arc::new(AtomicBool::new(false)),
             latch: Arc::default(),
+            absent: AtomicBool::new(false),
         }
     }
 
@@ -213,21 +265,30 @@ impl MediaShare {
             .is_some()
     }
 
-    /// `Ok` while no read found the share broken and every root lists.
+    /// Whether the last completed check found the share absent: no media
+    /// root holds an entry, so a catalogued file that reads as missing is
+    /// the share's absence, not the file's.
+    pub fn is_absent(&self) -> bool {
+        self.absent.load(Ordering::Acquire)
+    }
+
+    /// `Ok` while no read found the share broken, every root lists, and
+    /// some root holds an entry.
     pub async fn check(&self) -> Result<(), ShareError> {
         self.check_with(|roots| {
-            roots
-                .iter()
-                .try_fold(true, |all, root| Ok(list(root)? && all))
+            roots.iter().try_fold(
+                Listed::default(),
+                |listed, root| Ok(listed.add(list(root)?)),
+            )
         })
         .await
     }
 
-    /// `list_roots` answers whether every root listed, as opposed to some
-    /// being missing or refused (tolerated, but not the share seen whole).
+    /// `list_roots` answers how each root listed: with entries, empty, or
+    /// missing or refused (tolerated, but not the share seen whole).
     async fn check_with(
         &self,
-        list_roots: impl FnOnce(&[PathBuf]) -> Result<bool, ShareError> + Send + 'static,
+        list_roots: impl FnOnce(&[PathBuf]) -> Result<Listed, ShareError> + Send + 'static,
     ) -> Result<(), ShareError> {
         self.check_within(self.timeout, list_roots).await
     }
@@ -236,7 +297,7 @@ impl MediaShare {
     async fn check_within(
         &self,
         timeout: Duration,
-        list_roots: impl FnOnce(&[PathBuf]) -> Result<bool, ShareError> + Send + 'static,
+        list_roots: impl FnOnce(&[PathBuf]) -> Result<Listed, ShareError> + Send + 'static,
     ) -> Result<(), ShareError> {
         if let Some(why) = self.broken_cause() {
             return Err(ShareError::Broken(why));
@@ -270,17 +331,46 @@ impl MediaShare {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => Err(ShareError::TimedOut(timeout)),
         };
-        let all_listed = listed?;
+        let listed = listed?;
+        self.note_absent(&listed);
         // A read may have found the share broken while the roots listed;
         // decide under the same lock a fault takes.
         let broken = self.latch.broken.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(why) = broken.as_ref() {
             return Err(ShareError::Broken(why.clone()));
         }
-        if all_listed {
+        if listed.absent() {
+            return Err(ShareError::Absent {
+                empty: listed.empty,
+                unreadable: listed.unreadable,
+            });
+        }
+        if listed.all_listed() {
             self.latch.seen_whole.store(true, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Records whether `listed` found the share absent, logging each change.
+    fn note_absent(&self, listed: &Listed) {
+        let absent = listed.absent();
+        if self.absent.swap(absent, Ordering::AcqRel) == absent {
+            return;
+        }
+        if absent {
+            tracing::error!(
+                empty = listed.empty,
+                unreadable = listed.unreadable,
+                "media share absent: no media root holds any entry"
+            );
+        } else {
+            tracing::info!(
+                with_entries = listed.with_entries,
+                empty = listed.empty,
+                unreadable = listed.unreadable,
+                "media share back: a media root holds entries again"
+            );
+        }
     }
 
     /// Sets [`MEDIA_SHARE_OK`] to 1, unless the share is broken. Under the
@@ -301,23 +391,24 @@ impl MediaShare {
     }
 }
 
-/// Stats `root` and reads one entry; `true` when it listed. Only a
-/// share-level error fails: a missing or refused root is logged and passes
-/// as `false`, since a fresh mount would not change it.
-fn list(root: &Path) -> Result<bool, ShareError> {
+/// Stats `root` and reads one entry. Only a share-level error fails: a
+/// missing or refused root is logged and passes as unreadable, since a fresh
+/// mount would not change it.
+fn list(root: &Path) -> Result<RootListing, ShareError> {
     let looked = std::fs::metadata(root).and_then(|_| {
         let mut entries = std::fs::read_dir(root)?;
-        entries.next().transpose().map(|_| ())
+        entries.next().transpose().map(|first| first.is_some())
     });
     match looked {
-        Ok(()) => Ok(true),
+        Ok(true) => Ok(RootListing::Entries),
+        Ok(false) => Ok(RootListing::Empty),
         Err(e) if breaks_the_share(&e) => Err(ShareError::Io {
             root: root.to_owned(),
             source: e,
         }),
         Err(e) => {
             tracing::warn!(root = %root.display(), error = %e, "media root unreadable; not a share fault, staying ready");
-            Ok(false)
+            Ok(RootListing::Unreadable)
         }
     }
 }
@@ -330,6 +421,20 @@ mod tests {
 
     fn err(errno: i32) -> io::Error {
         io::Error::from_raw_os_error(errno)
+    }
+
+    /// One root, listed with entries.
+    const WHOLE: Listed = Listed {
+        with_entries: 1,
+        empty: 0,
+        unreadable: 0,
+    };
+
+    /// A root dir holding one file.
+    fn filled_root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mkv"), b"x").unwrap();
+        dir
     }
 
     #[test]
@@ -370,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn a_broken_share_stays_unready_and_keeps_its_first_cause() {
         let share = MediaShare::new(ROOT_TIMEOUT);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = filled_root();
         share.set_roots(vec![dir.path().to_owned()]);
         assert!(share.check().await.is_ok());
 
@@ -395,7 +500,7 @@ mod tests {
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let listing = share.check_with(move |_| {
             wait.recv().ok();
-            Ok(true)
+            Ok(WHOLE)
         });
         let fault = async {
             // Only once the listing is under way, so the check's first look
@@ -421,12 +526,16 @@ mod tests {
         share.on_broken(move |why| sink.lock().unwrap().push(why.to_owned()));
         share.set_roots(vec![PathBuf::from("/m")]);
         assert!(!share.was_whole());
-        assert!(share.check_with(|_| Ok(false)).await.is_ok());
+        let tolerated = Listed {
+            unreadable: 1,
+            ..WHOLE
+        };
+        assert!(share.check_with(move |_| Ok(tolerated)).await.is_ok());
         assert!(
             !share.was_whole(),
             "a tolerated root is not the share whole"
         );
-        assert!(share.check_with(|_| Ok(true)).await.is_ok());
+        assert!(share.check_with(|_| Ok(WHOLE)).await.is_ok());
         assert!(share.was_whole());
 
         let listed = share
@@ -474,7 +583,7 @@ mod tests {
             .await;
         assert!(matches!(listed, Err(ShareError::Io { .. })), "{listed:?}");
         assert!(!share.is_broken());
-        assert!(share.check_with(|_| Ok(true)).await.is_ok());
+        assert!(share.check_with(|_| Ok(WHOLE)).await.is_ok());
     }
 
     /// A listing that fails with a share fault only after its probe gave up
@@ -486,7 +595,7 @@ mod tests {
         let sink = Arc::clone(&told);
         share.on_broken(move |_| *sink.lock().unwrap() += 1);
         share.set_roots(vec![PathBuf::from("/m")]);
-        assert!(share.check_with(|_| Ok(true)).await.is_ok());
+        assert!(share.check_with(|_| Ok(WHOLE)).await.is_ok());
 
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let listed = share
@@ -537,11 +646,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_root_does_not_make_the_server_unready() {
+    async fn a_missing_root_is_absent_not_broken() {
         let share = MediaShare::new(ROOT_TIMEOUT);
         share.set_roots(vec![PathBuf::from("/no/such/media/root")]);
-        assert!(share.check().await.is_ok());
+        let checked = share.check().await;
+        assert!(
+            matches!(
+                checked,
+                Err(ShareError::Absent {
+                    empty: 0,
+                    unreadable: 1
+                })
+            ),
+            "{checked:?}"
+        );
+        assert!(!share.is_broken(), "a fresh mount would not change it");
         assert!(!share.was_whole(), "a missing root was not read");
+    }
+
+    /// B1538: an export whose disks are gone serves an empty mountpoint.
+    /// With no root holding an entry the share is absent, never broken (a
+    /// fresh mount is just as empty, so the hook is not told), and it comes
+    /// back by itself once a root holds an entry again.
+    #[tokio::test]
+    async fn roots_with_no_entries_make_the_share_absent_until_one_has_some() {
+        let share = MediaShare::new(ROOT_TIMEOUT);
+        let told = Arc::new(Mutex::new(0_u32));
+        let sink = Arc::clone(&told);
+        share.on_broken(move |_| *sink.lock().unwrap() += 1);
+        let empty = tempfile::tempdir().unwrap();
+        share.set_roots(vec![
+            empty.path().to_owned(),
+            PathBuf::from("/no/such/media/root"),
+        ]);
+        let checked = share.check().await;
+        assert!(
+            matches!(
+                checked,
+                Err(ShareError::Absent {
+                    empty: 1,
+                    unreadable: 1
+                })
+            ),
+            "{checked:?}"
+        );
+        let why = checked.unwrap_err().to_string();
+        assert!(why.contains("1 empty, 1 missing or refused"), "{why}");
+        assert!(share.is_absent());
+        assert!(!share.is_broken());
+        assert_eq!(*told.lock().unwrap(), 0);
+
+        std::fs::write(empty.path().join("a.mkv"), b"x").unwrap();
+        assert!(share.check().await.is_ok());
+        assert!(!share.is_absent(), "a root with entries brings it back");
+    }
+
+    #[tokio::test]
+    async fn one_root_with_entries_is_not_absent() {
+        let share = MediaShare::new(ROOT_TIMEOUT);
+        let filled = filled_root();
+        let empty = tempfile::tempdir().unwrap();
+        share.set_roots(vec![
+            filled.path().to_owned(),
+            empty.path().to_owned(),
+            PathBuf::from("/no/such/media/root"),
+        ]);
+        assert!(share.check().await.is_ok());
+        assert!(!share.is_absent());
     }
 
     #[tokio::test]
@@ -554,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn a_listing_still_running_fails_the_next_check_without_a_thread() {
         let share = MediaShare::new(ROOT_TIMEOUT);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = filled_root();
         share.set_roots(vec![dir.path().to_owned()]);
         share.busy.store(true, Ordering::Release);
         assert!(matches!(share.check().await, Err(ShareError::StillWaiting)));

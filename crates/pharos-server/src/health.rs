@@ -23,7 +23,7 @@ pub struct Snapshot {
     pub draining: bool,
     /// Why the media share cannot be read, when it cannot (B1531). Set
     /// only by `/readyz`. It answers 503 with it, or 200 while
-    /// `media_restart` is set (ADR-0156).
+    /// `media_restart` is set (ADR-0156) or the share is absent (B1538).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<String>,
     /// Set while the pod stays Ready through a broken share because it asked
@@ -174,8 +174,12 @@ async fn readyz(
     if let (true, Some(media)) = (snap.ready, media) {
         if let Err(e) = media.share.check().await {
             snap.media = Some(e.to_string());
-            snap.media_restart = stays_ready(&media, &e);
-            snap.ready = snap.media_restart.is_some();
+            // An absent share leaves the pod Ready: browsing needs no share,
+            // and a fresh mount would be just as empty (B1538).
+            if !matches!(e, crate::media_share::ShareError::Absent { .. }) {
+                snap.media_restart = stays_ready(&media, &e);
+                snap.ready = snap.media_restart.is_some();
+            }
         }
         // A drain may have begun while the check awaited; it wins over the
         // restart's stay-ready, which would otherwise answer 200.
@@ -418,6 +422,30 @@ mod tests {
         assert!(txt.contains("Stale file handle"), "got: {txt}");
     }
 
+    /// B1538: a share whose roots hold no entry leaves `/readyz` at 200,
+    /// naming the absence, with the gauge at 0.
+    #[actix_web::test]
+    async fn readyz_stays_up_on_an_absent_share_and_says_so() {
+        let share: &'static crate::media_share::MediaShare = Box::leak(Box::new(
+            crate::media_share::MediaShare::new(crate::media_share::ROOT_TIMEOUT),
+        ));
+        let empty = tempfile::tempdir().unwrap();
+        share.set_roots(vec![empty.path().to_owned()]);
+        let h = ReadinessHandle::spawn(&["x"]);
+        h.mark("x").await.unwrap();
+        let app = test::init_service(build_app_with_media(h, share)).await;
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let req = test::TestRequest::get().uri("/readyz").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(media_ok(&recorder), Some(0.0));
+        let body = test::read_body(resp).await;
+        let txt = std::str::from_utf8(&body).unwrap();
+        assert!(txt.contains("the media share is absent"), "got: {txt}");
+        assert!(!txt.contains("media_restart"), "got: {txt}");
+    }
+
     /// ADR-0156: a pod that read its share and asked for its own restart
     /// stays Ready through the fault, saying so, with the gauge still 0. A
     /// pod that never read its share, or whose request gave up, does not.
@@ -442,6 +470,7 @@ mod tests {
 
         let share = leak();
         let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.mkv"), b"x").unwrap();
         share.set_roots(vec![root.path().to_owned()]);
         assert_eq!(get(share, None).await.0, 200, "a whole share is ready");
         share.mark_broken("reading /m/a: Stale file handle".into());
