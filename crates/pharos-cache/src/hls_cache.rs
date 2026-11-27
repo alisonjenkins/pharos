@@ -140,6 +140,9 @@ struct EntryMeta {
     bytes: u64,
     /// Monotonically-increasing access counter; higher = more recent.
     last_used: u64,
+    /// The file's mtime when it was recorded, so an eviction can tell the file
+    /// it chose from one a peer has since published at the same path (B1539).
+    mtime: Option<SystemTime>,
 }
 
 /// Compound cache key. Audio + subtitle default to a 0 / off sentinel so
@@ -2428,6 +2431,25 @@ struct ProducedSegment {
     rechecked: bool,
 }
 
+/// A cached filler past [`FILLER_RETRY_AFTER_SECS`], as the driver's recheck saw
+/// it. Its bytes are served if the refresh fails; its length and mtime say
+/// which file the publish step may retire.
+struct StaleFiller {
+    bytes: Vec<u8>,
+    meta: std::fs::Metadata,
+    age_secs: u64,
+}
+
+/// What the driver's recheck of the keyed path decided.
+enum Recheck {
+    /// Serve this file as it stands; no encode.
+    Serve(ProducedSegment),
+    /// Nothing usable is there: encode.
+    Encode,
+    /// A stale filler: encode, and replace it only if the refresh succeeds.
+    Refresh(StaleFiller),
+}
+
 /// How one wait on the shared registry ended.
 ///
 /// The two arms are not interchangeable FOR ACCOUNTING, which is the only reason
@@ -2744,6 +2766,68 @@ impl HlsSegmentCache {
             *slot = claim_staging_dir(&self.root);
         }
         slot.clone()
+    }
+
+    /// [`Self::staging_dir`], re-claiming if the claimed directory has gone
+    /// (another instance's sweep took it while this one was idle). The claim
+    /// is cleared and made again; an unclaimed path is never created.
+    async fn live_staging_dir(&self) -> Option<PathBuf> {
+        let dir = self.staging_dir()?;
+        match tokio::fs::metadata(&dir).await {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(dir = %dir.display(), "HLS staging directory was removed; claiming a new one");
+                {
+                    let mut slot = self
+                        .staging
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if slot.as_ref() == Some(&dir) {
+                        *slot = None;
+                    }
+                }
+                self.staging_dir()
+            }
+            _ => Some(dir),
+        }
+    }
+}
+
+/// How long another instance's staging directory must sit untouched before a
+/// starting instance removes it as a dead pod's.
+const STAGING_SWEEP_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// B1539 — remove the staging directories of instances that are gone: any
+/// directory under `<root>/.staging` other than `keep` whose mtime is older
+/// than `older_than`. Best effort and logged. A live but idle instance's
+/// directory can be swept too; it notices and re-claims
+/// ([`HlsSegmentCache::live_staging_dir`]).
+fn sweep_stale_staging(root: &Path, keep: Option<&Path>, older_than: Duration) {
+    let Ok(rd) = std::fs::read_dir(root.join(STAGING_DIR)) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for e in rd.flatten() {
+        let path = e.path();
+        if keep == Some(path.as_path()) {
+            continue;
+        }
+        let old = e
+            .metadata()
+            .ok()
+            .filter(|m| m.is_dir())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= older_than);
+        if old {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    tracing::info!(dir = %path.display(), "removed a stale HLS staging directory")
+                }
+                Err(err) => {
+                    tracing::warn!(dir = %path.display(), error = %err, "could not remove a stale HLS staging directory")
+                }
+            }
+        }
     }
 }
 
@@ -3090,6 +3174,7 @@ impl HlsSegmentCache {
         let root = Self::generation_root(&base, generation);
         let _ = std::fs::create_dir_all(&root);
         let staging = claim_staging_dir(&root);
+        sweep_stale_staging(&root, staging.as_deref(), STAGING_SWEEP_AFTER);
         tracing::info!(
             base = %base.display(),
             generation,
@@ -3332,6 +3417,9 @@ impl HlsSegmentCache {
                             "could not quarantine a cached segment"
                         );
                         report.failed += 1;
+                        // The record follows its segment: a segment that
+                        // stays keeps its record (B1539).
+                        break;
                     }
                 }
             }
@@ -3395,64 +3483,40 @@ impl HlsSegmentCache {
 
     /// B1539/V1540 — the driver's look at the keyed path, before any encode.
     ///
-    /// Retirement of a stale filler lives HERE, not on the hit path, because the
-    /// driver is the one party per key at a time (`InFlightGuard`): a second
-    /// reader that saw the same stale file registers after the first driver
-    /// published, and finds that driver's fresh file at its own recheck instead
-    /// of retiring it and encoding a second time inside the interval.
+    /// The driver is the one party per key at a time (`InFlightGuard`): a
+    /// second reader that saw the same stale file registers after the first
+    /// driver published, and finds that driver's fresh file at its own recheck
+    /// instead of encoding a second time inside the interval.
     ///
-    /// `Some` when the file is usable and is served as it stands: real,
-    /// unconfirmed, or a filler younger than [`FILLER_RETRY_AFTER_SECS`]. `None`
-    /// when there is nothing usable (absent, unreadable, defective, or a stale
-    /// filler, which is taken out of service here) and the caller encodes.
+    /// A stale filler is NOT retired here. It keeps serving until a refresh has
+    /// actually produced bytes: the encode runs first, and the filler is taken
+    /// out of service only at publication, under the publish lock, if it is
+    /// still the same file (see `produce_segment`). If the refresh fails, the
+    /// filler is served as it stands.
     async fn recheck_cached(
         &self,
         key: SegmentIdentity,
         path: &Path,
         opts: &SegmentOpts,
-    ) -> Option<ProducedSegment> {
-        let meta = tokio::fs::metadata(path).await.ok()?;
-        let bytes = tokio::fs::read(path).await.ok()?;
+    ) -> Recheck {
+        let Ok(meta) = tokio::fs::metadata(path).await else {
+            return Recheck::Encode;
+        };
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            return Recheck::Encode;
+        };
         if let Some(defect) = segment_defect(&bytes, opts.container) {
             self.quarantine_defective_segment(key, path, &meta, defect)
                 .await;
-            return None;
+            return Recheck::Encode;
         }
         let (kind, prov) = classify_paired(path, &meta).await;
         if let Some(age_secs) = stale_filler_age(kind, &meta, prov.as_ref()) {
-            let retired = self.take_out_of_service(key, path, &meta).await;
-            // A retirement that could neither move nor delete the file leaves
-            // the old bytes at the path. Encoding now would pair them with the
-            // new encode's record, so serve what is there, as the filler it is,
-            // and try again on a later read.
-            if tokio::fs::symlink_metadata(path).await.is_ok() {
-                metrics::counter!("pharos_segment_filler_retire_failed_total").increment(1);
-                tracing::warn!(
-                    media.id = key.media_id,
-                    seg = key.seg_index,
-                    age_secs,
-                    path = %path.display(),
-                    "stale filler could not be taken out of service; serving it without re-encoding (B1539)"
-                );
-                return Some(ProducedSegment {
-                    bytes,
-                    kind: SegmentKind::Filler,
-                    rechecked: true,
-                });
-            }
-            if let Some(kept) = retired {
-                metrics::counter!("pharos_segment_filler_retry_total").increment(1);
-                tracing::info!(
-                    media.id = key.media_id,
-                    seg = key.seg_index,
-                    age_secs,
-                    reason = "stale_filler",
-                    bytes = meta.len(),
-                    kept,
-                    "cached filler segment is older than the retry interval; taken out of service and re-encoding from source (B1539)"
-                );
-            }
-            return None;
+            return Recheck::Refresh(StaleFiller {
+                bytes,
+                meta,
+                age_secs,
+            });
         }
         self.touch(key).await;
         tracing::debug!(
@@ -3461,7 +3525,7 @@ impl HlsSegmentCache {
             kind = kind.label(),
             "driver recheck found a usable cached segment; not encoding (B1539)"
         );
-        Some(ProducedSegment {
+        Recheck::Serve(ProducedSegment {
             bytes,
             kind,
             rechecked: true,
@@ -3485,6 +3549,17 @@ impl HlsSegmentCache {
         let Some(_lock) = self.publish_lock_or_count(path).await else {
             return Some(false);
         };
+        self.take_out_of_service_locked(key, path, read).await
+    }
+
+    /// [`Self::take_out_of_service`] for a caller that already holds the
+    /// publish lock for `path` (the lock is not reentrant).
+    async fn take_out_of_service_locked(
+        &self,
+        key: SegmentIdentity,
+        path: &Path,
+        read: &std::fs::Metadata,
+    ) -> Option<bool> {
         // A concurrent request may already have quarantined these bytes and
         // published a fresh encode at the same path; that file is not ours to
         // move. Same length and mtime is the file this request read.
@@ -4319,6 +4394,72 @@ impl HlsSegmentCache {
         seg_index: u32,
         class: JobClass,
         hint: JobHint,
+        job_slot: pharos_transcode::scheduler::JobSlot,
+        promoted: Arc<std::sync::atomic::AtomicBool>,
+        published: Arc<std::sync::atomic::AtomicBool>,
+        registration_id: u64,
+    ) -> Result<ProducedSegment, HlsCacheError> {
+        let path = self.segment_path_keyed(key);
+        // B1539 — before any encode, look at the keyed path again: a concurrent
+        // driver may have published since the request's fast-path read.
+        let stale = match self.recheck_cached(key, &path, opts).await {
+            Recheck::Serve(hit) => return Ok(hit),
+            Recheck::Encode => None,
+            Recheck::Refresh(stale) => Some(stale),
+        };
+        let produced = self
+            .produce_segment_encoding(
+                source,
+                opts,
+                key,
+                media_id,
+                seg_index,
+                class,
+                hint,
+                job_slot,
+                promoted,
+                published,
+                registration_id,
+                stale.as_ref(),
+            )
+            .await;
+        match (produced, stale) {
+            // The refresh failed, for whatever reason: the filler that was
+            // there is still the best answer, and is still on disk with its
+            // record, so a later read tries again (B1539).
+            (Err(e), Some(stale)) => {
+                metrics::counter!("pharos_segment_filler_refresh_failed_total").increment(1);
+                tracing::warn!(
+                    media.id = media_id,
+                    seg = seg_index,
+                    age_secs = stale.age_secs,
+                    error = %e,
+                    "refreshing a stale filler failed; serving the cached filler (B1539)"
+                );
+                Ok(ProducedSegment {
+                    bytes: stale.bytes,
+                    kind: SegmentKind::Filler,
+                    rechecked: true,
+                })
+            }
+            (produced, _) => produced,
+        }
+    }
+
+    /// The encode-and-publish half of [`Self::produce_segment`]. `stale` is
+    /// the filler the keyed path held at the recheck, if the encode is its
+    /// refresh: publication retires it, under the publish lock, only if it is
+    /// still that file.
+    #[allow(clippy::too_many_arguments)]
+    async fn produce_segment_encoding(
+        &self,
+        source: &Path,
+        opts: &SegmentOpts,
+        key: SegmentIdentity,
+        media_id: u64,
+        seg_index: u32,
+        class: JobClass,
+        hint: JobHint,
         // `job_slot` is published to as soon as the scheduler names this
         // encode's job, so a requester coalescing onto it can have it promoted.
         // Owned here, so its sender dies with this task and no waiter outlives
@@ -4335,14 +4476,9 @@ impl HlsSegmentCache {
         // `segment_tmp_path`. Two drivers for one key can only overlap at the
         // abandonment seam, and they must not share a file when they do.
         registration_id: u64,
+        stale: Option<&StaleFiller>,
     ) -> Result<ProducedSegment, HlsCacheError> {
         let path = self.segment_path_keyed(key);
-        // B1539 — before any encode, look at the keyed path again: a concurrent
-        // driver may have published since the request's fast-path read, and a
-        // stale filler is retired here, serialized by the in-flight registry.
-        if let Some(hit) = self.recheck_cached(key, &path, opts).await {
-            return Ok(hit);
-        }
         // V128: every exit from this function has to land in exactly one arm of
         // `pharos_segment_produced_total`, or the arms do not partition
         // production attempts and V91's `failed + coalesced_failed` sum is
@@ -4377,7 +4513,7 @@ impl HlsSegmentCache {
         // B1539 — the temp file lives in this instance's own staging
         // directory, so no other pod sharing the cache volume can write it;
         // re-created here in case a sweep removed it while idle.
-        let Some(staging) = self.staging_dir() else {
+        let Some(staging) = self.live_staging_dir().await else {
             return Err(counted(
                 "claim_staging",
                 std::io::Error::other("no HLS staging directory could be claimed").into(),
@@ -4890,9 +5026,39 @@ impl HlsSegmentCache {
             // section across processes (B1539): a pod sharing this volume
             // could otherwise interleave its own record write or rename.
             // A directory is left to the rename to refuse (and count) below.
-            let occupied = tokio::fs::symlink_metadata(&path)
-                .await
-                .is_ok_and(|m| !m.is_dir());
+            let is_occupied = || async {
+                tokio::fs::symlink_metadata(&path)
+                    .await
+                    .is_ok_and(|m| !m.is_dir())
+            };
+            let mut occupied = is_occupied().await;
+            // A stale filler is retired only now that a refresh exists to take
+            // its place, and only if the path still holds the very file the
+            // recheck saw (a peer that replaced it owns what it published).
+            if let (true, Some(stale)) = (occupied, stale) {
+                if let Some(kept) = self
+                    .take_out_of_service_locked(key, &path, &stale.meta)
+                    .await
+                {
+                    occupied = is_occupied().await;
+                    if occupied {
+                        metrics::counter!("pharos_segment_filler_retire_failed_total").increment(1);
+                    } else {
+                        metrics::counter!("pharos_segment_filler_retry_total").increment(1);
+                        tracing::info!(
+                            media.id = media_id,
+                            seg = seg_index,
+                            age_secs = stale.age_secs,
+                            reason = "stale_filler",
+                            bytes = stale.meta.len(),
+                            kept,
+                            "cached filler segment is older than the retry interval; replaced by a fresh encode (B1539)"
+                        );
+                    }
+                } else {
+                    occupied = is_occupied().await;
+                }
+            }
             let record = if occupied {
                 None
             } else {
@@ -4927,9 +5093,22 @@ impl HlsSegmentCache {
                     false
                 }
                 Some(Ok(())) => {
-                    tokio::fs::rename(&tmp, &path)
-                        .await
-                        .map_err(|e| counted("publish_rename", e.into()))?;
+                    #[cfg(test)]
+                    let renamed = if tests::RENAME_FAILS.with(std::cell::Cell::get) {
+                        Err(std::io::Error::other("injected"))
+                    } else {
+                        tokio::fs::rename(&tmp, &path).await
+                    };
+                    #[cfg(not(test))]
+                    let renamed = tokio::fs::rename(&tmp, &path).await;
+                    if let Err(e) = renamed {
+                        // The record was written for a segment that never
+                        // arrived: remove it with the staged file, under the
+                        // lock, before reporting the failure (B1539).
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                        let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                        return Err(counted("publish_rename", e.into()));
+                    }
                     true
                 }
                 Some(Err(e)) => {
@@ -6746,6 +6925,10 @@ impl HlsSegmentCache {
     }
 
     async fn record(&self, key: SegmentIdentity, bytes: u64) {
+        let mtime = tokio::fs::metadata(self.segment_path_keyed(key))
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
         let mut state = self.state.lock().await;
         state.access_counter += 1;
         let counter = state.access_counter;
@@ -6756,6 +6939,7 @@ impl HlsSegmentCache {
             EntryMeta {
                 bytes,
                 last_used: counter,
+                mtime,
             },
         ) {
             state.total_bytes = state.total_bytes.saturating_sub(old.bytes);
@@ -6764,44 +6948,95 @@ impl HlsSegmentCache {
     }
 
     async fn maybe_evict(&self) {
-        // Snapshot the (key, last_used) candidates outside the lock so
-        // the disk delete doesn't hold the cache state.
-        let mut to_remove: Vec<(SegmentIdentity, PathBuf)> = Vec::new();
-        {
-            let mut state = self.state.lock().await;
-            while state.total_bytes > self.max_bytes {
-                let Some((key, meta)) =
-                    state
-                        .entries
-                        .iter()
-                        .min_by_key(|(_, m)| m.last_used)
-                        .map(|(k, m)| {
-                            (
-                                *k,
-                                EntryMeta {
-                                    bytes: m.bytes,
-                                    last_used: m.last_used,
-                                },
-                            )
-                        })
-                else {
+        // Pick the least-recently-used victims that bring the total under the
+        // budget, WITHOUT touching the accounting: an entry is dropped and its
+        // bytes debited only once its file is confirmed gone (B1539).
+        let victims: Vec<(SegmentIdentity, EntryMeta)> = {
+            let state = self.state.lock().await;
+            let mut all: Vec<(SegmentIdentity, EntryMeta)> = state
+                .entries
+                .iter()
+                .map(|(k, m)| {
+                    (
+                        *k,
+                        EntryMeta {
+                            bytes: m.bytes,
+                            last_used: m.last_used,
+                            mtime: m.mtime,
+                        },
+                    )
+                })
+                .collect();
+            all.sort_by_key(|(_, m)| m.last_used);
+            let mut total = state.total_bytes;
+            let mut picked = Vec::new();
+            for v in all {
+                if total <= self.max_bytes {
                     break;
-                };
-                state.entries.remove(&key);
-                state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
-                to_remove.push((key, self.segment_path_keyed(key)));
+                }
+                total = total.saturating_sub(v.1.bytes);
+                picked.push(v);
             }
-        }
-        for (_, path) in to_remove {
+            picked
+        };
+        for (key, victim) in victims {
+            let path = self.segment_path_keyed(key);
+            // Cannot take the lock: leave the file AND its entry for a later
+            // sweep.
             let Some(_lock) = self.publish_lock_or_count(&path).await else {
                 continue;
             };
-            let _ = tokio::fs::remove_file(&path).await;
-            // The provenance record describes THESE bytes and is worthless once
-            // they are gone; left behind it would accumulate one small file per
-            // segment ever evicted, in a directory whose size is the thing
-            // being enforced here.
-            let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+            // Revalidate under the lock: only the file this entry recorded is
+            // ours to evict. A peer may have published a fresh segment here.
+            let gone = match tokio::fs::metadata(&path).await {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+                Ok(m) => {
+                    let same = m.len() == victim.bytes
+                        && victim.mtime.is_none_or(|t| m.modified().ok() == Some(t));
+                    if !same {
+                        // Not the recorded file: leave it, and stop billing
+                        // for bytes that are no longer these.
+                        true
+                    } else {
+                        match tokio::fs::remove_file(&path).await {
+                            Ok(()) => {
+                                // The provenance record describes THESE bytes
+                                // and is worthless once they are gone; left
+                                // behind it would accumulate one small file per
+                                // segment ever evicted.
+                                let _ =
+                                    tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                                true
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                let _ =
+                                    tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "could not evict a cached segment; keeping its entry"
+                                );
+                                false
+                            }
+                        }
+                    }
+                }
+            };
+            if gone {
+                let mut state = self.state.lock().await;
+                if state
+                    .entries
+                    .get(&key)
+                    .is_some_and(|m| m.bytes == victim.bytes)
+                {
+                    state.entries.remove(&key);
+                    state.total_bytes = state.total_bytes.saturating_sub(victim.bytes);
+                }
+            }
         }
     }
 
@@ -10573,6 +10808,9 @@ mod tests {
         /// Makes `take_out_of_service` fail without touching the file.
         pub(super) static RETIREMENT_FAILS: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Makes the publishing rename fail after the record was written.
+        pub(super) static RENAME_FAILS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
         static STALE_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
             const { std::cell::RefCell::new(None) };
         static EVICT_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
@@ -10684,20 +10922,18 @@ mod tests {
         assert_eq!(kept, 1, "{:?}", cache.quarantined());
     }
 
-    /// B1539/V1540 — a retirement that cannot remove the stale filler must not
-    /// lead to an encode whose record is written over the old bytes: the old
-    /// filler is served as a filler, nothing is encoded, and its record is
-    /// untouched.
+    /// B1539/V1540 — a refresh whose stale filler cannot be retired at
+    /// publication must not write its record over the old bytes: the fresh
+    /// bytes are served `Transient`, and the old file keeps its record.
     ///
     /// The failure is injected at the segment move/delete step, so the real
     /// cleanup code runs: the record must stay beside a segment that stays.
     ///
-    /// Disarm evidence: with the still-present check removed from
-    /// `recheck_cached` the driver encodes (attempts 4), and with the record
-    /// removed before the segment's own removal succeeds the record is gone;
-    /// both go RED.
+    /// Disarm evidence: with the occupied check skipped after a failed
+    /// retirement the record is overwritten, and with the record removed before
+    /// the segment's own removal succeeds the record is gone; both go RED.
     #[test]
-    fn a_filler_that_cannot_be_retired_is_served_as_a_filler_and_not_re_encoded() {
+    fn a_filler_that_cannot_be_retired_keeps_its_record_and_the_refresh_is_served_uncached() {
         use metrics_util::debugging::DebuggingRecorder;
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -10727,27 +10963,32 @@ mod tests {
                 backdate(&path, FILLER_RETRY_AFTER_SECS + 60);
                 RETIREMENT_FAILS.with(|f| f.set(true));
                 let (_, _, kind) = ask_filler_variant(&cache, &source, &opts).await;
-                assert_eq!(kind, SegmentKind::Filler, "never classified Real");
+                assert_eq!(
+                    kind,
+                    SegmentKind::Transient,
+                    "the fresh bytes are served uncached, never classified Real"
+                );
                 assert_eq!(
                     real_attempts.load(std::sync::atomic::Ordering::SeqCst),
-                    2,
-                    "no encode while the old bytes cannot be retired"
+                    4,
+                    "the refresh ran; its result could not replace the old file"
                 );
                 assert_eq!(
                     std::fs::read(provenance_sidecar_path(&path)).unwrap(),
                     record_before,
                     "the record still describes the bytes at the path"
                 );
-                // Still a filler on the next read, not Unconfirmed: the record
-                // was not removed with the segment left behind.
-                let (_, served, kind) = ask_filler_variant(&cache, &source, &opts).await;
-                assert_eq!((served, kind), (SegmentServed::Hit, SegmentKind::Filler));
+                // The old file is still a filler with its record, so the next
+                // read refreshes again rather than finding an Unconfirmed one.
+                let (_, _, kind) = ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!(kind, SegmentKind::Transient);
+                assert_eq!(real_attempts.load(std::sync::atomic::Ordering::SeqCst), 6);
 
-                // The filesystem recovers: the next read retires and re-encodes.
+                // The filesystem recovers: the next read replaces it.
                 RETIREMENT_FAILS.with(|f| f.set(false));
                 let (_, served, kind) = ask_filler_variant(&cache, &source, &opts).await;
                 assert_eq!((served, kind), (SegmentServed::Miss, SegmentKind::Filler));
-                assert_eq!(real_attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
+                assert_eq!(real_attempts.load(std::sync::atomic::Ordering::SeqCst), 8);
             });
         });
         // One snapshot reads (and clears) every counter, so take both from it.
@@ -11158,7 +11399,18 @@ mod tests {
                     .any(|e| e.file_name().to_string_lossy().contains("tmp"))
             })
         };
+        // Bounded: a request that finished before the checkpoint, or an encode
+        // that never staged a file, fails the test promptly instead of hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !tmp_seen() {
+            assert!(
+                !task.is_finished(),
+                "the request finished before reaching the lock checkpoint"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no staged temp file appeared within 20 s"
+            );
             tokio::task::yield_now().await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -11336,6 +11588,224 @@ mod tests {
             write_failed, 0,
             "no record was attempted for a refused segment"
         );
+    }
+
+    /// A scheduler whose every encode fails, for a refresh that cannot succeed.
+    fn fails_every_segment() -> pharos_transcode::scheduler::TranscodeScheduler {
+        use pharos_transcode::protocol::{JobSpec, WorkerError, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
+        };
+        struct Failing;
+        impl WorkerSpawner for Failing {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                Box::pin(async move { Ok(Box::new(FailWorker { id }) as Box<dyn Worker>) })
+            }
+        }
+        struct FailWorker {
+            id: WorkerId,
+        }
+        impl Worker for FailWorker {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, _job: JobSpec) -> RunFuture<'a> {
+                Box::pin(
+                    async move { WorkerRunResult::Failed(WorkerError::Other("injected".into())) },
+                )
+            }
+        }
+        TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Failing),
+            pharos_transcode::scheduler::SchedConfig::default(),
+        )
+    }
+
+    /// B1539/V1540 — a stale filler whose refresh fails is still served, as a
+    /// filler, and is still on disk with its record: it is not retired up front.
+    ///
+    /// Disarm evidence: with the filler retired before the encode (the old
+    /// order) it is gone from disk and the request errors, so this goes RED.
+    #[test]
+    fn a_stale_filler_whose_refresh_fails_is_still_served_and_kept() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let good = cache.with_scheduler(always_short_until_filler(false, real_attempts.clone()));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        let key =
+            SegmentIdentity::new(42, 0, None, None, &opts, SourceGen::for_read(&source, None));
+        let path = good.segment_path_keyed(key);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (bytes_before, _, _) = ask_filler_variant(&good, &source, &opts).await;
+                let record_before = std::fs::read(provenance_sidecar_path(&path)).unwrap();
+                backdate(&path, FILLER_RETRY_AFTER_SECS + 60);
+                let bad = good.clone().with_scheduler(fails_every_segment());
+                let (bytes, _, kind) = ask_filler_variant(&bad, &source, &opts).await;
+                assert_eq!(kind, SegmentKind::Filler);
+                assert_eq!(bytes, bytes_before, "the old filler is what is served");
+                assert!(path.exists(), "the filler stays on disk");
+                assert_eq!(
+                    std::fs::read(provenance_sidecar_path(&path)).unwrap(),
+                    record_before,
+                    "with its record"
+                );
+                assert!(bad.quarantined().is_empty(), "nothing was retired");
+            });
+        });
+        assert_eq!(
+            counter_value(&snapshotter, "pharos_segment_filler_refresh_failed_total"),
+            1
+        );
+    }
+
+    /// B1539 — a record written for a segment whose rename then fails is
+    /// removed with the staged file, not left beside nothing.
+    #[tokio::test]
+    async fn a_failed_rename_removes_the_record_it_just_wrote() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let cache = cache.with_scheduler(writes_each_segment(std::time::Duration::ZERO));
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::for_read(source, None));
+        let path = cache.segment_path_keyed(key);
+        RENAME_FAILS.with(|f| f.set(true));
+        let err = cache
+            .segment_bytes_keyed_served(
+                7,
+                0,
+                None,
+                None,
+                source,
+                None,
+                &opts,
+                JobClass::Interactive,
+                StreamKey::NONE,
+                PlayheadSeed::Observes,
+            )
+            .await;
+        RENAME_FAILS.with(|f| f.set(false));
+        assert!(err.is_err(), "the publish failure is the request's error");
+        assert!(!path.exists());
+        assert!(!provenance_sidecar_path(&path).exists(), "no orphan record");
+        let staging = cache.staging_dir().unwrap();
+        assert_eq!(
+            std::fs::read_dir(staging).unwrap().count(),
+            0,
+            "no temp file"
+        );
+    }
+
+    /// B1539 — a purge that cannot move a segment leaves its record where it is.
+    #[tokio::test]
+    async fn a_purge_that_cannot_move_a_segment_leaves_its_record() {
+        let dir = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(dir.path(), 1 << 20);
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(7, 3, None, None, &opts, SourceGen::LOCAL);
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; 64]).unwrap();
+        std::fs::write(provenance_sidecar_path(&path), r#"{"filler":false}"#).unwrap();
+        // The segment's quarantine destination is a non-empty directory, so
+        // its rename fails while the record's would succeed.
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let blocker = cache.root().join(QUARANTINE_DIR).join(format!("7-{name}"));
+        std::fs::create_dir_all(blocker.join("x")).unwrap();
+
+        let report = cache.quarantine_segments(7, 3..=3).await.unwrap();
+        assert_eq!(report.failed, 1);
+        assert!(path.exists());
+        assert!(
+            provenance_sidecar_path(&path).exists(),
+            "the record stays with its segment"
+        );
+    }
+
+    /// B1539 — the LRU keeps an entry (and its bytes) when the removal could
+    /// not be done, and spares a file a peer replaced since it was recorded.
+    #[tokio::test]
+    async fn lru_eviction_keeps_entries_it_could_not_remove_and_spares_replacements() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache_capped(&dir, std::time::Duration::ZERO, 100);
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::LOCAL);
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; 400]).unwrap();
+        std::fs::write(provenance_sidecar_path(&path), "{}").unwrap();
+        cache.record(key, 400).await;
+
+        // (a) The lock cannot be taken: nothing is touched or forgotten.
+        std::fs::write(cache.root().join(".locks"), b"").unwrap();
+        cache.maybe_evict().await;
+        assert!(path.exists());
+        assert_eq!(cache.entry_count().await, 1);
+        assert_eq!(cache.total_bytes().await, 400);
+        std::fs::remove_file(cache.root().join(".locks")).unwrap();
+
+        // (b) A peer published a different file at the path since it was
+        // recorded: it is spared, and the stale entry is dropped.
+        std::fs::write(&path, vec![b'y'; 123]).unwrap();
+        cache.maybe_evict().await;
+        assert!(path.exists(), "the replacement was evicted");
+        assert!(provenance_sidecar_path(&path).exists());
+        assert_eq!(cache.entry_count().await, 0);
+
+        // (c) The recorded file itself is evicted with its record.
+        cache.record(key, 123).await;
+        let mut cache2 = cache.clone();
+        cache2.max_bytes = 10;
+        cache2.maybe_evict().await;
+        assert!(!path.exists() && !provenance_sidecar_path(&path).exists());
+        assert_eq!(cache2.entry_count().await, 0);
+    }
+
+    /// B1539 — a stale staging directory of a dead instance is swept at
+    /// construction; a fresh one and the instance's own are not. An instance
+    /// whose directory was swept while idle claims a new one.
+    #[tokio::test]
+    async fn stale_staging_directories_are_swept_and_a_lost_one_is_reclaimed() {
+        let dir = TempDir::new().unwrap();
+        let a = HlsSegmentCache::new(dir.path(), 1 << 20);
+        let own = a.staging_dir().unwrap();
+        let parent = own.parent().unwrap().to_path_buf();
+        let old = parent.join("dead-pod");
+        let fresh = parent.join("live-pod");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(old.join("f"), b"x").unwrap();
+        let day = std::time::Duration::from_secs(25 * 3600);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(SystemTime::now() - day)
+            .unwrap();
+        sweep_stale_staging(&a.root, Some(&own), STAGING_SWEEP_AFTER);
+        assert!(!old.exists(), "a dead pod's staging directory leaked");
+        assert!(fresh.exists() && own.exists());
+
+        // The claimed directory vanishes (a peer's sweep): re-claim, never
+        // create the old path.
+        std::fs::remove_dir_all(&own).unwrap();
+        let again = a.live_staging_dir().await.unwrap();
+        assert_ne!(again, own);
+        assert!(again.is_dir());
+        assert!(!own.exists(), "the swept path must not be re-created");
     }
 
     /// B1539/V1540 — age alone never retires a real segment: only a filler is
