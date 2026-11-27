@@ -8248,6 +8248,7 @@ name = "pharos-cache"
 version = "0.0.0"
 dependencies = [
  "dashmap",
+ "libc",
  "metrics",
  "metrics-util",
  "pharos-core",
