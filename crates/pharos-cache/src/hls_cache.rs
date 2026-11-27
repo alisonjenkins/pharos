@@ -1161,6 +1161,13 @@ struct SegmentProvenance<'a> {
     /// disk days later is identifiable without re-deriving it from the
     /// frame counts above.
     filler: bool,
+    /// Inode and length of the staged file this record describes (unix). A
+    /// rename within one filesystem keeps the inode, so a reader can tell
+    /// these bytes from any other file later put at the keyed path, such as an
+    /// old filler restored after this publication failed. `None` on platforms
+    /// without inodes: such records are read as legacy ones.
+    inode: Option<u64>,
+    len: Option<u64>,
 }
 
 /// Record WHO produced a segment, next to the segment itself.
@@ -1190,6 +1197,8 @@ async fn write_provenance(
         "produced_frames": prov.produced_frames,
         "expected_frames": prov.expected_frames,
         "filler": prov.filler,
+        "inode": prov.inode,
+        "len": prov.len,
         "written_unix": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1288,23 +1297,61 @@ struct FillerProvenance {
 /// is only trustworthy as a PAIR with the bytes, so a caller reads the bytes
 /// first and the record after, and a record that vanished in between (a
 /// concurrent retirement moved it) lands here as `Unconfirmed` too.
+#[cfg(test)]
 async fn classify_segment(segment: &Path) -> (SegmentKind, Option<FillerProvenance>) {
+    let (kind, prov, _) = classify_record(segment).await;
+    (kind, prov)
+}
+
+/// The file a record says it describes: inode and length. Absent in records
+/// written before they were bound to their bytes (legacy: no check).
+#[derive(Clone, Copy, Default)]
+struct RecordBinding {
+    inode: Option<u64>,
+    len: Option<u64>,
+}
+
+/// [`classify_segment`] plus the binding the record carries.
+async fn classify_record(segment: &Path) -> (SegmentKind, Option<FillerProvenance>, RecordBinding) {
+    let none = RecordBinding::default();
     let Ok(text) = tokio::fs::read(provenance_sidecar_path(segment)).await else {
-        return (SegmentKind::Unconfirmed, None);
+        return (SegmentKind::Unconfirmed, None, none);
     };
     let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&text) else {
-        return (SegmentKind::Unconfirmed, None);
+        return (SegmentKind::Unconfirmed, None, none);
+    };
+    let binding = RecordBinding {
+        inode: doc.get("inode").and_then(serde_json::Value::as_u64),
+        len: doc.get("len").and_then(serde_json::Value::as_u64),
     };
     match doc.get("filler").and_then(serde_json::Value::as_bool) {
-        Some(false) => (SegmentKind::Real, None),
+        Some(false) => (SegmentKind::Real, None, binding),
         Some(true) => (
             SegmentKind::Filler,
             Some(FillerProvenance {
                 written_unix: doc.get("written_unix").and_then(serde_json::Value::as_u64),
             }),
+            binding,
         ),
-        None => (SegmentKind::Unconfirmed, None),
+        None => (SegmentKind::Unconfirmed, None, none),
     }
+}
+
+/// Whether the file now at the keyed path is the one a record describes. A
+/// legacy record (no inode or length) and a platform without inodes keep the
+/// length-and-mtime check alone.
+fn record_matches_file(binding: RecordBinding, now: &std::fs::Metadata) -> bool {
+    if binding.len.is_some_and(|l| l != now.len()) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if binding.inode.is_some_and(|i| i != now.ino()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Age in seconds when `kind` is a filler old enough to retry from source.
@@ -1329,10 +1376,18 @@ async fn classify_paired(
     segment: &Path,
     read: &std::fs::Metadata,
 ) -> (SegmentKind, Option<FillerProvenance>) {
-    let (kind, prov) = classify_segment(segment).await;
-    let unchanged = tokio::fs::metadata(segment)
-        .await
-        .is_ok_and(|now| now.len() == read.len() && now.modified().ok() == read.modified().ok());
+    let (kind, prov, binding) = classify_record(segment).await;
+    #[cfg(test)]
+    tests::record_read_gate().await;
+    // The re-stat must see the very file that was read (length and mtime) AND
+    // the file the record describes (inode): a record for a replacement that
+    // was rolled back, with the old filler restored, matches the former but
+    // not the latter.
+    let unchanged = tokio::fs::metadata(segment).await.is_ok_and(|now| {
+        now.len() == read.len()
+            && now.modified().ok() == read.modified().ok()
+            && record_matches_file(binding, &now)
+    });
     if unchanged {
         (kind, prov)
     } else {
@@ -5163,22 +5218,30 @@ impl HlsSegmentCache {
             let record = if occupied {
                 None
             } else {
-                Some(
-                    write_provenance(
-                        &path,
-                        SegmentProvenance {
-                            device: device.as_deref(),
-                            generation: generation(),
-                            transcode_ms: transcode_ms as u64,
-                            encode_ms: timing.as_ref().map(|t| t.encode_ms),
-                            queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
-                            produced_frames,
-                            expected_frames,
-                            filler: is_filler,
-                        },
-                    )
-                    .await,
+                #[cfg(unix)]
+                let inode = {
+                    use std::os::unix::fs::MetadataExt;
+                    tokio::fs::metadata(&tmp).await.ok().map(|m| m.ino())
+                };
+                #[cfg(not(unix))]
+                let inode = None;
+                let written = write_provenance(
+                    &path,
+                    SegmentProvenance {
+                        device: device.as_deref(),
+                        generation: generation(),
+                        transcode_ms: transcode_ms as u64,
+                        encode_ms: timing.as_ref().map(|t| t.encode_ms),
+                        queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
+                        produced_frames,
+                        expected_frames,
+                        filler: is_filler,
+                        inode,
+                        len: Some(bytes.len() as u64),
+                    },
                 )
+                .await;
+                Some(written)
             };
             match record {
                 None => {
@@ -10955,8 +11018,21 @@ mod tests {
             const { std::cell::Cell::new(0) };
         static STALE_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
             const { std::cell::RefCell::new(None) };
+        static RECORD_READ_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
+            const { std::cell::RefCell::new(None) };
         static EVICT_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
             const { std::cell::RefCell::new(None) };
+    }
+
+    /// Holds a paired read between reading the record and its re-stat.
+    pub(super) async fn record_read_gate() {
+        let gate = RECORD_READ_GATE.with(|g| g.borrow_mut().take());
+        if let Some(g) = gate {
+            g.arrived.add_permits(1);
+            if let Ok(p) = g.proceed.acquire().await {
+                p.forget();
+            }
+        }
     }
 
     pub(super) fn note_publish_lock_attempt() {
@@ -11936,6 +12012,93 @@ mod tests {
             "bytes restored beside a record that is not theirs"
         );
         assert!(held.exists(), "the filler left the quarantine ring");
+    }
+
+    /// B1539 — a record is bound to its bytes by inode. A reader that read the
+    /// old filler, then the replacement's record, must not call the old
+    /// filler `Real` once the failed publication has restored it (same
+    /// length and mtime, but not the inode the record describes).
+    ///
+    /// Disarm evidence: without the inode comparison in the re-stat the
+    /// restored filler is classified `Real`, so this goes RED.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_record_for_a_rolled_back_replacement_does_not_make_the_old_bytes_real() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(11, 0, None, None, &opts, SourceGen::LOCAL);
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![1u8; 64]).unwrap();
+        std::fs::write(
+            provenance_sidecar_path(&path),
+            r#"{"filler":true,"written_unix":1}"#,
+        )
+        .unwrap();
+        // The reader has read the old bytes.
+        let read = std::fs::metadata(&path).unwrap();
+        // The writer retires the filler and writes the replacement's record.
+        assert_eq!(
+            cache.take_out_of_service(key, &path, &read).await,
+            Some(true)
+        );
+        write_provenance(
+            &path,
+            SegmentProvenance {
+                device: None,
+                generation: "g",
+                transcode_ms: 0,
+                encode_ms: None,
+                queue_wait_ms: None,
+                produced_frames: None,
+                expected_frames: None,
+                filler: false,
+                inode: Some(read.ino() + 1),
+                len: Some(read.len()),
+            },
+        )
+        .await
+        .unwrap();
+        let gate = Arc::new(StaleGate {
+            arrived: tokio::sync::Semaphore::new(0),
+            proceed: tokio::sync::Semaphore::new(0),
+        });
+        RECORD_READ_GATE.with(|g| *g.borrow_mut() = Some(gate.clone()));
+        let reader = {
+            let path = path.clone();
+            tokio::spawn(async move { classify_paired(&path, &read).await.0 })
+        };
+        // The reader has read the replacement's record. The publication now
+        // fails and rolls back: its record goes, the old pair comes back.
+        tokio::time::timeout(std::time::Duration::from_secs(20), gate.arrived.acquire())
+            .await
+            .expect("the reader never reached its gate within 20 s")
+            .unwrap()
+            .forget();
+        assert!(remove_own_record(&path).await);
+        cache.restore_retired_filler(key, &path).await;
+        gate.proceed.add_permits(1);
+        let kind = reader.await.unwrap();
+        assert_ne!(kind, SegmentKind::Real, "the old bytes were read as real");
+        assert_eq!(kind, SegmentKind::Unconfirmed);
+    }
+
+    /// B1539 — a record written before records carried an inode still
+    /// classifies as before, so a deploy does not downgrade existing segments.
+    #[tokio::test]
+    async fn a_legacy_record_without_an_inode_is_still_real() {
+        let dir = TempDir::new().unwrap();
+        let seg = dir.path().join("seg.m4s");
+        std::fs::write(&seg, vec![1u8; 64]).unwrap();
+        std::fs::write(
+            provenance_sidecar_path(&seg),
+            r#"{"filler":false,"written_unix":1}"#,
+        )
+        .unwrap();
+        let meta = std::fs::metadata(&seg).unwrap();
+        assert_eq!(classify_paired(&seg, &meta).await.0, SegmentKind::Real);
     }
 
     /// B1539 — an LRU entry recorded without a known mtime is never treated as
