@@ -823,16 +823,23 @@ pub enum SegmentKind {
     /// or one a concurrent retirement just moved), unreadable or unparsable.
     /// Served, but a client must not pin it for long.
     Unconfirmed,
+    /// Bytes served WITHOUT being retained at the keyed path (the provenance
+    /// record could not be written, the path was occupied, or a short segment
+    /// was refused for caching), whatever they truly are. A later encode can
+    /// replace what the cache holds under this key, so a client must not keep
+    /// these or validate them against a key-derived ETag.
+    Transient,
 }
 
 impl SegmentKind {
-    pub const ALL: [Self; 3] = [Self::Real, Self::Filler, Self::Unconfirmed];
+    pub const ALL: [Self; 4] = [Self::Real, Self::Filler, Self::Unconfirmed, Self::Transient];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Real => "real",
             Self::Filler => "filler",
             Self::Unconfirmed => "unconfirmed",
+            Self::Transient => "transient",
         }
     }
 }
@@ -3309,11 +3316,6 @@ impl HlsSegmentCache {
         path: &Path,
         read: &std::fs::Metadata,
     ) -> Option<bool> {
-        // Test hook: a retirement that can neither move nor delete the file.
-        #[cfg(test)]
-        if tests::RETIREMENT_FAILS.with(std::cell::Cell::get) {
-            return Some(false);
-        }
         // A concurrent request may already have quarantined these bytes and
         // published a fresh encode at the same path; that file is not ours to
         // move. Same length and mtime is the file this request read.
@@ -3330,9 +3332,19 @@ impl HlsSegmentCache {
             .unwrap_or_default();
         let dest = pen.join(format!("{}-{name}", key.media_id));
         let moved = match tokio::fs::create_dir_all(&pen).await {
+            // Test hook: the segment can be neither moved nor deleted.
+            #[cfg(test)]
+            Ok(()) if tests::RETIREMENT_FAILS.with(std::cell::Cell::get) => {
+                Err(std::io::Error::other("injected"))
+            }
             Ok(()) => tokio::fs::rename(path, &dest).await,
             Err(e) => Err(e),
         };
+        // Whether the segment is still at `path` after the attempt. Its sidecar
+        // follows the segment and never goes first: a segment left in place
+        // without its record reads as `Unconfirmed` and a stale filler would
+        // never be retried (B1539).
+        let mut still_there = false;
         let kept = match moved {
             Ok(()) => {
                 let _ = tokio::fs::rename(
@@ -3346,12 +3358,31 @@ impl HlsSegmentCache {
             }
             Err(e) => {
                 tracing::debug!(path = %path.display(), error = %e, "could not quarantine a defective segment; deleting it");
-                let _ = tokio::fs::remove_file(path).await;
-                let _ = tokio::fs::remove_file(provenance_sidecar_path(path)).await;
+                #[cfg(test)]
+                let removed = if tests::RETIREMENT_FAILS.with(std::cell::Cell::get) {
+                    Err(std::io::Error::other("injected"))
+                } else {
+                    tokio::fs::remove_file(path).await
+                };
+                #[cfg(not(test))]
+                let removed = tokio::fs::remove_file(path).await;
+                match removed {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(provenance_sidecar_path(path)).await;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let _ = tokio::fs::remove_file(provenance_sidecar_path(path)).await;
+                    }
+                    Err(e) => {
+                        still_there = true;
+                        tracing::warn!(path = %path.display(), error = %e, "could not delete a segment taken out of service; leaving it and its provenance record in place");
+                    }
+                }
                 false
             }
         };
-        {
+        // A segment that is still on disk keeps its LRU entry.
+        if !still_there {
             let mut state = self.state.lock().await;
             if let Some(meta) = state.entries.remove(&key) {
                 state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
@@ -4804,6 +4835,9 @@ impl HlsSegmentCache {
         // its duration — at 6 s that is 600 ms, ~14 frames, a plainly visible
         // stutter that reads as a healthy segment. These fields make the
         // difference queryable instead of invisible.
+        // Whether these bytes are still what the keyed path holds; the short
+        // refusal below can take them out again.
+        let mut retained = cached;
         let frame_deficit = match (expected_frames, produced_frames) {
             // Only meaningful when this segment actually encodes video.
             (Some(want), Some(got)) if opts.video.is_some() => Some(want as i64 - got as i64),
@@ -4878,8 +4912,15 @@ impl HlsSegmentCache {
                     short_disposition(result, already_refused),
                     ShortDisposition::ReEncode
                 ) {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                    // Segment first, record after, and only if the segment is gone.
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => retained = false,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => retained = false,
+                        Err(_) => {}
+                    }
+                    if !retained {
+                        let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                    }
                     metrics::counter!(
                         "pharos_segment_frames_refused_total",
                         "disposition" => "reencode",
@@ -4933,13 +4974,17 @@ impl HlsSegmentCache {
         }
         // An unpublished segment has no file, so no LRU entry: the accounting
         // would otherwise carry bytes the eviction walk can never find.
-        if cached {
+        if retained {
             self.record(key, bytes.len() as u64).await;
             self.maybe_evict().await;
         }
         Ok(ProducedSegment {
             bytes,
-            kind,
+            kind: if retained {
+                kind
+            } else {
+                SegmentKind::Transient
+            },
             rechecked: false,
         })
     }
@@ -10295,9 +10340,13 @@ mod tests {
     /// filler is served as a filler, nothing is encoded, and its record is
     /// untouched.
     ///
+    /// The failure is injected at the segment move/delete step, so the real
+    /// cleanup code runs: the record must stay beside a segment that stays.
+    ///
     /// Disarm evidence: with the still-present check removed from
-    /// `recheck_cached`, the driver encodes, attempts become 4 and the record
-    /// is overwritten, so this goes RED.
+    /// `recheck_cached` the driver encodes (attempts 4), and with the record
+    /// removed before the segment's own removal succeeds the record is gone;
+    /// both go RED.
     #[test]
     fn a_filler_that_cannot_be_retired_is_served_as_a_filler_and_not_re_encoded() {
         use metrics_util::debugging::DebuggingRecorder;
@@ -10329,7 +10378,6 @@ mod tests {
                 backdate(&path, FILLER_RETRY_AFTER_SECS + 60);
                 RETIREMENT_FAILS.with(|f| f.set(true));
                 let (_, _, kind) = ask_filler_variant(&cache, &source, &opts).await;
-                RETIREMENT_FAILS.with(|f| f.set(false));
                 assert_eq!(kind, SegmentKind::Filler, "never classified Real");
                 assert_eq!(
                     real_attempts.load(std::sync::atomic::Ordering::SeqCst),
@@ -10341,15 +10389,38 @@ mod tests {
                     record_before,
                     "the record still describes the bytes at the path"
                 );
+                // Still a filler on the next read, not Unconfirmed: the record
+                // was not removed with the segment left behind.
+                let (_, served, kind) = ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!((served, kind), (SegmentServed::Hit, SegmentKind::Filler));
+
+                // The filesystem recovers: the next read retires and re-encodes.
+                RETIREMENT_FAILS.with(|f| f.set(false));
+                let (_, served, kind) = ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!((served, kind), (SegmentServed::Miss, SegmentKind::Filler));
+                assert_eq!(real_attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
             });
         });
+        // One snapshot reads (and clears) every counter, so take both from it.
+        let snap = snapshotter.snapshot().into_vec();
+        let count = |name: &str| -> u64 {
+            snap.iter()
+                .filter(|(k, ..)| k.key().name() == name)
+                .map(|(.., v)| match v {
+                    metrics_util::debugging::DebugValue::Counter(n) => *n,
+                    _ => 0,
+                })
+                .sum()
+        };
         assert_eq!(
-            counter_value(&snapshotter, "pharos_segment_filler_retire_failed_total"),
-            1
+            count("pharos_segment_filler_retire_failed_total"),
+            2,
+            "the failed retirement is counted on each read while the hook is set"
         );
         assert_eq!(
-            counter_value(&snapshotter, "pharos_segment_filler_retry_total"),
-            0
+            count("pharos_segment_filler_retry_total"),
+            1,
+            "only the retirement that succeeded after recovery counts"
         );
     }
 
@@ -10400,7 +10471,7 @@ mod tests {
                     .await
                     .expect("served uncached");
                 RETIREMENT_FAILS.with(|f| f.set(false));
-                assert_eq!(kind, SegmentKind::Real);
+                assert_eq!(kind, SegmentKind::Transient);
                 assert_ne!(bytes, vec![0u8; 8192]);
             });
         });
@@ -10573,7 +10644,11 @@ mod tests {
                     .await
                     .expect("the request succeeds uncached");
                 assert!(!bytes.is_empty());
-                assert_eq!((served, kind), (SegmentServed::Miss, SegmentKind::Real));
+                assert_eq!(
+                    (served, kind),
+                    (SegmentServed::Miss, SegmentKind::Transient),
+                    "unretained bytes are Transient whatever they are"
+                );
             });
         });
         assert!(
