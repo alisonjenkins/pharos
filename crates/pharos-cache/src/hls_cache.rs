@@ -5020,12 +5020,19 @@ impl HlsSegmentCache {
         // over bytes still there would describe the wrong ones. The retirement
         // that precedes an encode can fail to remove a file; then the bytes are
         // served uncached and the old file and its record are left as they are.
+        let publish_lock = if short_refused {
+            None
+        } else {
+            #[cfg(test)]
+            tests::note_publish_lock_attempt();
+            self.publish_lock_or_count(&path).await
+        };
         let cached = if short_refused {
             // Never published: no record, no rename, no LRU entry. The bytes
             // are served to the requesters as `Transient`.
             let _ = tokio::fs::remove_file(&tmp).await;
             false
-        } else if let Some(_lock) = self.publish_lock_or_count(&path).await {
+        } else if let Some(_lock) = publish_lock {
             // The occupied check, the record and the rename are one critical
             // section across processes (B1539): a pod sharing this volume
             // could otherwise interleave its own record write or rename.
@@ -10819,10 +10826,18 @@ mod tests {
         /// Makes the publishing rename fail after the record was written.
         pub(super) static RENAME_FAILS: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// How many times a producer on this thread has reached the publish
+        /// lock acquisition.
+        static PUBLISH_LOCK_ATTEMPTS: std::cell::Cell<u32> =
+            const { std::cell::Cell::new(0) };
         static STALE_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
             const { std::cell::RefCell::new(None) };
         static EVICT_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
             const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn note_publish_lock_attempt() {
+        PUBLISH_LOCK_ATTEMPTS.with(|c| c.set(c.get() + 1));
     }
 
     /// Holds the FIRST eviction unit between the scan and its removal.
@@ -11377,6 +11392,7 @@ mod tests {
         let source = Path::new("/no/source");
         let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::for_read(source, None));
         let path = cache.segment_path_keyed(key);
+        PUBLISH_LOCK_ATTEMPTS.with(|c| c.set(0));
         let held = hold_publish_lock_elsewhere(&cache, &path);
 
         let task = {
@@ -11398,26 +11414,17 @@ mod tests {
                     .await
             })
         };
-        // The encode finishes into its tmp file, then waits at the lock.
-        // B1539 — temp files live in the instance's staging directory.
-        let dir_of = cache.staging_dir().unwrap();
-        let tmp_seen = || {
-            std::fs::read_dir(&dir_of).is_ok_and(|d| {
-                d.flatten()
-                    .any(|e| e.file_name().to_string_lossy().contains("tmp"))
-            })
-        };
-        // Bounded: a request that finished before the checkpoint, or an encode
-        // that never staged a file, fails the test promptly instead of hanging.
+        // Wait for the signal that the producer reached the lock acquisition
+        // (not for a temp file). Bounded, and prompt if the request finished.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while !tmp_seen() {
+        while PUBLISH_LOCK_ATTEMPTS.with(std::cell::Cell::get) == 0 {
             assert!(
                 !task.is_finished(),
-                "the request finished before reaching the lock checkpoint"
+                "the request finished before it reached the publish lock"
             );
             assert!(
                 std::time::Instant::now() < deadline,
-                "no staged temp file appeared within 20 s"
+                "the producer never attempted the publish lock within 20 s"
             );
             tokio::task::yield_now().await;
         }
