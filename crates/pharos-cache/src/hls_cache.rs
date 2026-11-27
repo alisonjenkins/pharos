@@ -3251,7 +3251,27 @@ impl HlsSegmentCache {
         }
         let (kind, prov) = classify_paired(path, &meta).await;
         if let Some(age_secs) = stale_filler_age(kind, &meta, prov.as_ref()) {
-            if let Some(kept) = self.take_out_of_service(key, path, &meta).await {
+            let retired = self.take_out_of_service(key, path, &meta).await;
+            // A retirement that could neither move nor delete the file leaves
+            // the old bytes at the path. Encoding now would pair them with the
+            // new encode's record, so serve what is there, as the filler it is,
+            // and try again on a later read.
+            if tokio::fs::symlink_metadata(path).await.is_ok() {
+                metrics::counter!("pharos_segment_filler_retire_failed_total").increment(1);
+                tracing::warn!(
+                    media.id = key.media_id,
+                    seg = key.seg_index,
+                    age_secs,
+                    path = %path.display(),
+                    "stale filler could not be taken out of service; serving it without re-encoding (B1539)"
+                );
+                return Some(ProducedSegment {
+                    bytes,
+                    kind: SegmentKind::Filler,
+                    rechecked: true,
+                });
+            }
+            if let Some(kept) = retired {
                 metrics::counter!("pharos_segment_filler_retry_total").increment(1);
                 tracing::info!(
                     media.id = key.media_id,
@@ -3289,6 +3309,11 @@ impl HlsSegmentCache {
         path: &Path,
         read: &std::fs::Metadata,
     ) -> Option<bool> {
+        // Test hook: a retirement that can neither move nor delete the file.
+        #[cfg(test)]
+        if tests::RETIREMENT_FAILS.with(std::cell::Cell::get) {
+            return Some(false);
+        }
         // A concurrent request may already have quarantined these bytes and
         // published a fresh encode at the same path; that file is not ours to
         // move. Same length and mtime is the file this request read.
@@ -3634,6 +3659,8 @@ impl HlsSegmentCache {
                         let (kind, prov) = classify_paired(&path, &meta).await;
                         if stale_filler_age(kind, &meta, prov.as_ref()).is_some() {
                             stale_filler = Some(b);
+                            #[cfg(test)]
+                            tests::stale_gate().await;
                         } else {
                             self.touch(key).await;
                             record_cache_hit(
@@ -4618,28 +4645,55 @@ impl HlsSegmentCache {
         // requesters still get these bytes with their true kind (the request
         // succeeds, uncached), and the next request encodes again. Publishing
         // anyway would leave a segment a reader can only call `Unconfirmed`.
-        let record = write_provenance(
-            &path,
-            SegmentProvenance {
-                device: device.as_deref(),
-                generation: generation(),
-                transcode_ms: transcode_ms as u64,
-                encode_ms: timing.as_ref().map(|t| t.encode_ms),
-                queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
-                produced_frames,
-                expected_frames,
-                filler: is_filler,
-            },
-        )
-        .await;
+        // The sidecar is only ever written at an EMPTY keyed path, so a sidecar
+        // always describes the bytes at the path or no bytes: a record written
+        // over bytes still there would describe the wrong ones. The retirement
+        // that precedes an encode can fail to remove a file; then the bytes are
+        // served uncached and the old file and its record are left as they are.
+        // A directory is left to the rename to refuse (and count) below.
+        let occupied = tokio::fs::symlink_metadata(&path)
+            .await
+            .is_ok_and(|m| !m.is_dir());
+        let record = if occupied {
+            None
+        } else {
+            Some(
+                write_provenance(
+                    &path,
+                    SegmentProvenance {
+                        device: device.as_deref(),
+                        generation: generation(),
+                        transcode_ms: transcode_ms as u64,
+                        encode_ms: timing.as_ref().map(|t| t.encode_ms),
+                        queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
+                        produced_frames,
+                        expected_frames,
+                        filler: is_filler,
+                    },
+                )
+                .await,
+            )
+        };
         let cached = match record {
-            Ok(()) => {
+            None => {
+                tracing::warn!(
+                    media.id = media_id,
+                    seg = seg_index,
+                    kind = kind.label(),
+                    path = %path.display(),
+                    "keyed path is still occupied after retirement; serving the segment without caching it (B1539)"
+                );
+                metrics::counter!("pharos_segment_publish_occupied_total").increment(1);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                false
+            }
+            Some(Ok(())) => {
                 tokio::fs::rename(&tmp, &path)
                     .await
                     .map_err(|e| counted("publish_rename", e.into()))?;
                 true
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 tracing::warn!(
                     media.id = media_id,
                     seg = seg_index,
@@ -10130,6 +10184,230 @@ mod tests {
         });
         assert_eq!(
             counter_value(&snapshotter, "pharos_segment_filler_retry_total"),
+            1
+        );
+    }
+
+    thread_local! {
+        /// Makes `take_out_of_service` fail without touching the file.
+        pub(super) static RETIREMENT_FAILS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        static STALE_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Holds every hit-path reader of a stale filler between its stale check and
+    /// the registry until the test releases it.
+    struct StaleGate {
+        arrived: tokio::sync::Semaphore,
+        proceed: tokio::sync::Semaphore,
+    }
+
+    pub(super) async fn stale_gate() {
+        let gate = STALE_GATE.with(|g| g.borrow().clone());
+        if let Some(g) = gate {
+            g.arrived.add_permits(1);
+            if let Ok(p) = g.proceed.acquire().await {
+                p.forget();
+            }
+        }
+    }
+
+    /// B1539/V1540 — two readers both see the stale filler before either has
+    /// retired it. Exactly one retirement and one re-encode happen. The gate
+    /// holds both between the hit path's stale check and the registry; one is
+    /// released and finishes, then the other runs against the replacement.
+    ///
+    /// Disarm evidence: with `recheck_cached` returning `None` for a usable
+    /// file, whichever reader registers after the first published encodes again
+    /// (attempts 6, not 4), so this goes RED.
+    #[test]
+    fn two_readers_of_one_stale_filler_retire_and_encode_once() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache = cache.with_scheduler(always_short_until_filler(false, real_attempts.clone()));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        let key =
+            SegmentIdentity::new(42, 0, None, None, &opts, SourceGen::for_read(&source, None));
+        let path = cache.segment_path_keyed(key);
+        let attempts = || real_attempts.load(std::sync::atomic::Ordering::SeqCst);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!(attempts(), 2, "precondition: the ladder ran once");
+                backdate(&path, FILLER_RETRY_AFTER_SECS + 60);
+
+                let gate = Arc::new(StaleGate {
+                    arrived: tokio::sync::Semaphore::new(0),
+                    proceed: tokio::sync::Semaphore::new(0),
+                });
+                STALE_GATE.with(|g| *g.borrow_mut() = Some(gate.clone()));
+                let spawn_reader = || {
+                    let (cache, source, opts) = (cache.clone(), source.clone(), opts.clone());
+                    tokio::spawn(async move { ask_filler_variant(&cache, &source, &opts).await })
+                };
+                let mut a = spawn_reader();
+                let mut b = spawn_reader();
+                // Both have read the stale filler and not yet registered.
+                gate.arrived.acquire_many(2).await.unwrap().forget();
+                assert_eq!(attempts(), 2, "nothing has retired or encoded yet");
+                gate.proceed.add_permits(1);
+                let (first, rest) = tokio::select! {
+                    r = &mut a => (r, &mut b),
+                    r = &mut b => (r, &mut a),
+                };
+                first.unwrap();
+                gate.proceed.add_permits(1);
+                rest.await.unwrap();
+                STALE_GATE.with(|g| *g.borrow_mut() = None);
+                assert_eq!(attempts(), 4, "exactly one re-encode");
+            });
+        });
+        assert_eq!(
+            counter_value(&snapshotter, "pharos_segment_filler_retry_total"),
+            1
+        );
+        let kept = cache
+            .quarantined()
+            .into_iter()
+            .filter(|(name, ..)| !name.ends_with(PROVENANCE_SUFFIX))
+            .count();
+        assert_eq!(kept, 1, "{:?}", cache.quarantined());
+    }
+
+    /// B1539/V1540 — a retirement that cannot remove the stale filler must not
+    /// lead to an encode whose record is written over the old bytes: the old
+    /// filler is served as a filler, nothing is encoded, and its record is
+    /// untouched.
+    ///
+    /// Disarm evidence: with the still-present check removed from
+    /// `recheck_cached`, the driver encodes, attempts become 4 and the record
+    /// is overwritten, so this goes RED.
+    #[test]
+    fn a_filler_that_cannot_be_retired_is_served_as_a_filler_and_not_re_encoded() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache = cache.with_scheduler(always_short_until_filler(false, real_attempts.clone()));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        let key =
+            SegmentIdentity::new(42, 0, None, None, &opts, SourceGen::for_read(&source, None));
+        let path = cache.segment_path_keyed(key);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                ask_filler_variant(&cache, &source, &opts).await;
+                let record_before = std::fs::read(provenance_sidecar_path(&path)).unwrap();
+                backdate(&path, FILLER_RETRY_AFTER_SECS + 60);
+                RETIREMENT_FAILS.with(|f| f.set(true));
+                let (_, _, kind) = ask_filler_variant(&cache, &source, &opts).await;
+                RETIREMENT_FAILS.with(|f| f.set(false));
+                assert_eq!(kind, SegmentKind::Filler, "never classified Real");
+                assert_eq!(
+                    real_attempts.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "no encode while the old bytes cannot be retired"
+                );
+                assert_eq!(
+                    std::fs::read(provenance_sidecar_path(&path)).unwrap(),
+                    record_before,
+                    "the record still describes the bytes at the path"
+                );
+            });
+        });
+        assert_eq!(
+            counter_value(&snapshotter, "pharos_segment_filler_retire_failed_total"),
+            1
+        );
+        assert_eq!(
+            counter_value(&snapshotter, "pharos_segment_filler_retry_total"),
+            0
+        );
+    }
+
+    /// B1539/V1540 — whatever left a file at the keyed path, an encode never
+    /// writes its record over it: the fresh bytes are served uncached, the old
+    /// file is untouched, and no record appears for it.
+    ///
+    /// Disarm evidence: with the `occupied` check removed, the record is written
+    /// beside the old bytes and the counter stays 0, so this goes RED.
+    #[test]
+    fn an_encode_never_writes_a_record_over_bytes_already_at_the_path() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let cache = cache.with_scheduler(writes_each_segment(std::time::Duration::ZERO));
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::for_read(source, None));
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A defective file the quarantine cannot move.
+        std::fs::write(&path, vec![0u8; 8192]).unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                RETIREMENT_FAILS.with(|f| f.set(true));
+                let (bytes, _, kind) = cache
+                    .segment_bytes_keyed_served(
+                        7,
+                        0,
+                        None,
+                        None,
+                        source,
+                        None,
+                        &opts,
+                        JobClass::Interactive,
+                        StreamKey::NONE,
+                        PlayheadSeed::Observes,
+                    )
+                    .await
+                    .expect("served uncached");
+                RETIREMENT_FAILS.with(|f| f.set(false));
+                assert_eq!(kind, SegmentKind::Real);
+                assert_ne!(bytes, vec![0u8; 8192]);
+            });
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0u8; 8192]);
+        assert!(!provenance_sidecar_path(&path).exists());
+        assert_eq!(
+            counter_value(&snapshotter, "pharos_segment_publish_occupied_total"),
             1
         );
     }
