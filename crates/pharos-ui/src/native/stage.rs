@@ -8,10 +8,13 @@
 use dioxus::prelude::*;
 use pharos_client::api::ItemRef;
 
-use super::listen::{Icon, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
+use super::group_app::Together;
+use super::listen::{Icon, QueuePanel, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
 use super::platform;
 use super::playback::{position_at, MediaState};
+use super::queue::{QueueAction, QueueCtx};
 use super::route::Route;
+use super::views::Nav;
 use super::watch_view::Control;
 
 /// The stage element, for its size while dragging.
@@ -849,6 +852,137 @@ pub fn StageBar(
     }
 }
 
+/// Whether the bar for a waiting queue shows (B1540/V1541): nothing plays,
+/// so no player holds the queue, and songs wait in it. A group picks what
+/// plays, so its members get no bar.
+pub fn idle_queue_shown(playing: Option<ItemRef>, in_group: bool, upcoming: usize) -> bool {
+    playing.is_none() && !in_group && upcoming > 0
+}
+
+/// What the waiting-queue bar logs as it shows, hides or starts the queue.
+pub fn idle_queue_line(event: &str, upcoming: usize) -> String {
+    format!("pharos: idle queue event={event} upcoming={upcoming}")
+}
+
+/// The mini bar while songs wait and nothing plays (B1540/V1541): Play
+/// starts the queue's first song, and the queue button opens the queue
+/// beside it, as the compact player's does. Without it, songs added with
+/// nothing playing had no way to start or be seen.
+#[component]
+pub fn IdleQueueBar() -> Element {
+    let StageCtx(stage) = use_context::<StageCtx>();
+    let queue = try_use_context::<QueueCtx>();
+    let nav = try_use_context::<Nav>();
+    let in_group = try_use_context::<Together>().is_some_and(|t| t.view.read().active);
+    let own_dock = use_signal(|| false);
+    let mut dock = try_use_context::<QueueDock>().map_or(own_dock, |d| d.0);
+    let (Some(QueueCtx(mut queue)), Some(nav)) = (queue, nav) else {
+        return rsx! {};
+    };
+    let upcoming = queue.read().upcoming().len();
+    if !idle_queue_shown(stage.read().item, in_group, upcoming) {
+        return rsx! {};
+    }
+    let start = move |id: ItemRef| {
+        platform::info(&idle_queue_line("play", queue.peek().upcoming().len()));
+        nav.0.call(Route::Watch(id));
+    };
+    let on_queue = EventHandler::new(move |action: QueueAction| {
+        let play = match action {
+            QueueAction::Play(key) => queue
+                .peek()
+                .upcoming()
+                .iter()
+                .find(|e| e.key == key)
+                .map(|e| e.id),
+            _ => None,
+        };
+        queue.write().apply(action, platform::now_ms().to_bits());
+        platform::info(&format!(
+            "pharos: queue action={} upcoming={} player=idle",
+            action.label(),
+            queue.peek().upcoming().len()
+        ));
+        if let Some(id) = play {
+            start(id);
+        }
+    });
+    let mut toggle = move || {
+        let open = !*dock.peek();
+        dock.set(open);
+        super::listen::store_dock(open);
+        platform::info(&idle_queue_line(
+            if open { "queue_shown" } else { "queue_hidden" },
+            queue.peek().upcoming().len(),
+        ));
+    };
+    let first = queue.read().next();
+    let waiting = match upcoming {
+        1 => "1 song waiting".to_owned(),
+        n => format!("{n} songs waiting"),
+    };
+    rsx! {
+        div { class: "pharos-stage is-mini is-idle",
+            div { class: "pharos-stage-bar", "data-view": "mini",
+                div { class: STRIP_CLASS,
+                    div { class: "pharos-stage-text",
+                        p { class: "pharos-stage-title", "Queue" }
+                        p { class: "pharos-stage-waiting", "{waiting}" }
+                    }
+                    div { class: "pharos-stage-transport", role: "group", aria_label: "Transport",
+                        button {
+                            class: "pharos-stage-button pharos-stage-play",
+                            r#type: "button",
+                            aria_label: "Play the queue",
+                            title: "Play the queue",
+                            "data-key-action": "play",
+                            disabled: first.is_none(),
+                            onclick: move |_| {
+                                if let Some(id) = first {
+                                    start(id);
+                                }
+                            },
+                            Icon { path: ICON_PLAY }
+                        }
+                    }
+                    div { class: "pharos-stage-extra",
+                        button {
+                            id: STAGE_QUEUE_ID,
+                            class: "pharos-stage-button pharos-stage-queue",
+                            r#type: "button",
+                            "data-key-action": "queue",
+                            aria_label: queue_label(upcoming),
+                            title: "Show or hide what plays next",
+                            aria_pressed: if dock() { "true" } else { "false" },
+                            aria_controls: dock().then_some(QUEUE_PANEL_ID),
+                            onclick: move |_| toggle(),
+                            Icon { path: ICON_QUEUE_NEXT }
+                            span { class: "pharos-queue-count", aria_hidden: "true", "{upcoming}" }
+                        }
+                    }
+                }
+            }
+            if dock() {
+                div {
+                    class: "pharos-queue-dock",
+                    "data-view": "mini",
+                    "data-side": "right",
+                    "data-edge": "top",
+                    QueuePanel {
+                        queue: queue.read().upcoming().to_vec(),
+                        shuffled: queue.read().shuffled(),
+                        on_queue,
+                        on_escape: move |()| {
+                            toggle();
+                            platform::focus_by_id(STAGE_QUEUE_ID);
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The queue button's name, with how many songs wait so a screen reader
 /// hears the count the badge shows.
 pub fn queue_label(count: usize) -> String {
@@ -991,6 +1125,65 @@ const ICON_CLOSE: &str = "M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::queue::{Queue, Track};
+
+    /// The waiting-queue bar's HTML with `songs` queued and `playing` on the
+    /// player.
+    fn idle_bar(songs: u64, playing: Option<ItemRef>) -> String {
+        #[derive(Props, Clone, PartialEq)]
+        struct Setup {
+            songs: u64,
+            playing: Option<ItemRef>,
+        }
+        #[allow(non_snake_case)]
+        fn Root(p: Setup) -> Element {
+            let mut queue = Queue::default();
+            queue.add(
+                (1..=p.songs)
+                    .map(|n| Track {
+                        id: ItemRef::Real(n),
+                        name: format!("Song {n}"),
+                        runtime_ms: 1_000,
+                    })
+                    .collect(),
+            );
+            use_context_provider(|| QueueCtx(Signal::new(queue)));
+            use_context_provider(|| {
+                StageCtx(Signal::new(Stage {
+                    item: p.playing,
+                    ..Stage::default()
+                }))
+            });
+            use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
+            rsx! { IdleQueueBar {} }
+        }
+        let mut dom = VirtualDom::new_with_props(Root, Setup { songs, playing });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn queued_songs_with_nothing_playing_get_a_bar_to_start_and_see_them() {
+        let html = idle_bar(2, None);
+        assert!(html.contains("aria-label=\"Play the queue\""), "{html}");
+        assert!(html.contains("2 songs waiting"), "{html}");
+        assert!(html.contains("aria-label=\"Queue, 2 songs\""), "{html}");
+        assert!(html.contains("is-mini"), "{html}");
+    }
+
+    #[test]
+    fn no_waiting_queue_bar_while_something_plays_or_the_queue_is_empty() {
+        assert!(!idle_bar(2, Some(ItemRef::Real(9))).contains("pharos-stage"));
+        assert!(!idle_bar(0, None).contains("pharos-stage"));
+    }
+
+    #[test]
+    fn a_group_gets_no_waiting_queue_bar() {
+        assert!(idle_queue_shown(None, false, 1));
+        assert!(!idle_queue_shown(None, true, 1));
+        assert!(!idle_queue_shown(Some(ItemRef::Real(1)), false, 1));
+        assert!(!idle_queue_shown(None, false, 0));
+    }
 
     const VIEWPORT: (f64, f64) = (1000.0, 800.0);
     const WINDOW: (f64, f64) = (320.0, 220.0);
