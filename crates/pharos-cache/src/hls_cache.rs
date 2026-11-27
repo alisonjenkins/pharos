@@ -11654,7 +11654,11 @@ mod tests {
             };
             // The scan has run and picked the old record; now a replacement
             // is published, as another request or pod would.
-            gate.arrived.acquire().await.unwrap().forget();
+            tokio::time::timeout(std::time::Duration::from_secs(20), gate.arrived.acquire())
+                .await
+                .expect("the eviction never reached its gate within 20 s")
+                .unwrap()
+                .forget();
             std::fs::write(&path, vec![b'x'; 64]).unwrap();
             std::fs::write(&record, r#"{"filler":false}"#).unwrap();
             gate.proceed.add_permits(1);
