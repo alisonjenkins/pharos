@@ -203,10 +203,12 @@ missing. The server calls the share absent (B1538):
 - It logs `media share absent` once when this starts and
   `media share back` once a root holds entries again.
 
-The library scan does not delete items while this lasts. A root that
-walks to no media file at all keeps every row, and the sweep guard also
-skips any pass that would remove more than a quarter of a root (once that
-is at least 100 items).
+The library scan does not delete items while this lasts. A bare root, one
+with no file of any kind and no folder left out for `.ignore`, keeps every
+row. A root that still holds files, or whose media went under a `.ignore`
+folder, is swept as usual, and the sweep guard there skips any pass that
+would remove more than a quarter of a root (once that is at least 100
+items).
 
 Each request logs one `self-restart:` line with the Deployment, the outcome
 and the cause, and counts
