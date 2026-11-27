@@ -5225,22 +5225,40 @@ impl HlsSegmentCache {
                 };
                 #[cfg(not(unix))]
                 let inode = None;
-                let written = write_provenance(
-                    &path,
-                    SegmentProvenance {
-                        device: device.as_deref(),
-                        generation: generation(),
-                        transcode_ms: transcode_ms as u64,
-                        encode_ms: timing.as_ref().map(|t| t.encode_ms),
-                        queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
-                        produced_frames,
-                        expected_frames,
-                        filler: is_filler,
-                        inode,
-                        len: Some(bytes.len() as u64),
-                    },
-                )
-                .await;
+                let mut dir_retries = 0u32;
+                let written = loop {
+                    #[cfg(test)]
+                    tests::prune_media_dir(path.parent()).await;
+                    let r = write_provenance(
+                        &path,
+                        SegmentProvenance {
+                            device: device.as_deref(),
+                            generation: generation(),
+                            transcode_ms: transcode_ms as u64,
+                            encode_ms: timing.as_ref().map(|t| t.encode_ms),
+                            queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
+                            produced_frames,
+                            expected_frames,
+                            filler: is_filler,
+                            inode,
+                            len: Some(bytes.len() as u64),
+                        },
+                    )
+                    .await;
+                    match &r {
+                        // The cap sweep prunes empty media dirs without the
+                        // lock: re-create it and try again, bounded.
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound && dir_retries < 2 => {
+                            dir_retries += 1;
+                            metrics::counter!("pharos_segment_publish_dir_retry_total")
+                                .increment(1);
+                            if let Some(parent) = path.parent() {
+                                let _ = tokio::fs::create_dir_all(parent).await;
+                            }
+                        }
+                        _ => break r,
+                    }
+                };
                 Some(written)
             };
             match record {
@@ -5257,14 +5275,36 @@ impl HlsSegmentCache {
                     false
                 }
                 Some(Ok(())) => {
-                    #[cfg(test)]
-                    let renamed = if tests::RENAME_FAILS.with(std::cell::Cell::get) {
-                        Err(std::io::Error::other("injected"))
-                    } else {
-                        tokio::fs::rename(&tmp, &path).await
-                    };
-                    #[cfg(not(test))]
-                    let renamed = tokio::fs::rename(&tmp, &path).await;
+                    let mut renamed;
+                    let mut rename_dir_retries = 0u32;
+                    loop {
+                        #[cfg(test)]
+                        {
+                            renamed = if tests::RENAME_FAILS.with(std::cell::Cell::get) {
+                                Err(std::io::Error::other("injected"))
+                            } else {
+                                tokio::fs::rename(&tmp, &path).await
+                            };
+                        }
+                        #[cfg(not(test))]
+                        {
+                            renamed = tokio::fs::rename(&tmp, &path).await;
+                        }
+                        match &renamed {
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::NotFound
+                                    && rename_dir_retries < 2 =>
+                            {
+                                rename_dir_retries += 1;
+                                metrics::counter!("pharos_segment_publish_dir_retry_total")
+                                    .increment(1);
+                                if let Some(parent) = path.parent() {
+                                    let _ = tokio::fs::create_dir_all(parent).await;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
                     if let Err(e) = renamed {
                         // The record was written for a segment that never
                         // arrived: remove it with the staged file, under the
@@ -11020,6 +11060,10 @@ mod tests {
             const { std::cell::RefCell::new(None) };
         static RECORD_READ_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
             const { std::cell::RefCell::new(None) };
+        /// How many publications lose their media dir to a prune just before
+        /// the record write.
+        static PRUNES_BEFORE_RECORD: std::cell::Cell<u32> =
+            const { std::cell::Cell::new(0) };
         static EVICT_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
             const { std::cell::RefCell::new(None) };
     }
@@ -11031,6 +11075,16 @@ mod tests {
             g.arrived.add_permits(1);
             if let Ok(p) = g.proceed.acquire().await {
                 p.forget();
+            }
+        }
+    }
+
+    /// Simulates the cap sweep pruning the (empty) media dir.
+    pub(super) async fn prune_media_dir(parent: Option<&Path>) {
+        if PRUNES_BEFORE_RECORD.with(|c| c.get()) > 0 {
+            PRUNES_BEFORE_RECORD.with(|c| c.set(c.get() - 1));
+            if let Some(p) = parent {
+                let _ = tokio::fs::remove_dir(p).await;
             }
         }
     }
@@ -12099,6 +12153,50 @@ mod tests {
         .unwrap();
         let meta = std::fs::metadata(&seg).unwrap();
         assert_eq!(classify_paired(&seg, &meta).await.0, SegmentKind::Real);
+    }
+
+    /// B1539 — the cap sweep may prune the media dir between the dir being
+    /// re-created and the record write. The publication re-creates it and
+    /// retries, and counts the retry.
+    ///
+    /// Disarm evidence: without the retry the record write fails with
+    /// NotFound and the segment is served uncached (`Transient`), so this goes
+    /// RED.
+    #[test]
+    fn a_media_dir_pruned_before_the_record_write_is_re_created() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache = cache.with_scheduler(always_short_until_filler(false, real_attempts));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        let key =
+            SegmentIdentity::new(42, 0, None, None, &opts, SourceGen::for_read(&source, None));
+        let path = cache.segment_path_keyed(key);
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                PRUNES_BEFORE_RECORD.with(|c| c.set(1));
+                let (_, _, kind) = ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!(kind, SegmentKind::Filler, "published, not transient");
+                assert!(path.exists());
+                assert!(provenance_sidecar_path(&path).exists());
+            });
+        });
+        assert_eq!(
+            counter_value(&snapshotter, "pharos_segment_publish_dir_retry_total"),
+            1
+        );
     }
 
     /// B1539 — an LRU entry recorded without a known mtime is never treated as
