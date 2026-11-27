@@ -2388,7 +2388,7 @@ pub struct HlsSegmentCache {
     /// B1539 — this instance's own directory for in-progress encodes, claimed
     /// atomically at construction so no other process sharing the cache root
     /// has it. See [`segment_tmp_path`].
-    staging: Arc<PathBuf>,
+    staging: Arc<std::sync::Mutex<Option<PathBuf>>>,
 }
 
 /// B1539 — the first registration id of a cache instance: random high 32 bits,
@@ -2699,30 +2699,52 @@ const STAGING_DIR: &str = ".staging";
 
 /// B1539 — create a staging directory no other process sharing `root` has:
 /// `create_dir` is atomic and fails on an existing name, so a name that is
-/// taken (another pod drew the same nonce) is simply skipped. Falls back to an
-/// unclaimed path when the volume is unwritable; encodes there then fail and
-/// are counted like any other unwritable cache.
-fn claim_staging_dir(root: &Path) -> PathBuf {
+/// taken (another pod drew the same nonce) is skipped for a fresh one. FAILS
+/// CLOSED: `None` when no fresh directory could be created (unwritable volume,
+/// or every candidate taken) — never a directory somebody else may own.
+fn claim_staging_dir(root: &Path) -> Option<PathBuf> {
+    claim_staging_dir_with(root, || {
+        format!("{:016x}-{}", first_registration_id(), std::process::id())
+    })
+}
+
+/// [`claim_staging_dir`] with the candidate names supplied, so a test can
+/// force every candidate to collide.
+fn claim_staging_dir_with(root: &Path, mut candidate: impl FnMut() -> String) -> Option<PathBuf> {
     let parent = root.join(STAGING_DIR);
     let _ = std::fs::create_dir_all(&parent);
-    let mut last = parent.join("unclaimed");
     for _ in 0..16 {
-        let dir = parent.join(format!(
-            "{:016x}-{}",
-            first_registration_id(),
-            std::process::id()
-        ));
+        let dir = parent.join(candidate());
         match std::fs::create_dir(&dir) {
-            Ok(()) => return dir,
+            Ok(()) => return Some(dir),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => {
                 tracing::warn!(dir = %dir.display(), error = %e, "could not create the HLS staging directory");
-                return dir;
+                return None;
             }
         }
-        last = dir;
     }
-    last
+    tracing::warn!(
+        parent = %parent.display(),
+        "every HLS staging directory candidate was already taken"
+    );
+    None
+}
+
+impl HlsSegmentCache {
+    /// B1539 — this instance's claimed staging directory, claiming one now if
+    /// construction could not. `None` (fail closed) while none can be claimed:
+    /// the encode is then refused rather than written somewhere shared.
+    fn staging_dir(&self) -> Option<PathBuf> {
+        let mut slot = self
+            .staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = claim_staging_dir(&self.root);
+        }
+        slot.clone()
+    }
 }
 
 /// Drops the in-flight registration however the driver ends.
@@ -3085,7 +3107,7 @@ impl HlsSegmentCache {
             source_end: Arc::new(std::sync::OnceLock::new()),
             refused_once: Arc::new(DashMap::new()),
             next_registration: Arc::new(std::sync::atomic::AtomicU64::new(first_registration_id())),
-            staging: Arc::new(staging),
+            staging: Arc::new(std::sync::Mutex::new(staging)),
         }
     }
 
@@ -4218,9 +4240,12 @@ impl HlsSegmentCache {
                         // describes can leave an orphan writing to it, and
                         // unlinking a file a worker still holds open costs
                         // nothing and reclaims its space when that worker exits.
-                        let orphan = segment_tmp_path(&driver.staging, &driver.segment_path_keyed(key), id);
-                        let _ = tokio::fs::remove_file(progress_sidecar_path(&orphan)).await;
-                        let _ = tokio::fs::remove_file(&orphan).await;
+                        if let Some(staging) = driver.staging_dir() {
+                            let orphan =
+                                segment_tmp_path(&staging, &driver.segment_path_keyed(key), id);
+                            let _ = tokio::fs::remove_file(progress_sidecar_path(&orphan)).await;
+                            let _ = tokio::fs::remove_file(&orphan).await;
+                        }
                         tracing::debug!(
                             media.id = media_id,
                             seg = seg_index,
@@ -4352,10 +4377,13 @@ impl HlsSegmentCache {
         // B1539 — the temp file lives in this instance's own staging
         // directory, so no other pod sharing the cache volume can write it;
         // re-created here in case a sweep removed it while idle.
-        tokio::fs::create_dir_all(self.staging.as_path())
-            .await
-            .map_err(|e| counted("create_staging", e.into()))?;
-        let tmp = segment_tmp_path(&self.staging, &path, registration_id);
+        let Some(staging) = self.staging_dir() else {
+            return Err(counted(
+                "claim_staging",
+                std::io::Error::other("no HLS staging directory could be claimed").into(),
+            ));
+        };
+        let tmp = segment_tmp_path(&staging, &path, registration_id);
         // Time the transcode: a segment covers SEGMENT_SECONDS of playback, so
         // if this exceeds that wall-clock the encoder is below realtime and the
         // client will stall. Logged per miss so Loki/Tempo show exactly which
@@ -8170,21 +8198,42 @@ mod tests {
         let a = HlsSegmentCache::new(dir.path(), 1 << 20);
         let b = HlsSegmentCache::new(dir.path(), 1 << 20);
         assert_ne!(
-            a.staging, b.staging,
+            a.staging_dir(),
+            b.staging_dir(),
             "two instances claimed one staging dir"
         );
-        assert!(a.staging.is_dir() && b.staging.is_dir());
+        let (sa, sb) = (a.staging_dir().unwrap(), b.staging_dir().unwrap());
+        assert!(sa.is_dir() && sb.is_dir());
         // A forced collision: same keyed path, same id, in both instances.
         let path = dir.path().join("61/9.ts");
-        let ta = segment_tmp_path(&a.staging, &path, 7);
-        let tb = segment_tmp_path(&b.staging, &path, 7);
+        let ta = segment_tmp_path(&sa, &path, 7);
+        let tb = segment_tmp_path(&sb, &path, 7);
         assert_ne!(ta, tb);
         assert_ne!(progress_sidecar_path(&ta), progress_sidecar_path(&tb));
         assert_ne!(partial_segment_path(&ta), partial_segment_path(&tb));
         // A further claim on the same root gets its own directory too.
-        let taken = claim_staging_dir(&a.root);
-        assert_ne!(taken, *a.staging);
-        assert_ne!(taken, *b.staging);
+        let taken = claim_staging_dir(&a.root).unwrap();
+        assert_ne!(taken, sa);
+        assert_ne!(taken, sb);
+    }
+
+    /// B1539 — the staging claim fails closed: when every candidate is
+    /// already taken it claims nothing rather than reusing somebody else's
+    /// directory, and an encode is then refused, not written there.
+    #[tokio::test]
+    async fn a_staging_claim_never_reuses_a_taken_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join(STAGING_DIR);
+        std::fs::create_dir_all(parent.join("taken")).unwrap();
+        assert_eq!(
+            claim_staging_dir_with(dir.path(), || "taken".to_string()),
+            None,
+            "a directory another instance owns was handed out"
+        );
+        // An unwritable root (a FILE where the root should be) claims nothing.
+        let file_root = dir.path().join("not-a-dir");
+        std::fs::write(&file_root, b"x").unwrap();
+        assert_eq!(claim_staging_dir(&file_root), None);
     }
 
     /// The belt on the abandonment seam: two drivers for one key must not share
@@ -11102,7 +11151,7 @@ mod tests {
         };
         // The encode finishes into its tmp file, then waits at the lock.
         // B1539 — temp files live in the instance's staging directory.
-        let dir_of = cache.staging.as_ref().clone();
+        let dir_of = cache.staging_dir().unwrap();
         let tmp_seen = || {
             std::fs::read_dir(&dir_of).is_ok_and(|d| {
                 d.flatten()
