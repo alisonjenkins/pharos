@@ -1584,36 +1584,9 @@ async fn serve_segment(
         item.edition.as_deref(),
     );
 
-    // 304 short-circuit: matched If-None-Match → no body, no ffmpeg.
-    if let Some(inm) = req
-        .headers()
-        .get(actix_web::http::header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-    {
-        if if_none_match_is_real(inm, &etag) {
-            // Answered before the cache is read, which is safe only because the
-            // matched ETag is the Real-form one (B1539). That form goes out only
-            // with a confirmed-real segment RETAINED at its keyed path; filler,
-            // unconfirmed and unretained bytes (an uncached serve, the live
-            // fallbacks) carry no ETag. So a client that presents it holds the
-            // retained bytes, and those change only by quarantine or purge. A
-            // purge bumps the item's epoch, which changes the URL. A quarantine
-            // of a defective Real segment (defect found on a later read) does
-            // replace the bytes without an epoch bump, and a 304 then keeps
-            // the client's copy: no worse than before, since a segment that
-            // had to be quarantined was broken in the first place.
-            return Ok(HttpResponse::NotModified()
-                .insert_header((
-                    actix_web::http::header::ETAG,
-                    real_segment_etag(&etag).as_str(),
-                ))
-                .insert_header((
-                    actix_web::http::header::CACHE_CONTROL,
-                    segment_cache_control(SegmentKind::Real),
-                ))
-                .finish());
-        }
-    }
+    // No 304 before the cache is read: an entity tag is only meaningful against
+    // the CURRENT representation, which is known after the read
+    // (`not_modified_for_current`, B1539).
 
     // T42: when an HLS cache is wired, route through it. Otherwise
     // fall back to live transcoding (every request spawns ffmpeg).
@@ -1759,9 +1732,8 @@ fn opaque_tags(list: &str) -> Vec<&str> {
 /// Whether an `If-None-Match` names the Real-form ETag of this segment key,
 /// by weak comparison (RFC 9110 §8.8.3.2: opaque tags compared, `W/` ignored).
 ///
-/// `*` is deliberately NOT a match here. It means "any current representation",
-/// and this runs before the cache is read, so a current Real representation
-/// cannot be confirmed; answering 200 is always safe.
+/// `*` is not a tag and never matches here; it is answered against the current
+/// representation by [`not_modified_for_current`].
 fn if_none_match_is_real(inm: &str, key_etag: &str) -> bool {
     let real = real_segment_etag(key_etag);
     let real = real.strip_prefix("W/").unwrap_or(&real);
@@ -1769,34 +1741,36 @@ fn if_none_match_is_real(inm: &str, key_etag: &str) -> bool {
 }
 
 /// The 304 for a request whose `If-None-Match` is satisfied by the
-/// representation the cache has just confirmed, if any. Called after the cache
-/// read, so unlike the pre-cache short-circuit it can answer `*`: that matches
-/// when a current representation exists, and only a `Real` (retained,
-/// confirmed) one counts. A tag list matches on the Real-form ETag as before.
+/// representation the cache has just returned, if any (RFC 9110 §13.1.2).
+/// Called after the cache read, against the current representation only:
+/// - `*` matches any current representation, of any kind, and the 304 carries
+///   the same headers its 200 would (no ETag, and `no-store` for a filler,
+///   unconfirmed or unretained one).
+/// - A tag list matches only the Real-form ETag, which only a `Real` (retained,
+///   confirmed) representation has.
 fn not_modified_for_current(
     inm: Option<&str>,
     key_etag: &str,
     kind: SegmentKind,
 ) -> Option<HttpResponse> {
     let inm = inm?;
-    if kind != SegmentKind::Real {
+    let star = inm.trim() == "*";
+    let tagged = kind == SegmentKind::Real && if_none_match_is_real(inm, key_etag);
+    if !star && !tagged {
         return None;
     }
-    if inm.trim() != "*" && !if_none_match_is_real(inm, key_etag) {
-        return None;
+    let mut nm = HttpResponse::NotModified();
+    nm.insert_header((
+        actix_web::http::header::CACHE_CONTROL,
+        segment_cache_control(kind),
+    ));
+    if kind == SegmentKind::Real {
+        nm.insert_header((
+            actix_web::http::header::ETAG,
+            real_segment_etag(key_etag).as_str(),
+        ));
     }
-    Some(
-        HttpResponse::NotModified()
-            .insert_header((
-                actix_web::http::header::ETAG,
-                real_segment_etag(key_etag).as_str(),
-            ))
-            .insert_header((
-                actix_web::http::header::CACHE_CONTROL,
-                segment_cache_control(SegmentKind::Real),
-            ))
-            .finish(),
-    )
+    Some(nm.finish())
 }
 
 /// The 200 answer for a cached segment. Only a `Real` segment, retained at its
@@ -5779,7 +5753,8 @@ mod tests {
         );
         assert!(!if_none_match_is_real("W/\"seg-other-real\"", key));
         assert!(!if_none_match_is_real("*", key));
-        // After the cache read, `*` matches a current Real representation only.
+        // `*` matches any current representation, of any kind, with the 200's
+        // own headers (no ETag, no-store for the non-Real kinds).
         assert!(not_modified_for_current(Some("*"), key, SegmentKind::Real).is_some());
         assert!(not_modified_for_current(Some(&real), key, SegmentKind::Real).is_some());
         for kind in [
@@ -5787,10 +5762,12 @@ mod tests {
             SegmentKind::Unconfirmed,
             SegmentKind::Transient,
         ] {
-            assert!(
-                not_modified_for_current(Some("*"), key, kind).is_none(),
-                "{kind:?} is not a current Real representation"
-            );
+            let nm = not_modified_for_current(Some("*"), key, kind)
+                .unwrap_or_else(|| panic!("{kind:?}: `*` matches any current representation"));
+            assert!(nm.headers().get(ETAG).is_none(), "{kind:?} 304 has no ETag");
+            assert_eq!(nm.headers().get("cache-control").unwrap(), "no-store");
+            // A tag never matches a non-Real representation.
+            assert!(not_modified_for_current(Some(&real), key, kind).is_none());
         }
         assert!(not_modified_for_current(None, key, SegmentKind::Real).is_none());
         assert!(not_modified_for_current(Some("\"other\""), key, SegmentKind::Real).is_none());
