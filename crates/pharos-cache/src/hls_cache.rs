@@ -2673,6 +2673,52 @@ async fn await_last_requester_gone(
 /// unreferenced, never renamed, never served — which is the trade this makes on
 /// purpose: a leaked temp file is recoverable and a corrupt cached segment
 /// served with a 200 is not.
+/// B1539 — candidate temp names for one registration: the plain
+/// [`segment_tmp_path`] first (what cancellation cleanup removes), then
+/// suffixed ones for the rare case another cache instance already holds it.
+fn segment_tmp_candidate(path: &Path, registration: u64, attempt: u32) -> PathBuf {
+    if attempt == 0 {
+        segment_tmp_path(path, registration)
+    } else {
+        path.with_extension(format!("{registration}.{attempt}.ts.tmp"))
+    }
+}
+
+/// How many names [`reserve_segment_tmp`] tries before giving up.
+const TMP_RESERVE_ATTEMPTS: u32 = 16;
+
+/// B1539 — create this encode's temp file with `create_new` (O_EXCL) so no
+/// other process sharing the cache root can be writing the same file. A name
+/// that already exists belongs to someone else (ids are unique in-process), so
+/// the next candidate is tried. The progress and partial sidecars derive from
+/// the reserved name, so they are exclusive too.
+async fn reserve_segment_tmp(path: &Path, registration: u64) -> std::io::Result<PathBuf> {
+    for attempt in 0..TMP_RESERVE_ATTEMPTS {
+        let candidate = segment_tmp_candidate(path, registration, attempt);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(_) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                metrics::counter!("pharos_segment_tmp_collision_total").increment(1);
+                tracing::warn!(
+                    path = %candidate.display(),
+                    attempt,
+                    "hls segment temp name already taken by another writer; trying the next (B1539)"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("no free temp name after {TMP_RESERVE_ATTEMPTS} attempts"),
+    ))
+}
+
 fn segment_tmp_path(path: &Path, registration: u64) -> PathBuf {
     path.with_extension(format!("{registration}.ts.tmp"))
 }
@@ -4299,7 +4345,14 @@ impl HlsSegmentCache {
                 .await
                 .map_err(|e| counted("create_dir", e.into()))?;
         }
-        let tmp = segment_tmp_path(&path, registration_id);
+        // B1539 — reserve the temp path exclusively before any encode writes
+        // it. Registration ids are unique only within this process; another
+        // pod sharing the cache volume may hold the same name. `create_new`
+        // (O_EXCL) makes the reservation atomic across processes, and on a
+        // collision the next candidate name is tried.
+        let tmp = reserve_segment_tmp(&path, registration_id)
+            .await
+            .map_err(|e| counted("reserve_tmp", e.into()))?;
         // Time the transcode: a segment covers SEGMENT_SECONDS of playback, so
         // if this exceeds that wall-clock the encoder is below realtime and the
         // client will stall. Logged per miss so Loki/Tempo show exactly which
@@ -8115,27 +8168,29 @@ mod tests {
     /// wrong reader: a corrupt segment, renamed into the cache and served with a
     /// 200 for as long as it stays there. Distinct names make that interleaving
     /// harmless rather than rare.
-    /// B1539 — two cache instances on one root (two pods sharing the cache
-    /// volume in a rolling update) must not name their first encode's temp
-    /// file the same, or one pod's encode overwrites the other's before the
-    /// publish lock is ever taken.
-    #[test]
-    fn two_cache_instances_on_one_root_never_share_a_temp_file() {
+    /// B1539 — a temp name another writer (another pod on the same cache
+    /// volume) already holds is never reused: the reservation is O_EXCL, so a
+    /// forced collision on the same registration id gets a different file.
+    #[tokio::test]
+    async fn a_temp_name_held_by_another_writer_is_never_reused() {
         let dir = tempfile::tempdir().unwrap();
-        let a = HlsSegmentCache::new(dir.path(), 1 << 20);
-        let b = HlsSegmentCache::new(dir.path(), 1 << 20);
-        let next = |c: &HlsSegmentCache| {
-            c.next_registration
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        };
-        let (ia, ib) = (next(&a), next(&b));
-        assert_ne!(ia >> 32, ib >> 32, "instances drew the same id space");
-        let path = dir.path().join("61/9.ts");
-        assert_ne!(segment_tmp_path(&path, ia), segment_tmp_path(&path, ib));
-        assert_ne!(
-            progress_sidecar_path(&segment_tmp_path(&path, ia)),
-            progress_sidecar_path(&segment_tmp_path(&path, ib)),
+        let path = dir.path().join("9.ts");
+        // The other pod's in-progress encode, same id.
+        let theirs = segment_tmp_path(&path, 7);
+        std::fs::write(&theirs, b"their half-written bytes").unwrap();
+        let ours = reserve_segment_tmp(&path, 7).await.unwrap();
+        assert_ne!(ours, theirs, "reserved the other writer's temp file");
+        assert_ne!(progress_sidecar_path(&ours), progress_sidecar_path(&theirs));
+        assert_ne!(partial_segment_path(&ours), partial_segment_path(&theirs));
+        assert_eq!(
+            std::fs::read(&theirs).unwrap(),
+            b"their half-written bytes",
+            "the other writer's file was touched"
         );
+        // A second concurrent reservation of the same id gets yet another name.
+        let again = reserve_segment_tmp(&path, 7).await.unwrap();
+        assert_ne!(again, ours);
+        assert_ne!(again, theirs);
     }
 
     #[test]
