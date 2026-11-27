@@ -1762,16 +1762,16 @@ fn segment_ok_response(
 /// - `Transient`: `no-store`. The bytes were served without being retained at
 ///   the keyed path (an uncached serve, or a live transcode), so nothing the
 ///   cache holds describes them.
-/// - `Unconfirmed`: five minutes. The cache could not confirm what these bytes
+/// - `Unconfirmed`: `no-store`. The cache could not confirm what these bytes
 ///   are: the segment predates provenance records, or the reader lost a race
-///   with a retirement that moved the record. It may be a filler, so it must
-///   never be pinned without confirmation, but a short life keeps a one-off
-///   race from costing a refetch on every request.
+///   with a retirement that moved the record. It may be a filler, so a client
+///   must not keep it at all; a heuristic or short freshness window would
+///   still let an unconfirmed filler outlive the cache's own retry.
 fn segment_cache_control(kind: SegmentKind) -> &'static str {
     match kind {
         SegmentKind::Real => "private, max-age=31536000, immutable",
         SegmentKind::Filler => "no-store",
-        SegmentKind::Unconfirmed => "private, max-age=300",
+        SegmentKind::Unconfirmed => "no-store",
         SegmentKind::Transient => "no-store",
     }
 }
@@ -5702,9 +5702,7 @@ mod tests {
         assert!(segment_cache_control(SegmentKind::Real).contains("immutable"));
         assert_eq!(segment_cache_control(SegmentKind::Filler), "no-store");
         assert_eq!(segment_cache_control(SegmentKind::Transient), "no-store");
-        let unconfirmed = segment_cache_control(SegmentKind::Unconfirmed);
-        assert!(!unconfirmed.contains("immutable"));
-        assert!(unconfirmed.contains("max-age=300"));
+        assert_eq!(segment_cache_control(SegmentKind::Unconfirmed), "no-store");
     }
 
     /// A source on the share that ffmpeg could not open for a share fault is
