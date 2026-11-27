@@ -3400,7 +3400,8 @@ fn StageView() -> Element {
     let StageCtx(stage) = use_context::<StageCtx>();
     let s = stage.read();
     let (Some(id), Some(key)) = (s.item, s.key()) else {
-        return rsx! {};
+        // Songs can wait in the queue with nothing playing (B1540).
+        return rsx! { super::stage::IdleQueueBar {} };
     };
     // The playing item first, so a lookup by element id that both players
     // share (the visualiser's canvas) finds its own.

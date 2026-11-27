@@ -6740,7 +6740,8 @@ body:has(.pharos-stage.is-mini) .pharos-letters {
   text-overflow: ellipsis;
   font-weight: 600;
 }
-.pharos-stage-error {
+.pharos-stage-error,
+.pharos-stage-waiting {
   margin: 0;
   overflow: hidden;
   white-space: nowrap;
