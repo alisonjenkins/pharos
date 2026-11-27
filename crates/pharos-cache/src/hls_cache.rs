@@ -12308,11 +12308,25 @@ mod tests {
         // Another process holds the lock, so the eviction waits after it has
         // selected its victim.
         let held = hold_publish_lock_elsewhere(&cache, &path);
+        PUBLISH_LOCK_ATTEMPTS.with(|c| c.set(0));
         let sweep = {
             let cache = cache.clone();
             tokio::spawn(async move { cache.maybe_evict().await })
         };
-        tokio::task::yield_now().await;
+        // Wait until the eviction has selected its victim and found the lock
+        // held, so it cannot select the replacement instead.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        while PUBLISH_LOCK_ATTEMPTS.with(std::cell::Cell::get) == 0 {
+            assert!(
+                !sweep.is_finished(),
+                "the eviction finished without waiting on the lock"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the eviction never reached the publish lock within 20 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         // A new segment of the same length is published and recorded.
         std::fs::write(&path, vec![b'y'; 400]).unwrap();
         cache.record(key, 400).await;
