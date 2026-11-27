@@ -32,6 +32,7 @@ use super::ports::{ContainerKind, ContainerRef};
 use super::queue::{added_line, video_kind, QueueCtx, Track, VideoQueueCtx};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
+use super::stage::StageCtx;
 use super::together_view::{InThisGroup, SeenDots};
 use super::views::{
     display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime,
@@ -4039,6 +4040,60 @@ fn video_queue_offered() -> bool {
     try_use_context::<VideoQueueCtx>().is_some() && !in_group
 }
 
+/// Whether an add to the music queue starts it (B1540/V1541): a
+/// Shift-click with nothing playing starts the queue's first song. A plain
+/// click, a video queue, a group (which picks what plays) and a playing item
+/// leave the songs to wait, where the idle queue bar shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleStart {
+    Start(ItemRef),
+    NotAsked,
+    Video,
+    Group,
+    Playing,
+    /// A page rendered without the app's player.
+    NoPlayer,
+    Empty,
+}
+
+impl IdleStart {
+    /// The `verdict` its log line carries.
+    pub fn label(self) -> &'static str {
+        match self {
+            IdleStart::Start(_) => "start",
+            IdleStart::NotAsked => "not_asked",
+            IdleStart::Video => "video",
+            IdleStart::Group => "group",
+            IdleStart::Playing => "playing",
+            IdleStart::NoPlayer => "no_player",
+            IdleStart::Empty => "empty",
+        }
+    }
+}
+
+/// See [`IdleStart`]. `asked` is a Shift-click; `player` is what the
+/// app's player has on it, `None` for a page rendered without one; `next` is
+/// the queue's first song after the add.
+pub fn idle_start(
+    asked: bool,
+    video: bool,
+    in_group: bool,
+    player: Option<Option<ItemRef>>,
+    next: Option<ItemRef>,
+) -> IdleStart {
+    match (asked, video, in_group, player) {
+        (false, ..) => IdleStart::NotAsked,
+        (_, true, _, _) => IdleStart::Video,
+        (_, _, true, _) => IdleStart::Group,
+        (_, _, _, None) => IdleStart::NoPlayer,
+        (_, _, _, Some(Some(_))) => IdleStart::Playing,
+        (_, _, _, Some(None)) => next.map_or(IdleStart::Empty, IdleStart::Start),
+    }
+}
+
+/// The queue buttons' tooltip line for the Shift-click (B1540).
+const SHIFT_HINT: &str = ". Shift-click to start playing";
+
 /// How long the "Added" note stays.
 const QUEUED_NOTE_MS: u32 = 2_500;
 
@@ -4066,6 +4121,10 @@ pub fn QueueButtons(
     };
     let ctx = try_use_context::<Ctx>();
     let listed_from = try_use_context::<ShownLibrary>();
+    // With nothing playing, an add starts the queue (B1540/V1541).
+    let stage = try_use_context::<StageCtx>();
+    let nav = try_use_context::<Nav>();
+    let together = try_use_context::<Together>();
     // A song row can also start a mix like it, playing at once (spec 024).
     // No mix in a SyncPlay group, where the group picks the songs.
     let in_group = try_use_context::<Together>()
@@ -4085,9 +4144,12 @@ pub fn QueueButtons(
     // A row's buttons answer `a` and `A` only from that row: with the focus
     // elsewhere on a show's page, they would queue its first episode.
     let row_only = kind == QueueTarget::EpisodeRow;
-    let put = move |place: Place| {
+    // `start`: a Shift-click, which also starts the queue when nothing
+    // plays (B1540/V1541).
+    let put = move |place: Place, start: bool| {
         let (tracks, name) = (tracks.clone(), name.clone());
         let listed_from = listed_from.clone();
+        let together = together.clone();
         spawn(async move {
             let found = match (
                 tracks.is_empty(),
@@ -4121,12 +4183,38 @@ pub fn QueueButtons(
                     };
                     let count = songs.len();
                     platform::info(&added_line(place_label, target, count));
+                    // Whether the added songs come first, so a started queue
+                    // begins with them.
+                    let leads = place == Place::Next || queue.peek().upcoming().is_empty();
                     match place {
                         Place::Next => queue.write().play_next(songs),
                         Place::End => queue.write().add(songs),
                     }
+                    let in_group = together.as_ref().is_some_and(|t| t.view.peek().active);
+                    let player = stage
+                        .filter(|_| nav.is_some())
+                        .map(|StageCtx(s)| s.peek().item);
+                    let verdict =
+                        idle_start(start, kind.video(), in_group, player, queue.peek().next());
+                    platform::info(&format!(
+                        "pharos: queue idle start verdict={} target={target} place={place_label} item={:?}",
+                        verdict.label(),
+                        match verdict {
+                            IdleStart::Start(id) => Some(id),
+                            _ => None,
+                        }
+                    ));
+                    let started = match (verdict, nav) {
+                        (IdleStart::Start(id), Some(nav)) => {
+                            nav.0.call(Route::Watch(id));
+                            true
+                        }
+                        _ => false,
+                    };
                     note.set(Some(match (place, count) {
                         (_, 0) => kind.nothing(&name),
+                        (_, _) if started && leads => format!("Playing {name}."),
+                        (_, _) if started => format!("{name} added. Playing the queue."),
                         (Place::Next, _) => format!("{name} plays next."),
                         (Place::End, _) => format!("{name} added to the queue."),
                     }));
@@ -4151,19 +4239,21 @@ pub fn QueueButtons(
     // (B1347/V1318); their names stay in the aria-label and title.
     let labelled = kind == QueueTarget::VideoPage;
     let button_class = kind.button_class();
+    // Only music starts on a Shift-click.
+    let hint = if kind.video() { "" } else { SHIFT_HINT };
     rsx! {
         div { class: "pharos-queue-buttons", "data-target": kind.label(),
             button {
                 class: "{button_class}",
                 r#type: "button",
-                title: "{next_label}",
+                title: "{next_label}{hint}",
                 "data-key-action": "queue-next",
                 "data-key-row-only": row_only.then_some("true"),
                 aria_label: "{next_label}",
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
                     evt.prevent_default();
-                    put(Place::Next);
+                    put(Place::Next, evt.modifiers().shift());
                 },
                 Icon { path: ICON_QUEUE_NEXT }
                 if labelled { span { class: "pharos-button-label", "Play next" } }
@@ -4171,14 +4261,14 @@ pub fn QueueButtons(
             button {
                 class: "{button_class}",
                 r#type: "button",
-                title: "{end_label}",
+                title: "{end_label}{hint}",
                 "data-key-action": "queue-end",
                 "data-key-row-only": row_only.then_some("true"),
                 aria_label: "{end_label}",
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
                     evt.prevent_default();
-                    put_end(Place::End);
+                    put_end(Place::End, evt.modifiers().shift());
                 },
                 Icon { path: ICON_QUEUE_ADD }
                 if labelled { span { class: "pharos-button-label", "Add to queue" } }
@@ -6078,6 +6168,66 @@ mod tests {
         // A whole page answers for itself, whatever the aggregate says.
         partial.total = 1;
         assert!(all_played(&partial, Some(false)));
+    }
+
+    #[test]
+    fn only_a_shift_click_with_nothing_playing_starts_the_queue() {
+        let song = Some(ItemRef::Real(3));
+        let idle = Some(None);
+        let busy = Some(Some(ItemRef::Real(1)));
+        assert_eq!(
+            idle_start(true, false, false, idle, song),
+            IdleStart::Start(ItemRef::Real(3))
+        );
+        assert_eq!(
+            idle_start(false, false, false, idle, song),
+            IdleStart::NotAsked
+        );
+        assert_eq!(idle_start(true, true, false, idle, song), IdleStart::Video);
+        assert_eq!(idle_start(true, false, true, idle, song), IdleStart::Group);
+        assert_eq!(
+            idle_start(true, false, false, None, song),
+            IdleStart::NoPlayer
+        );
+        assert_eq!(
+            idle_start(true, false, false, busy, song),
+            IdleStart::Playing
+        );
+        assert_eq!(idle_start(true, false, false, idle, None), IdleStart::Empty);
+    }
+
+    #[test]
+    fn idle_start_verdicts_are_distinct() {
+        let labels: HashSet<&str> = [
+            IdleStart::Start(ItemRef::Real(1)),
+            IdleStart::NotAsked,
+            IdleStart::Video,
+            IdleStart::Group,
+            IdleStart::Playing,
+            IdleStart::NoPlayer,
+            IdleStart::Empty,
+        ]
+        .iter()
+        .map(|v| v.label())
+        .collect();
+        assert_eq!(labels.len(), 7);
+    }
+
+    #[test]
+    fn music_queue_buttons_say_shift_starts_playing_and_video_ones_do_not() {
+        let song = render(|| {
+            use_context_provider(|| QueueCtx(Signal::new(Default::default())));
+            rsx! { QueueButtons { name: "A song".to_owned(), tracks: vec![], album: None, kind: QueueTarget::Song } }
+        });
+        assert!(song.contains("Shift-click to start playing"), "{song}");
+        let video = render(|| {
+            use_context_provider(|| {
+                VideoQueueCtx(Signal::new(Default::default()), Signal::new(false))
+            });
+            rsx! { QueueButtons { name: "A film".to_owned(), tracks: vec![], album: None, kind: QueueTarget::VideoPage } }
+        });
+        assert!(video.contains("pharos-queue-buttons"), "{video}");
+        assert!(!video.contains("Shift-click"), "{video}");
     }
 
     fn render(body: impl Fn() -> Element + 'static) -> String {
