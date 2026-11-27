@@ -172,7 +172,15 @@ test.describe("strict console + response capture", () => {
     // Let home finish building its tabs first: leaving mid-build makes
     // jellyfin-web's own home tab log "failed to get tab controller"
     // when its chunk resolves against a view that is already gone.
+    // networkidle alone does not cover it on a loaded runner: the home
+    // tab's controller has run only once it has put its sections in.
     await page.waitForLoadState("networkidle");
+    await page
+      .locator(".pageTabContent .sections > *")
+      .first()
+      .waitFor({ state: "attached", timeout: 20_000 })
+      // A home with no sections still gets the route checks below.
+      .catch(() => {});
 
     // Navigate directly via hash route. The bundle is served at the
     // origin root (no `/web/` prefix) and jellyfin-web resolves the
