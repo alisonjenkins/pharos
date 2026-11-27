@@ -3556,6 +3556,41 @@ impl HlsSegmentCache {
         self.take_out_of_service_locked(key, path, read).await
     }
 
+    /// Put a filler that this publication retired back at `path`, segment first
+    /// and then its record, because the publication failed and left the keyed
+    /// path empty. Called under the publish lock. A failure to restore is
+    /// logged and counted: the filler is then only in the quarantine ring.
+    async fn restore_retired_filler(&self, key: SegmentIdentity, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let held = self
+            .root
+            .join(QUARANTINE_DIR)
+            .join(format!("{}-{name}", key.media_id));
+        let restored = match tokio::fs::rename(&held, path).await {
+            Ok(()) => {
+                tokio::fs::rename(
+                    provenance_sidecar_path(&held),
+                    provenance_sidecar_path(path),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = restored {
+            metrics::counter!("pharos_segment_filler_restore_failed_total").increment(1);
+            tracing::warn!(
+                media.id = key.media_id,
+                seg = key.seg_index,
+                path = %path.display(),
+                error = %e,
+                "could not restore the retired filler after a failed publication (B1539)"
+            );
+        }
+    }
+
     /// [`Self::take_out_of_service`] for a caller that already holds the
     /// publish lock for `path` (the lock is not reentrant).
     async fn take_out_of_service_locked(
@@ -5043,6 +5078,9 @@ impl HlsSegmentCache {
                     .is_ok_and(|m| !m.is_dir())
             };
             let mut occupied = is_occupied().await;
+            // Set when a stale filler was moved into the quarantine ring for
+            // this publication, so a failed publication can put it back.
+            let mut retired_to_quarantine = false;
             // A stale filler is retired only now that a refresh exists to take
             // its place, and only if the path still holds the very file the
             // recheck saw (a peer that replaced it owns what it published).
@@ -5055,6 +5093,7 @@ impl HlsSegmentCache {
                     if occupied {
                         metrics::counter!("pharos_segment_filler_retire_failed_total").increment(1);
                     } else {
+                        retired_to_quarantine = kept;
                         metrics::counter!("pharos_segment_filler_retry_total").increment(1);
                         tracing::info!(
                             media.id = media_id,
@@ -5118,6 +5157,9 @@ impl HlsSegmentCache {
                         // lock, before reporting the failure (B1539).
                         let _ = tokio::fs::remove_file(&tmp).await;
                         let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                        if retired_to_quarantine {
+                            self.restore_retired_filler(key, &path).await;
+                        }
                         return Err(counted("publish_rename", e.into()));
                     }
                     true
@@ -5133,6 +5175,9 @@ impl HlsSegmentCache {
                     metrics::counter!("pharos_segment_provenance_write_failed_total").increment(1);
                     let _ = tokio::fs::remove_file(&tmp).await;
                     let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                    if retired_to_quarantine {
+                        self.restore_retired_filler(key, &path).await;
+                    }
                     false
                 }
             }
@@ -11724,6 +11769,59 @@ mod tests {
             0,
             "no temp file"
         );
+    }
+
+    /// B1539 — when the publishing rename fails AFTER the stale filler was
+    /// retired, the retired pair is put back (segment, then record): the old
+    /// filler stays servable and a later read retries the refresh.
+    ///
+    /// Disarm evidence: without the restore the keyed path is empty and the
+    /// pair sits in quarantine, so this goes RED.
+    #[test]
+    fn a_failed_rename_after_retirement_restores_the_old_filler() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache = cache.with_scheduler(always_short_until_filler(false, real_attempts));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        let key =
+            SegmentIdentity::new(42, 0, None, None, &opts, SourceGen::for_read(&source, None));
+        let path = cache.segment_path_keyed(key);
+        rt.block_on(async {
+            let (bytes_before, _, _) = ask_filler_variant(&cache, &source, &opts).await;
+            let record_before = std::fs::read(provenance_sidecar_path(&path)).unwrap();
+            backdate(&path, FILLER_RETRY_AFTER_SECS + 60);
+
+            RENAME_FAILS.with(|f| f.set(true));
+            let (bytes, _, kind) = ask_filler_variant(&cache, &source, &opts).await;
+            RENAME_FAILS.with(|f| f.set(false));
+            assert_eq!(
+                kind,
+                SegmentKind::Filler,
+                "the refresh failed; the old one serves"
+            );
+            assert_eq!(bytes, bytes_before);
+            assert_eq!(std::fs::read(&path).unwrap(), bytes_before, "restored");
+            assert_eq!(
+                std::fs::read(provenance_sidecar_path(&path)).unwrap(),
+                record_before,
+                "with its own record"
+            );
+            assert!(cache.quarantined().is_empty(), "{:?}", cache.quarantined());
+
+            // And it is still retryable.
+            let (_, served, _) = ask_filler_variant(&cache, &source, &opts).await;
+            assert_eq!(served, SegmentServed::Miss);
+        });
     }
 
     /// B1539 — an LRU entry recorded without a known mtime is never treated as
