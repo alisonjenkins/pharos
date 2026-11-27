@@ -1622,7 +1622,7 @@ async fn serve_segment(
             .map(StreamKey::of)
             .unwrap_or(StreamKey::NONE);
         let waited = std::time::Instant::now();
-        let (bytes, served) = cache
+        let (bytes, served, filler) = cache
             .segment_bytes_keyed_served(
                 id_num,
                 seg,
@@ -1643,7 +1643,7 @@ async fn serve_segment(
             .insert_header((actix_web::http::header::ETAG, etag.as_str()))
             .insert_header((
                 actix_web::http::header::CACHE_CONTROL,
-                "private, max-age=31536000, immutable",
+                segment_cache_control(filler),
             ))
             .body(bytes));
     }
@@ -1700,6 +1700,18 @@ async fn serve_segment(
             "private, max-age=31536000, immutable",
         ))
         .streaming(stream.into_stream()))
+}
+
+/// `Cache-Control` for a media segment body. A synthesized filler (B1539/V1540)
+/// is `no-store`: the cache re-encodes it from the source once it is older than
+/// `FILLER_RETRY_AFTER_SECS`, and a client holding it `immutable` for a year
+/// would keep the black bytes after the server had healed.
+fn segment_cache_control(filler: bool) -> &'static str {
+    if filler {
+        "no-store"
+    } else {
+        "private, max-age=31536000, immutable"
+    }
 }
 
 /// The HTTP answer for a segment the cache could not produce.
@@ -3087,7 +3099,7 @@ async fn init_from_segment(
         _ => InitTemp::Cold,
     };
     let init = async {
-        let raw =
+        let (raw, _) =
             vp9_segment_raw_from(state, req, item, seg, opts, play_session_id, source).await?;
         // The init IS the rendition's clock. Judge it too: an init on the wrong
         // timescale mis-reads every segment that follows it, not just itself.
@@ -3250,7 +3262,7 @@ async fn vp9_segment(
         q.play_session_id.as_deref(),
     )
     .await;
-    let raw = vp9_segment_raw(
+    let (raw, filler) = vp9_segment_raw(
         &state,
         &req,
         &item,
@@ -3287,7 +3299,7 @@ async fn vp9_segment(
         .content_type(Container::Fmp4.content_type())
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "private, max-age=31536000, immutable",
+            segment_cache_control(filler),
         ))
         .body(processed.media))
 }
@@ -3564,7 +3576,7 @@ async fn h264cmaf_segment_for(
         q.play_session_id.as_deref(),
     )
     .await;
-    let raw = vp9_segment_raw(
+    let (raw, filler) = vp9_segment_raw(
         &state,
         &req,
         &item,
@@ -3580,7 +3592,7 @@ async fn h264cmaf_segment_for(
         .content_type(Container::Fmp4.content_type())
         .insert_header((
             actix_web::http::header::CACHE_CONTROL,
-            "private, max-age=31536000, immutable",
+            segment_cache_control(filler),
         ))
         .body(processed.media))
 }
@@ -5500,7 +5512,8 @@ fn codec_relative_index(abs_indices: impl Iterator<Item = u32>, abs: u32) -> Opt
 /// the same three tiers as the `.ts` path: codec-keyed disk cache first
 /// (production), then the load-balancing scheduler, then an inline ffmpeg
 /// fallback. fMP4 surgery needs the whole segment in memory, so the streaming
-/// tiers are collected to a `Vec`.
+/// tiers are collected to a `Vec`. The `bool` is whether the bytes are a
+/// synthesized filler (B1539).
 async fn vp9_segment_raw(
     state: &AppState,
     req: &HttpRequest,
@@ -5508,13 +5521,14 @@ async fn vp9_segment_raw(
     seg: u32,
     opts: &SegmentOpts,
     play_session_id: Option<&str>,
-) -> Result<Vec<u8>, actix_web::Error> {
+) -> Result<(Vec<u8>, bool), actix_web::Error> {
     // 008 — resolved once, so the cache key and the ffmpeg input agree.
     let source = transcode_source(state, &item.path, opts.video.is_some()).await?;
     vp9_segment_raw_from(state, req, item, seg, opts, play_session_id, source).await
 }
 
 /// [`vp9_segment_raw`] for a caller that already resolved the source locator.
+/// The `bool` is whether the bytes are a synthesized filler (B1539).
 async fn vp9_segment_raw_from(
     state: &AppState,
     req: &HttpRequest,
@@ -5523,13 +5537,13 @@ async fn vp9_segment_raw_from(
     opts: &SegmentOpts,
     play_session_id: Option<&str>,
     source: std::path::PathBuf,
-) -> Result<Vec<u8>, actix_web::Error> {
+) -> Result<(Vec<u8>, bool), actix_web::Error> {
     if let Some(cache) = state.hls.as_ref() {
         let stream = play_session_id
             .map(StreamKey::of)
             .unwrap_or(StreamKey::NONE);
         let waited = std::time::Instant::now();
-        let (bytes, served) = cache
+        let (bytes, served, filler) = cache
             .segment_bytes_keyed_served(
                 item.id,
                 seg,
@@ -5545,7 +5559,7 @@ async fn vp9_segment_raw_from(
             .await
             .map_err(|e| segment_cache_error(e, share_of(&item.path)))?;
         crate::media_telemetry::note_segment_served(req, seg, served, waited.elapsed());
-        return Ok(bytes);
+        return Ok((bytes, filler));
     }
     // Same as the h264 live fallback: no cache means no continuous audio
     // encode, so a muxed rung cannot be served here. (VP9 rungs are
@@ -5561,7 +5575,7 @@ async fn vp9_segment_raw_from(
             .submit_live(source.clone(), resolved.to_transcode_options())
             .await
         {
-            Ok(stream) => return collect_stream(stream).await,
+            Ok(stream) => return Ok((collect_stream(stream).await?, false)),
             Err(e) => {
                 tracing::warn!(error = %e, "vp9 scheduler live transcode failed; inline fallback")
             }
@@ -5572,7 +5586,7 @@ async fn vp9_segment_raw_from(
         .transcode(&source, &resolved.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
-    collect_stream(stream.into_stream()).await
+    Ok((collect_stream(stream.into_stream()).await?, false))
 }
 
 /// Drain a byte stream (`io::Result<Bytes>` items) into a single `Vec<u8>`.
@@ -5692,6 +5706,14 @@ mod stream_index_tests {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// B1539/V1540 — a filler segment must not be held by the client for a year
+    /// while the cache re-encodes it from source once it is stale.
+    #[actix_web::test]
+    async fn a_filler_segment_is_never_served_immutable() {
+        assert_eq!(segment_cache_control(true), "no-store");
+        assert!(segment_cache_control(false).contains("immutable"));
+    }
 
     /// A source on the share that ffmpeg could not open for a share fault is
     /// the share, not the file: 503, and the share is marked broken (B1531).
