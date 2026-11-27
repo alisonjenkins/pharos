@@ -930,6 +930,18 @@ fn record_cache_hit(
     );
 }
 
+/// Removes a staged temp file, and its progress and partial siblings, when
+/// dropped. Errors are ignored: after a successful publish the files are gone.
+struct StagedTmp(PathBuf);
+
+impl Drop for StagedTmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(progress_sidecar_path(&self.0));
+        let _ = std::fs::remove_file(partial_segment_path(&self.0));
+    }
+}
+
 /// Remove the record this publication wrote at the keyed path. True when it
 /// is gone (removed or never there), so a retired pair may be restored without
 /// ever meeting a replacement record.
@@ -4591,6 +4603,10 @@ impl HlsSegmentCache {
             ));
         };
         let tmp = segment_tmp_path(&staging, &path, registration_id);
+        // Every early return (a failed read or sync of the temp included)
+        // leaves nothing behind in the staging dir; after a successful rename
+        // the removal finds nothing and is harmless.
+        let _staged = StagedTmp(tmp.clone());
         // Time the transcode: a segment covers SEGMENT_SECONDS of playback, so
         // if this exceeds that wall-clock the encoder is below realtime and the
         // client will stall. Logged per miss so Loki/Tempo show exactly which
