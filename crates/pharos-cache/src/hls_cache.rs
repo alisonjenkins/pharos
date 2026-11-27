@@ -1180,6 +1180,59 @@ fn cached_age_secs(meta: &std::fs::Metadata) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// Lock files under `<root>/.locks`, one per stripe of keyed segment paths.
+/// Bounded, so they accumulate nothing per media item and never stop a media
+/// directory from being pruned; striped, so unrelated segments rarely contend.
+const PUBLISH_LOCK_STRIPES: u64 = 64;
+
+/// How long a publication or removal waits for the lock before it gives up.
+const PUBLISH_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// Held while a keyed segment path and its provenance record are checked,
+/// written, renamed or removed (B1539): publication, retirement, eviction,
+/// quarantine. It is an advisory `flock` on a file in the cache volume, so it
+/// excludes another PROCESS sharing the volume (two pods during a rolling
+/// update) as well as other tasks here; the in-flight registry only excludes
+/// the latter. The lock belongs to the open file, so one left by a process that
+/// died is released by the kernel. Critical sections are filesystem operations
+/// only, never an encode.
+///
+/// Not reentrant (each take is a fresh open file): never take it while holding
+/// it.
+struct PublishLock(#[allow(dead_code)] std::fs::File);
+
+/// `flock(LOCK_EX | LOCK_NB)`: `std::fs::File::try_lock` is newer than the
+/// workspace MSRV.
+#[cfg(unix)]
+fn try_flock(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: `flock` reads only the descriptor, which `file` keeps open for
+    // the whole call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// No cross-process lock off unix; the server ships for Linux.
+#[cfg(not(unix))]
+fn try_flock(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// The segment a path belongs to: a provenance sidecar maps to its segment, so
+/// both take the same lock.
+fn segment_of(path: &Path) -> PathBuf {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.ends_with(PROVENANCE_SUFFIX) => {
+            path.with_file_name(&name[..name.len() - PROVENANCE_SUFFIX.len()])
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 /// B1539/V1540 — how long a cached synthesized filler is trusted before the
 /// next read tries the source again.
 ///
@@ -3145,6 +3198,9 @@ impl HlsSegmentCache {
             return Ok(report);
         };
         tokio::fs::create_dir_all(&pen).await?;
+        // Units are segments: a record rides with its segment under one lock,
+        // so a replacement published meanwhile keeps its own record (B1539).
+        let mut units: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
         for e in entries.flatten() {
             let path = e.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -3158,19 +3214,35 @@ impl HlsSegmentCache {
             else {
                 continue;
             };
-            if !indices.contains(&idx) {
-                continue;
+            if indices.contains(&idx) {
+                units.insert(segment_of(&path));
             }
-            let dest = pen.join(format!("{media_id}-{name}"));
-            match tokio::fs::rename(&path, &dest).await {
-                Ok(()) => report.quarantined.push(name.to_string()),
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "could not quarantine a cached segment"
-                    );
-                    report.failed += 1;
+        }
+        for seg in units {
+            let Some(_lock) = self.publish_lock_or_count(&seg).await else {
+                report.failed += 1;
+                continue;
+            };
+            for path in [seg.clone(), provenance_sidecar_path(&seg)] {
+                let Some(name) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                let dest = pen.join(format!("{media_id}-{name}"));
+                match tokio::fs::rename(&path, &dest).await {
+                    Ok(()) => report.quarantined.push(name),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "could not quarantine a cached segment"
+                        );
+                        report.failed += 1;
+                    }
                 }
             }
         }
@@ -3316,6 +3388,13 @@ impl HlsSegmentCache {
         path: &Path,
         read: &std::fs::Metadata,
     ) -> Option<bool> {
+        // Check, move and record removal are one critical section: a
+        // replacement published in between would otherwise lose its record.
+        // Without the lock nothing is touched; the file stays and is reported
+        // as still there.
+        let Some(_lock) = self.publish_lock_or_count(path).await else {
+            return Some(false);
+        };
         // A concurrent request may already have quarantined these bytes and
         // published a fresh encode at the same path; that file is not ours to
         // move. Same length and mtime is the file this request read.
@@ -4704,7 +4783,10 @@ impl HlsSegmentCache {
             // are served to the requesters as `Transient`.
             let _ = tokio::fs::remove_file(&tmp).await;
             false
-        } else {
+        } else if let Some(_lock) = self.publish_lock_or_count(&path).await {
+            // The occupied check, the record and the rename are one critical
+            // section across processes (B1539): a pod sharing this volume
+            // could otherwise interleave its own record write or rename.
             // A directory is left to the rename to refuse (and count) below.
             let occupied = tokio::fs::symlink_metadata(&path)
                 .await
@@ -4762,6 +4844,10 @@ impl HlsSegmentCache {
                     false
                 }
             }
+        } else {
+            // Fail closed: without the lock the keyed path is not touched.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            false
         };
         if cached {
             if let Some(parent) = path.parent() {
@@ -4980,9 +5066,13 @@ impl HlsSegmentCache {
         }
         // An unpublished segment has no file, so no LRU entry: the accounting
         // would otherwise carry bytes the eviction walk can never find.
+        let mut retained = retained;
         if retained {
             self.record(key, bytes.len() as u64).await;
             self.maybe_evict().await;
+            // A segment that alone exceeds the budget is evicted by the
+            // eviction it triggered: it was served, but it is not retained.
+            retained = self.state.lock().await.entries.contains_key(&key);
         }
         Ok(ProducedSegment {
             bytes,
@@ -5020,6 +5110,62 @@ impl HlsSegmentCache {
     /// for warm caches that pre-date per-track + per-variant keys.
     fn segment_path_keyed(&self, key: SegmentIdentity) -> PathBuf {
         self.root.join(key.cache_relative_path())
+    }
+
+    /// The lock file guarding `segment` (or its sidecar) on the cache volume.
+    fn publish_lock_path(&self, segment: &Path) -> PathBuf {
+        let h = xxhash_rust::xxh3::xxh3_64(segment_of(segment).to_string_lossy().as_bytes());
+        self.root
+            .join(".locks")
+            .join(format!("{:02}.lock", h % PUBLISH_LOCK_STRIPES))
+    }
+
+    /// Take the cross-process publish lock for `segment`, waiting up to
+    /// [`PUBLISH_LOCK_WAIT`]. An error means the caller must NOT touch the
+    /// keyed path: fail closed.
+    async fn publish_lock(&self, segment: &Path) -> std::io::Result<PublishLock> {
+        let path = self.publish_lock_path(segment);
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)?;
+        let deadline = tokio::time::Instant::now() + PUBLISH_LOCK_WAIT;
+        loop {
+            match try_flock(&file) {
+                Ok(()) => return Ok(PublishLock(file)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("segment publish lock busy: {}", path.display()),
+                        ));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// [`Self::publish_lock`] that logs and counts a failure, for callers that
+    /// then skip the operation.
+    async fn publish_lock_or_count(&self, segment: &Path) -> Option<PublishLock> {
+        match self.publish_lock(segment).await {
+            Ok(l) => Some(l),
+            Err(e) => {
+                metrics::counter!("pharos_segment_publish_lock_failed_total").increment(1);
+                tracing::warn!(
+                    path = %segment.display(),
+                    error = %e,
+                    "could not take the segment publish lock; leaving the keyed path alone (B1539)"
+                );
+                None
+            }
+        }
     }
 
     /// Transcode one segment to `out`. Returns the scheduler's timing split
@@ -6545,6 +6691,9 @@ impl HlsSegmentCache {
             }
         }
         for (_, path) in to_remove {
+            let Some(_lock) = self.publish_lock_or_count(&path).await else {
+                continue;
+            };
             let _ = tokio::fs::remove_file(&path).await;
             // The provenance record describes THESE bytes and is worthless once
             // they are gone; left behind it would accumulate one small file per
@@ -6715,39 +6864,68 @@ impl HlsSegmentCache {
                     path,
                     size,
                     sidecar,
-                    ..
-                } => match tokio::fs::remove_file(&path).await {
-                    Ok(()) => {
-                        total = total.saturating_sub(size);
-                        report.evicted_bytes = report.evicted_bytes.saturating_add(size);
-                        report.evicted_files = report.evicted_files.saturating_add(1);
-                        if let Some((sidecar_path, sidecar_size)) = sidecar {
-                            match tokio::fs::remove_file(&sidecar_path).await {
-                                Ok(()) => {
-                                    total = total.saturating_sub(sidecar_size);
-                                    report.evicted_bytes =
-                                        report.evicted_bytes.saturating_add(sidecar_size);
-                                }
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => {
-                                    tracing::warn!(
-                                        path = %sidecar_path.display(),
-                                        error = %e,
-                                        "could not evict segment provenance sidecar"
-                                    );
+                    mtime,
+                } => {
+                    #[cfg(test)]
+                    tests::evict_gate().await;
+                    // The scan is a snapshot. Segment and record go together
+                    // under the publish lock, and only if they are still what
+                    // the scan saw: a replacement published since owns its
+                    // record, and must keep it (B1539).
+                    let Some(_lock) = self.publish_lock_or_count(&path).await else {
+                        continue;
+                    };
+                    let orphan_record = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(PROVENANCE_SUFFIX));
+                    let unchanged = if orphan_record {
+                        tokio::fs::symlink_metadata(segment_of(&path))
+                            .await
+                            .is_err()
+                    } else {
+                        tokio::fs::metadata(&path)
+                            .await
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            == Some(mtime)
+                    };
+                    if !unchanged {
+                        continue;
+                    }
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {
+                            total = total.saturating_sub(size);
+                            report.evicted_bytes = report.evicted_bytes.saturating_add(size);
+                            report.evicted_files = report.evicted_files.saturating_add(1);
+                            if let Some((sidecar_path, sidecar_size)) = sidecar {
+                                match tokio::fs::remove_file(&sidecar_path).await {
+                                    Ok(()) => {
+                                        total = total.saturating_sub(sidecar_size);
+                                        report.evicted_bytes =
+                                            report.evicted_bytes.saturating_add(sidecar_size);
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            path = %sidecar_path.display(),
+                                            error = %e,
+                                            "could not evict segment provenance sidecar"
+                                        );
+                                    }
                                 }
                             }
+                            evicted_paths.insert(path);
                         }
-                        evicted_paths.insert(path);
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "could not evict cached segment file"
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "could not evict cached segment file"
-                        );
-                    }
-                },
+                }
                 EvictUnit::Session { path, size, .. } => {
                     match tokio::fs::remove_dir_all(&path).await {
                         Ok(()) => {
@@ -10245,6 +10423,19 @@ mod tests {
             const { std::cell::Cell::new(false) };
         static STALE_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
             const { std::cell::RefCell::new(None) };
+        static EVICT_GATE: std::cell::RefCell<Option<Arc<StaleGate>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Holds the FIRST eviction unit between the scan and its removal.
+    pub(super) async fn evict_gate() {
+        let gate = EVICT_GATE.with(|g| g.borrow_mut().take());
+        if let Some(g) = gate {
+            g.arrived.add_permits(1);
+            if let Ok(p) = g.proceed.acquire().await {
+                p.forget();
+            }
+        }
     }
 
     /// Holds every hit-path reader of a stale filler between its stale check and
@@ -10749,6 +10940,219 @@ mod tests {
                 count("pharos_segment_provenance_write_failed_total", None),
             ),
         )
+    }
+
+    /// Hold the cross-process publish lock for `segment` from a separate open
+    /// file, as another pod sharing the volume would. Dropping it releases it.
+    fn hold_publish_lock_elsewhere(cache: &HlsSegmentCache, segment: &Path) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        let lock = cache.publish_lock_path(segment);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        // SAFETY: `flock` reads only the descriptor, which `file` keeps open.
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        file
+    }
+
+    /// B1539 — publication is excluded across processes: while another process
+    /// holds the publish lock for a key, a finished encode is NOT renamed into
+    /// the keyed path and no record is written; once released it is published
+    /// with its record.
+    ///
+    /// Disarm evidence: with the lock not taken in `produce_segment`, the
+    /// segment is published while the other holder still has the lock, so this
+    /// goes RED.
+    #[tokio::test]
+    async fn publication_waits_for_another_process_holding_the_publish_lock() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let cache = cache.with_scheduler(writes_each_segment(std::time::Duration::ZERO));
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::for_read(source, None));
+        let path = cache.segment_path_keyed(key);
+        let held = hold_publish_lock_elsewhere(&cache, &path);
+
+        let task = {
+            let (cache, opts) = (cache.clone(), opts.clone());
+            tokio::spawn(async move {
+                cache
+                    .segment_bytes_keyed_served(
+                        7,
+                        0,
+                        None,
+                        None,
+                        Path::new("/no/source"),
+                        None,
+                        &opts,
+                        JobClass::Interactive,
+                        StreamKey::NONE,
+                        PlayheadSeed::Observes,
+                    )
+                    .await
+            })
+        };
+        // The encode finishes into its tmp file, then waits at the lock.
+        let dir_of = path.parent().unwrap().to_path_buf();
+        let tmp_seen = || {
+            std::fs::read_dir(&dir_of).is_ok_and(|d| {
+                d.flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains("tmp"))
+            })
+        };
+        while !tmp_seen() {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!task.is_finished(), "publication must wait for the lock");
+        assert!(!path.exists(), "nothing at the keyed path while locked");
+        assert!(!provenance_sidecar_path(&path).exists(), "no record either");
+
+        drop(held);
+        let (_, served, kind) = task.await.unwrap().expect("served after the release");
+        assert_eq!((served, kind), (SegmentServed::Miss, SegmentKind::Real));
+        assert!(path.exists() && provenance_sidecar_path(&path).exists());
+    }
+
+    /// B1539 — if the lock cannot be taken the keyed path is left alone: the
+    /// bytes are served `Transient`, nothing is published, and it is counted.
+    #[test]
+    fn publication_fails_closed_when_the_publish_lock_cannot_be_taken() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let cache = cache.with_scheduler(writes_each_segment(std::time::Duration::ZERO));
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::for_read(source, None));
+        let path = cache.segment_path_keyed(key);
+        // A file where the lock directory must be.
+        std::fs::create_dir_all(&cache.root).unwrap();
+        std::fs::write(cache.root.join(".locks"), b"").unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (_, _, kind) = cache
+                    .segment_bytes_keyed_served(
+                        7,
+                        0,
+                        None,
+                        None,
+                        source,
+                        None,
+                        &opts,
+                        JobClass::Interactive,
+                        StreamKey::NONE,
+                        PlayheadSeed::Observes,
+                    )
+                    .await
+                    .expect("served uncached");
+                assert_eq!(kind, SegmentKind::Transient);
+            });
+        });
+        assert!(!path.exists());
+        assert_eq!(
+            counter_value(&snapshotter, "pharos_segment_publish_lock_failed_total"),
+            1
+        );
+    }
+
+    /// B1539 — eviction removes a segment and its record only if they are still
+    /// what its scan saw. A replacement published after the scan keeps its
+    /// record.
+    ///
+    /// Disarm evidence: with the recheck removed, the orphan record scanned
+    /// earlier is deleted by path, taking the replacement's record with it, so
+    /// this goes RED.
+    #[test]
+    fn eviction_keeps_a_replacements_record() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let (cache, _) = slow_test_cache_capped(&dir, std::time::Duration::ZERO, 1);
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::for_read(source, None));
+        let path = cache.segment_path_keyed(key);
+        let record = provenance_sidecar_path(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An old record whose segment is already gone: an eviction unit.
+        std::fs::write(&record, r#"{"filler":true}"#).unwrap();
+        backdate(&record, 3600);
+
+        rt.block_on(async {
+            let gate = Arc::new(StaleGate {
+                arrived: tokio::sync::Semaphore::new(0),
+                proceed: tokio::sync::Semaphore::new(0),
+            });
+            EVICT_GATE.with(|g| *g.borrow_mut() = Some(gate.clone()));
+            let sweep = {
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    cache
+                        .enforce_cap_at(SystemTime::now(), std::time::Duration::from_secs(60))
+                        .await
+                })
+            };
+            // The scan has run and picked the old record; now a replacement
+            // is published, as another request or pod would.
+            gate.arrived.acquire().await.unwrap().forget();
+            std::fs::write(&path, vec![b'x'; 64]).unwrap();
+            std::fs::write(&record, r#"{"filler":false}"#).unwrap();
+            gate.proceed.add_permits(1);
+            sweep.await.unwrap();
+        });
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            r#"{"filler":false}"#,
+            "the replacement's record survived the sweep"
+        );
+        assert!(path.exists());
+    }
+
+    /// B1539 — a segment that alone exceeds the budget is evicted by the
+    /// eviction its own publication triggers; it is served, but `Transient`.
+    ///
+    /// Disarm evidence: without the survival check it is reported `Real`.
+    #[tokio::test]
+    async fn a_segment_evicted_by_its_own_publication_is_transient() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache_capped(&dir, std::time::Duration::ZERO, 1);
+        let cache = cache.with_scheduler(writes_each_segment(std::time::Duration::ZERO));
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let (bytes, _, kind) = cache
+            .segment_bytes_keyed_served(
+                7,
+                0,
+                None,
+                None,
+                source,
+                None,
+                &opts,
+                JobClass::Interactive,
+                StreamKey::NONE,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .expect("served");
+        assert!(!bytes.is_empty());
+        assert_eq!(kind, SegmentKind::Transient);
     }
 
     /// B1539/T119 — a short segment that is refused for caching is never
