@@ -1735,6 +1735,35 @@ fn share_of(item_path: &std::path::Path) -> Option<&'static crate::media_share::
         .then(crate::media_share::MediaShare::global)
 }
 
+/// The 503 for a local source that is not there while the share is absent
+/// (V1538), or `None` when the share is present, the source is URL-backed,
+/// or the file exists. Stats the file only while the share is absent.
+async fn refuse_missing_on_absent_share(
+    share: Option<&crate::media_share::MediaShare>,
+    path: &std::path::Path,
+) -> Option<actix_web::Error> {
+    if !share.is_some_and(crate::media_share::MediaShare::is_absent) {
+        return None;
+    }
+    match tokio::fs::try_exists(path).await {
+        Ok(false) => {}
+        Ok(true) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "hls: could not tell whether the source exists on an absent share");
+            return None;
+        }
+    }
+    tracing::warn!(
+        reason = "missing",
+        share_broken = false,
+        share_absent = true,
+        error = "the source file is not on the absent share",
+        "hls: media source unreadable"
+    );
+    metrics::counter!("pharos_source_unreadable_total", "reason" => "missing").increment(1);
+    Some(error::ErrorServiceUnavailable("media share absent"))
+}
+
 fn segment_cache_error(
     e: pharos_cache::hls_cache::HlsCacheError,
     share: Option<&crate::media_share::MediaShare>,
@@ -2555,6 +2584,12 @@ async fn vp9_audio_playlist(
     // Honour the client's AudioStreamIndex (multi-audio titles like Code
     // Geass) so switching track selects a different rendition session.
     let audio_rel = resolve_audio_rel(&item, q.audio_stream_index);
+    // The session starts in the background and reports a source that would
+    // not open only to later requests, so a missing source on an absent
+    // share is answered here, before a 200 playlist promises segments.
+    if let Some(refused) = refuse_missing_on_absent_share(share_of(&item.path), &item.path).await {
+        return Err(refused);
+    }
     // Start (or reuse) the audio session in the background.
     let Some(cache) = state.hls.as_ref() else {
         return Err(error::ErrorNotFound("no cache"));
@@ -5678,6 +5713,50 @@ mod tests {
             status(segment_cache_error(missing(), Some(share))),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// B1538: the VP9 audio playlist's up-front check refuses a missing
+    /// local source while the share is absent, before any session starts,
+    /// and lets anything else through.
+    #[actix_web::test]
+    async fn the_audio_playlist_refuses_a_missing_source_on_an_absent_share() {
+        let share: &'static crate::media_share::MediaShare = Box::leak(Box::new(
+            crate::media_share::MediaShare::new(crate::media_share::ROOT_TIMEOUT),
+        ));
+        let root = tempfile::tempdir().unwrap();
+        share.set_roots(vec![root.path().to_owned()]);
+        let gone = root.path().join("gone.mkv");
+        assert!(
+            refuse_missing_on_absent_share(Some(share), &gone)
+                .await
+                .is_none(),
+            "before any check the share is not known to be absent"
+        );
+        assert!(share.check().await.is_err());
+        let refused = refuse_missing_on_absent_share(Some(share), &gone)
+            .await
+            .expect("a missing source on an absent share is refused");
+        assert_eq!(
+            refused.as_response_error().status_code(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(!share.is_broken());
+        assert!(
+            refuse_missing_on_absent_share(None, &gone).await.is_none(),
+            "a URL-backed source says nothing about the share"
+        );
+
+        std::fs::write(root.path().join("a.mkv"), b"x").unwrap();
+        assert!(
+            refuse_missing_on_absent_share(Some(share), &root.path().join("a.mkv"))
+                .await
+                .is_none(),
+            "a file that is there is let through"
+        );
+        assert!(share.check().await.is_ok());
+        assert!(refuse_missing_on_absent_share(Some(share), &gone)
+            .await
+            .is_none());
     }
 
     /// B1532: an audio session whose source would not open answers as a
