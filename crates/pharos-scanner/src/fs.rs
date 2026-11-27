@@ -884,13 +884,10 @@ impl<P: Prober> FsScanner<P> {
             files: paths,
             errors: walk_errors,
             nfos,
+            bare: walked_bare,
         } = walk(root.to_path_buf(), self.extensions.clone())
             .instrument(tracing::info_span!("scan.walk"))
             .await?;
-        // B1538 — a root that walks to no media file at all is far likelier an
-        // export serving its bare mountpoint than a library emptied by hand;
-        // the sweep's fraction guard skips small roots, so keep them here.
-        let walked_nothing = paths.is_empty();
         // A course's lessons are neither a show to split nor copies of one
         // another: two modules can each hold an `Introduction` (ADR-0126).
         let (lessons, paths): (Vec<PathBuf>, Vec<PathBuf>) = paths
@@ -1485,7 +1482,7 @@ impl<P: Prober> FsScanner<P> {
         // A fold is final only on the pass whose sweep removes the copy's row;
         // folding on a pass that keeps the row would repeat the merge next
         // pass and re-mark watched what a viewer since marked unwatched.
-        if !cancelled && walk_errors == 0 && !walked_nothing {
+        if !cancelled && walk_errors == 0 && !walked_bare {
             self.settle_series_identity(store, series_plan.as_ref(), &root_prefix)
                 .instrument(tracing::info_span!("scan.series_identity"))
                 .await;
@@ -1502,11 +1499,14 @@ impl<P: Prober> FsScanner<P> {
         let swept = if cancelled {
             tracing::info!(scan_id, "scan cancelled mid-run; skipping deletion sweep");
             Vec::new()
-        } else if walked_nothing {
+        } else if walked_bare {
+            // B1538 — no file at all and no `.ignore` folder is an export
+            // serving its bare mountpoint far likelier than a library emptied
+            // by hand; the store's fraction guard skips small roots.
             tracing::warn!(
                 scan_id,
                 root = %root.display(),
-                "walk found no media file under the root; skipping deletion sweep (an empty root reads as an absent share, not a deleted library)",
+                "walk found no file and no .ignore folder under the root; skipping deletion sweep (a bare root reads as an absent share, not a deleted library)",
             );
             Vec::new()
         } else if walk_errors == 0 {
@@ -5545,6 +5545,10 @@ struct WalkOutcome {
     /// Each `.nfo` file the walk passed and its mtime (unix seconds), so an
     /// unchanged video whose NFO was edited is re-read (B1284).
     nfos: HashMap<PathBuf, i64>,
+    /// No regular file of any kind under the root and no folder left out
+    /// for `.ignore`: an export serving its bare mountpoint looks like this,
+    /// a library emptied or excluded on purpose does not (B1538).
+    bare: bool,
 }
 
 /// Recursive walk inside `spawn_blocking`. Returns paths of files whose
@@ -5556,6 +5560,7 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
             let mut nfos = HashMap::new();
             let mut errors = 0usize;
             let mut ignored_folders = 0u64;
+            let mut any_file = false;
             let entries = walkdir::WalkDir::new(&root)
                 .follow_links(false)
                 .into_iter()
@@ -5593,6 +5598,7 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
                 if !e.file_type().is_file() {
                     continue;
                 }
+                any_file = true;
                 if is_sidecar_noise(e.path()) {
                     continue;
                 }
@@ -5640,6 +5646,7 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
                     files: out,
                     errors,
                     nfos,
+                    bare: !any_file && ignored_folders == 0,
                 },
                 ignored_folders,
             ))
@@ -8913,9 +8920,10 @@ mod tests {
         );
     }
 
-    /// B1538 — a root that walks to no media file keeps every row: an export
-    /// whose disks are gone serves an empty mountpoint, and the store's
-    /// fraction guard (B98) does not cover a root under 100 items.
+    /// B1538 — a root that walks to no file at all keeps every row: an export
+    /// whose disks are gone serves an empty mountpoint (empty folders and
+    /// all), and the store's fraction guard (B98) does not cover a root
+    /// under 100 items.
     #[tokio::test]
     async fn a_root_that_walks_to_nothing_keeps_its_rows() {
         let root = TempDir::new().unwrap();
@@ -8931,9 +8939,30 @@ mod tests {
                 .await
                 .unwrap();
         }
+        tokio::fs::create_dir(root.path().join("Movies"))
+            .await
+            .unwrap();
         let outcome = s.scan_into(root.path(), &store).await.unwrap();
         assert!(outcome.removed.is_empty(), "{:?}", outcome.removed);
         assert_eq!(store.list().await.unwrap().len(), 2, "rows kept");
+    }
+
+    /// B1538 — the bare-root guard leaves a deliberate exclusion alone: once
+    /// the only media sits under a folder that gained `.ignore`, its rows
+    /// are swept as V969 says, though the walk found no media file.
+    #[tokio::test]
+    async fn a_root_whose_media_all_went_under_ignore_is_still_swept() {
+        let root = TempDir::new().unwrap();
+        write_file(root.path(), "To Sort/a.mkv", b"a").await;
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        s.scan_into(root.path(), &store).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 1);
+
+        write_file(root.path(), "To Sort/.ignore", b"").await;
+        let outcome = s.scan_into(root.path(), &store).await.unwrap();
+        assert_eq!(outcome.removed.len(), 1, "{outcome:?}");
+        assert!(store.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]
