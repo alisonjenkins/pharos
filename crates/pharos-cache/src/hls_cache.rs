@@ -7050,14 +7050,25 @@ impl HlsSegmentCache {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                 Err(_) => false,
                 Ok(m) => {
-                    // Fail closed: an unknown recorded or current mtime is never
-                    // a match.
-                    let same = m.len() == victim.bytes
-                        && victim.mtime.is_some_and(|t| m.modified().ok() == Some(t));
-                    if !same {
-                        // Not the recorded file: leave it, and stop billing
-                        // for bytes that are no longer these.
+                    // Three answers, not two. A CONFIRMED different file (other
+                    // length, or both mtimes known and unequal) is a peer's
+                    // replacement: spare it and stop billing for bytes that are
+                    // no longer these. An UNKNOWN identity (either mtime
+                    // missing) is neither: leave the file and keep its entry.
+                    let different = m.len() != victim.bytes
+                        || matches!(
+                            (victim.mtime, m.modified().ok()),
+                            (Some(a), Some(b)) if a != b
+                        );
+                    let confirmed_same = !different
+                        && matches!(
+                            (victim.mtime, m.modified().ok()),
+                            (Some(a), Some(b)) if a == b
+                        );
+                    if different {
                         true
+                    } else if !confirmed_same {
+                        false
                     } else {
                         match tokio::fs::remove_file(&path).await {
                             Ok(()) => {
@@ -11842,6 +11853,8 @@ mod tests {
         std::fs::write(&path, vec![b'x'; 400]).unwrap();
         cache.maybe_evict().await;
         assert!(path.exists(), "a file of unknown identity was evicted");
+        assert_eq!(cache.entry_count().await, 1, "its entry was dropped");
+        assert_eq!(cache.total_bytes().await, 400, "its bytes were debited");
     }
 
     /// B1539 — the accounting is fenced by record identity: an entry that was
