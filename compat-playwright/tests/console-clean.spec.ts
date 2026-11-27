@@ -166,6 +166,9 @@ test.describe("strict console + response capture", () => {
   });
 
   test("settings + my-preferences route cleanly", async ({ page }) => {
+    // connect + signIn can take 40 s and the home-section wait 20 s more,
+    // so the default 60 s would cut the route checks short.
+    test.setTimeout(90_000);
     const cap = start(page);
     await connect(page);
     await signIn(page);
