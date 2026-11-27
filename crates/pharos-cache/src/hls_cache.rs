@@ -7064,6 +7064,10 @@ impl HlsSegmentCache {
         // bytes debited only once its file is confirmed gone (B1539).
         let victims: Vec<(SegmentIdentity, EntryMeta)> = {
             let state = self.state.lock().await;
+            // Under budget: nothing to pick, so skip the copy and the sort.
+            if state.total_bytes <= self.max_bytes {
+                return;
+            }
             let mut all: Vec<(SegmentIdentity, EntryMeta)> = state
                 .entries
                 .iter()
