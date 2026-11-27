@@ -6578,6 +6578,10 @@ body::before {
   border-top: var(--px-border) solid var(--px-color-border);
   background: var(--px-color-surface-raised);
 }
+/* The main area takes focus only as a fallback (B1540); no ring for it. */
+.pharos-main:focus {
+  outline: none;
+}
 /* The page keeps room for the bar, so it hides nothing. */
 body:has(.pharos-stage.is-mini) .pharos-main {
   padding-bottom: calc(var(--px-gutter) + 4rem);

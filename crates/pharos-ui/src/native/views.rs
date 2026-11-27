@@ -345,7 +345,7 @@ pub fn Shell(
                 LibraryNav { libraries, current }
                 Crumbs { trail }
             }
-            main { id: MAIN_ID, class: "pharos-main", {children} }
+            main { id: MAIN_ID, class: "pharos-main", tabindex: "-1", {children} }
         }
     }
 }

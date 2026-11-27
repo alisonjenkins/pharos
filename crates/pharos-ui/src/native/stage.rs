@@ -911,6 +911,9 @@ pub fn IdleQueueBar() -> Element {
             platform::info(&idle_queue_line("emptied", 0));
             spawn(async move {
                 platform::sleep_ms(0).await;
+                // The area itself first, so a page with no control in it
+                // (loading, or an empty home) still holds the focus.
+                platform::focus_by_id(MAIN_ID);
                 platform::focus_first_in(MAIN_ID);
             });
         }
