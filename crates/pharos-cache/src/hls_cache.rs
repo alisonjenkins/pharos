@@ -2379,7 +2379,25 @@ pub struct HlsSegmentCache {
     /// be able to say so under the map's shard lock: the driver's deregistration
     /// (which must never remove a SUCCESSOR's entry) and the abandonment check
     /// beside it.
+    ///
+    /// Starts at a per-instance random value, not 0 (B1539): the id names the
+    /// encode's temp file and its progress sidecar, and two pods sharing one
+    /// cache volume in a rolling update would otherwise both start at 0 and
+    /// write the same temp file for the same key.
     next_registration: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// B1539 — the first registration id of a cache instance: random high 32 bits,
+/// so instances that share a cache root (two pods in a rolling update) never
+/// hand out the same id and so never write the same temp file. The low 32 bits
+/// start at 0, leaving room for 4 billion registrations before a carry.
+/// `RandomState` is seeded from the OS's randomness per process (and per call),
+/// which is all this needs, without a new dependency.
+fn first_registration_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u32(std::process::id());
+    h.finish() & 0xFFFF_FFFF_0000_0000
 }
 
 /// The eventual outcome of one in-flight segment encode, as every waiter sees
@@ -3017,7 +3035,7 @@ impl HlsSegmentCache {
             inflight: Arc::new(DashMap::new()),
             source_end: Arc::new(std::sync::OnceLock::new()),
             refused_once: Arc::new(DashMap::new()),
-            next_registration: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            next_registration: Arc::new(std::sync::atomic::AtomicU64::new(first_registration_id())),
         }
     }
 
@@ -8097,6 +8115,29 @@ mod tests {
     /// wrong reader: a corrupt segment, renamed into the cache and served with a
     /// 200 for as long as it stays there. Distinct names make that interleaving
     /// harmless rather than rare.
+    /// B1539 — two cache instances on one root (two pods sharing the cache
+    /// volume in a rolling update) must not name their first encode's temp
+    /// file the same, or one pod's encode overwrites the other's before the
+    /// publish lock is ever taken.
+    #[test]
+    fn two_cache_instances_on_one_root_never_share_a_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = HlsSegmentCache::new(dir.path(), 1 << 20);
+        let b = HlsSegmentCache::new(dir.path(), 1 << 20);
+        let next = |c: &HlsSegmentCache| {
+            c.next_registration
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        };
+        let (ia, ib) = (next(&a), next(&b));
+        assert_ne!(ia >> 32, ib >> 32, "instances drew the same id space");
+        let path = dir.path().join("61/9.ts");
+        assert_ne!(segment_tmp_path(&path, ia), segment_tmp_path(&path, ib));
+        assert_ne!(
+            progress_sidecar_path(&segment_tmp_path(&path, ia)),
+            progress_sidecar_path(&segment_tmp_path(&path, ib)),
+        );
+    }
+
     #[test]
     fn two_registrations_for_one_key_never_write_the_same_file() {
         let path = Path::new("/cache/61/9.ts");
