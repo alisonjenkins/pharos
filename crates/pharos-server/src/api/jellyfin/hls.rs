@@ -1652,6 +1652,15 @@ async fn serve_segment(
             .await
             .map_err(|e| segment_cache_error(e, share_of(&item.path)))?;
         crate::media_telemetry::note_segment_served(&req, seg, served, waited.elapsed());
+        // `If-None-Match: *` is answered here, once the cache has said what it
+        // holds (RFC 9110 §13.1.2): only a current Real representation matches.
+        let inm = req
+            .headers()
+            .get(actix_web::http::header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok());
+        if let Some(not_modified) = not_modified_for_current(inm, &etag, kind) {
+            return Ok(not_modified);
+        }
         return Ok(segment_ok_response(
             opts.container.content_type(),
             &etag,
@@ -1757,6 +1766,37 @@ fn if_none_match_is_real(inm: &str, key_etag: &str) -> bool {
     let real = real_segment_etag(key_etag);
     let real = real.strip_prefix("W/").unwrap_or(&real);
     opaque_tags(inm).contains(&real)
+}
+
+/// The 304 for a request whose `If-None-Match` is satisfied by the
+/// representation the cache has just confirmed, if any. Called after the cache
+/// read, so unlike the pre-cache short-circuit it can answer `*`: that matches
+/// when a current representation exists, and only a `Real` (retained,
+/// confirmed) one counts. A tag list matches on the Real-form ETag as before.
+fn not_modified_for_current(
+    inm: Option<&str>,
+    key_etag: &str,
+    kind: SegmentKind,
+) -> Option<HttpResponse> {
+    let inm = inm?;
+    if kind != SegmentKind::Real {
+        return None;
+    }
+    if inm.trim() != "*" && !if_none_match_is_real(inm, key_etag) {
+        return None;
+    }
+    Some(
+        HttpResponse::NotModified()
+            .insert_header((
+                actix_web::http::header::ETAG,
+                real_segment_etag(key_etag).as_str(),
+            ))
+            .insert_header((
+                actix_web::http::header::CACHE_CONTROL,
+                segment_cache_control(SegmentKind::Real),
+            ))
+            .finish(),
+    )
 }
 
 /// The 200 answer for a cached segment. Only a `Real` segment, retained at its
@@ -5739,6 +5779,21 @@ mod tests {
         );
         assert!(!if_none_match_is_real("W/\"seg-other-real\"", key));
         assert!(!if_none_match_is_real("*", key));
+        // After the cache read, `*` matches a current Real representation only.
+        assert!(not_modified_for_current(Some("*"), key, SegmentKind::Real).is_some());
+        assert!(not_modified_for_current(Some(&real), key, SegmentKind::Real).is_some());
+        for kind in [
+            SegmentKind::Filler,
+            SegmentKind::Unconfirmed,
+            SegmentKind::Transient,
+        ] {
+            assert!(
+                not_modified_for_current(Some("*"), key, kind).is_none(),
+                "{kind:?} is not a current Real representation"
+            );
+        }
+        assert!(not_modified_for_current(None, key, SegmentKind::Real).is_none());
+        assert!(not_modified_for_current(Some("\"other\""), key, SegmentKind::Real).is_none());
     }
 
     #[actix_web::test]
