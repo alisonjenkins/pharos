@@ -5456,11 +5456,19 @@ impl HlsSegmentCache {
         // would otherwise carry bytes the eviction walk can never find.
         let mut retained = retained;
         if retained {
-            self.record(key, bytes.len() as u64).await;
+            let my_id = self.record(key, bytes.len() as u64).await;
             self.maybe_evict().await;
             // A segment that alone exceeds the budget is evicted by the
             // eviction it triggered: it was served, but it is not retained.
-            retained = self.state.lock().await.entries.contains_key(&key);
+            // Match this publication's own record id: a peer's later record
+            // under the same key is not ours to claim.
+            retained = self
+                .state
+                .lock()
+                .await
+                .entries
+                .get(&key)
+                .is_some_and(|m| m.recorded == my_id);
         }
         Ok(ProducedSegment {
             bytes,
@@ -7034,7 +7042,7 @@ impl HlsSegmentCache {
         }
     }
 
-    async fn record(&self, key: SegmentIdentity, bytes: u64) {
+    async fn record(&self, key: SegmentIdentity, bytes: u64) -> u64 {
         let mtime = tokio::fs::metadata(self.segment_path_keyed(key))
             .await
             .ok()
@@ -7056,6 +7064,7 @@ impl HlsSegmentCache {
             state.total_bytes = state.total_bytes.saturating_sub(old.bytes);
         }
         state.total_bytes = state.total_bytes.saturating_add(bytes);
+        counter
     }
 
     async fn maybe_evict(&self) {
