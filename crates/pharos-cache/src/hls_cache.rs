@@ -5058,8 +5058,6 @@ impl HlsSegmentCache {
         let publish_lock = if short_refused {
             None
         } else {
-            #[cfg(test)]
-            tests::note_publish_lock_attempt();
             self.publish_lock_or_count(&path).await
         };
         let cached = if short_refused {
@@ -5475,6 +5473,9 @@ impl HlsSegmentCache {
             match try_flock(&file) {
                 Ok(()) => return Ok(PublishLock(file)),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Test signal: a producer has really found the lock held.
+                    #[cfg(test)]
+                    tests::note_publish_lock_attempt();
                     if tokio::time::Instant::now() >= deadline {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
