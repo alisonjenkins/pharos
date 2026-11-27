@@ -34,6 +34,10 @@ use super::versions;
 #[derive(Clone, Copy)]
 pub struct Nav(pub EventHandler<Route>);
 
+/// The page's main area, where focus goes when a control it was on leaves
+/// the page (B1540).
+pub const MAIN_ID: &str = "pharos-main";
+
 /// Marks an item watched (`true`) or unwatched, provided by the app root:
 /// it stores the mark and reloads the screen. The name is what a failure
 /// says it could not mark (B824).
@@ -341,7 +345,7 @@ pub fn Shell(
                 LibraryNav { libraries, current }
                 Crumbs { trail }
             }
-            main { class: "pharos-main", {children} }
+            main { id: MAIN_ID, class: "pharos-main", {children} }
         }
     }
 }
