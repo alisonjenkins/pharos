@@ -1592,10 +1592,16 @@ async fn serve_segment(
     {
         if if_none_match_is_real(inm, &etag) {
             // Answered before the cache is read, which is safe only because the
-            // matched ETag is the Real-form one: only a confirmed-real segment
-            // is ever given it (B1539), and a real segment's bytes do not
-            // change. A filler or unconfirmed copy carries no ETag, so it can
-            // never be answered 304 here after the cache re-encoded it.
+            // matched ETag is the Real-form one (B1539). That form goes out only
+            // with a confirmed-real segment RETAINED at its keyed path; filler,
+            // unconfirmed and unretained bytes (an uncached serve, the live
+            // fallbacks) carry no ETag. So a client that presents it holds the
+            // retained bytes, and those change only by quarantine or purge. A
+            // purge bumps the item's epoch, which changes the URL. A quarantine
+            // of a defective Real segment (defect found on a later read) does
+            // replace the bytes without an epoch bump, and a 304 then keeps
+            // the client's copy: no worse than before, since a segment that
+            // had to be quarantined was broken in the first place.
             return Ok(HttpResponse::NotModified()
                 .insert_header((
                     actix_web::http::header::ETAG,
@@ -1676,17 +1682,7 @@ async fn serve_segment(
             .await
         {
             Ok(stream) => {
-                return Ok(HttpResponse::Ok()
-                    .content_type(opts.container.content_type())
-                    .insert_header((
-                        actix_web::http::header::ETAG,
-                        real_segment_etag(&etag).as_str(),
-                    ))
-                    .insert_header((
-                        actix_web::http::header::CACHE_CONTROL,
-                        "private, max-age=31536000, immutable",
-                    ))
-                    .streaming(stream));
+                return Ok(live_segment_builder(opts.container.content_type()).streaming(stream));
             }
             Err(e) => {
                 // Busy / worker error — fall through to inline ffmpeg so
@@ -1701,17 +1697,18 @@ async fn serve_segment(
         .transcode(&source, &resolved.to_transcode_options())
         .await
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
-    Ok(HttpResponse::Ok()
-        .content_type(opts.container.content_type())
-        .insert_header((
-            actix_web::http::header::ETAG,
-            real_segment_etag(&etag).as_str(),
-        ))
-        .insert_header((
-            actix_web::http::header::CACHE_CONTROL,
-            "private, max-age=31536000, immutable",
-        ))
-        .streaming(stream.into_stream()))
+    Ok(live_segment_builder(opts.container.content_type()).streaming(stream.into_stream()))
+}
+
+/// The response head for a segment transcoded live, with no cache behind it.
+/// Never retained, so no ETag and `no-store` (B1539).
+fn live_segment_builder(content_type: &str) -> actix_web::HttpResponseBuilder {
+    let mut ok = HttpResponse::Ok();
+    ok.content_type(content_type).insert_header((
+        actix_web::http::header::CACHE_CONTROL,
+        segment_cache_control(SegmentKind::Transient),
+    ));
+    ok
 }
 
 /// The ETag a confirmed-real segment is served under: the key's ETag with a
@@ -1731,10 +1728,11 @@ fn if_none_match_is_real(inm: &str, key_etag: &str) -> bool {
     inm.split(',').any(|t| t.trim() == real)
 }
 
-/// The 200 answer for a cached segment. Only a `Real` segment carries an ETag:
-/// the ETag comes from the segment's key, not its bytes, so one sent with a
-/// filler or an unconfirmed segment would keep matching after the cache
-/// re-encoded it (B1539).
+/// The 200 answer for a cached segment. Only a `Real` segment, retained at its
+/// keyed path, carries an ETag: the ETag comes from the segment's key, not its
+/// bytes, so one sent with a filler, an unconfirmed or an unretained
+/// (`Transient`) segment would keep matching after the cache re-encoded the key
+/// (B1539).
 fn segment_ok_response(
     content_type: &str,
     key_etag: &str,
@@ -1761,6 +1759,9 @@ fn segment_ok_response(
 /// - `Filler`: `no-store`. The cache re-encodes it from the source once it is
 ///   older than `FILLER_RETRY_AFTER_SECS`, and a client holding it `immutable`
 ///   for a year would keep the black bytes after the server had healed.
+/// - `Transient`: `no-store`. The bytes were served without being retained at
+///   the keyed path (an uncached serve, or a live transcode), so nothing the
+///   cache holds describes them.
 /// - `Unconfirmed`: five minutes. The cache could not confirm what these bytes
 ///   are: the segment predates provenance records, or the reader lost a race
 ///   with a retirement that moved the record. It may be a filler, so it must
@@ -1771,6 +1772,7 @@ fn segment_cache_control(kind: SegmentKind) -> &'static str {
         SegmentKind::Real => "private, max-age=31536000, immutable",
         SegmentKind::Filler => "no-store",
         SegmentKind::Unconfirmed => "private, max-age=300",
+        SegmentKind::Transient => "no-store",
     }
 }
 
@@ -5635,7 +5637,7 @@ async fn vp9_segment_raw_from(
             .submit_live(source.clone(), resolved.to_transcode_options())
             .await
         {
-            Ok(stream) => return Ok((collect_stream(stream).await?, SegmentKind::Real)),
+            Ok(stream) => return Ok((collect_stream(stream).await?, SegmentKind::Transient)),
             Err(e) => {
                 tracing::warn!(error = %e, "vp9 scheduler live transcode failed; inline fallback")
             }
@@ -5648,7 +5650,7 @@ async fn vp9_segment_raw_from(
         .map_err(|e| error::ErrorInternalServerError(format!("transcode: {e}")))?;
     Ok((
         collect_stream(stream.into_stream()).await?,
-        SegmentKind::Real,
+        SegmentKind::Transient,
     ))
 }
 
@@ -5778,13 +5780,23 @@ mod tests {
     async fn only_a_real_segment_carries_an_etag_and_only_it_is_revalidated() {
         use actix_web::http::header::ETAG;
         let key = "W/\"seg-0123456789abcdef\"";
-        for kind in [SegmentKind::Filler, SegmentKind::Unconfirmed] {
+        for kind in [
+            SegmentKind::Filler,
+            SegmentKind::Unconfirmed,
+            SegmentKind::Transient,
+        ] {
             let r = segment_ok_response("video/mp4", key, kind, vec![1]);
             assert!(
                 r.headers().get(ETAG).is_none(),
                 "{kind:?} must have no ETag"
             );
         }
+        let live = live_segment_builder("video/mp4").finish();
+        assert!(
+            live.headers().get(ETAG).is_none(),
+            "a live segment has no ETag"
+        );
+        assert_eq!(live.headers().get("cache-control").unwrap(), "no-store");
         let r = segment_ok_response("video/mp4", key, SegmentKind::Real, vec![1]);
         let real = r.headers().get(ETAG).unwrap().to_str().unwrap().to_string();
         assert_eq!(real, "W/\"seg-0123456789abcdef-real\"");
@@ -5802,6 +5814,7 @@ mod tests {
     async fn only_a_real_segment_is_served_immutable() {
         assert!(segment_cache_control(SegmentKind::Real).contains("immutable"));
         assert_eq!(segment_cache_control(SegmentKind::Filler), "no-store");
+        assert_eq!(segment_cache_control(SegmentKind::Transient), "no-store");
         let unconfirmed = segment_cache_control(SegmentKind::Unconfirmed);
         assert!(!unconfirmed.contains("immutable"));
         assert!(unconfirmed.contains("max-age=300"));
