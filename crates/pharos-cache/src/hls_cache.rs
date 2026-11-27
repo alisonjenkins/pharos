@@ -5218,15 +5218,31 @@ impl HlsSegmentCache {
             let record = if occupied {
                 None
             } else {
+                // Fail closed on unix: a record that cannot name its bytes'
+                // inode would be read with no inode check, so it is not
+                // written, and the publication fails like a record-write
+                // failure (the retired filler is restored).
                 #[cfg(unix)]
                 let inode = {
                     use std::os::unix::fs::MetadataExt;
-                    tokio::fs::metadata(&tmp).await.ok().map(|m| m.ino())
+                    #[cfg(test)]
+                    let stat = if tests::TMP_STAT_FAILS.with(std::cell::Cell::get) {
+                        Err(std::io::Error::other("injected"))
+                    } else {
+                        tokio::fs::metadata(&tmp).await
+                    };
+                    #[cfg(not(test))]
+                    let stat = tokio::fs::metadata(&tmp).await;
+                    stat.map(|m| Some(m.ino()))
                 };
                 #[cfg(not(unix))]
-                let inode = None;
+                let inode: std::io::Result<Option<u64>> = Ok(None);
                 let mut dir_retries = 0u32;
                 let written = loop {
+                    let inode = match &inode {
+                        Ok(i) => *i,
+                        Err(e) => break Err(std::io::Error::new(e.kind(), e.to_string())),
+                    };
                     #[cfg(test)]
                     tests::prune_media_dir(path.parent()).await;
                     let r = write_provenance(
@@ -11052,6 +11068,9 @@ mod tests {
         /// Makes the publishing rename fail after the record was written.
         pub(super) static RENAME_FAILS: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+        /// Makes the stat of the staged file fail before the record write.
+        pub(super) static TMP_STAT_FAILS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
         /// How many times a producer on this thread has reached the publish
         /// lock acquisition.
         static PUBLISH_LOCK_ATTEMPTS: std::cell::Cell<u32> =
@@ -12033,6 +12052,53 @@ mod tests {
             // And it is still retryable.
             let (_, served, _) = ask_filler_variant(&cache, &source, &opts).await;
             assert_eq!(served, SegmentServed::Miss);
+        });
+    }
+
+    /// B1539 — on unix a staged file whose inode cannot be read is not
+    /// published: a record without an inode would be read with no inode check,
+    /// so the publication fails closed: the fresh bytes are served
+    /// `Transient` and the retired filler is restored with its own record.
+    ///
+    /// Disarm evidence: with the stat error mapped to "no inode" the refresh
+    /// publishes an inode-less record over the filler, so this goes RED.
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_file_whose_inode_cannot_be_read_is_not_published() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache = cache.with_scheduler(always_short_until_filler(false, real_attempts));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        let key =
+            SegmentIdentity::new(42, 0, None, None, &opts, SourceGen::for_read(&source, None));
+        let path = cache.segment_path_keyed(key);
+        rt.block_on(async {
+            let (bytes_before, _, _) = ask_filler_variant(&cache, &source, &opts).await;
+            let record_before = std::fs::read(provenance_sidecar_path(&path)).unwrap();
+            backdate(&path, FILLER_RETRY_AFTER_SECS + 60);
+
+            TMP_STAT_FAILS.with(|f| f.set(true));
+            let (bytes, _, kind) = ask_filler_variant(&cache, &source, &opts).await;
+            TMP_STAT_FAILS.with(|f| f.set(false));
+            // The fresh bytes go out uncached, like any record-write failure.
+            assert_eq!(kind, SegmentKind::Transient);
+            let _ = bytes;
+            assert_eq!(std::fs::read(&path).unwrap(), bytes_before, "restored");
+            assert_eq!(
+                std::fs::read(provenance_sidecar_path(&path)).unwrap(),
+                record_before,
+                "no inode-less record was published"
+            );
         });
     }
 
