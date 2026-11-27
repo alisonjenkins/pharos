@@ -4659,6 +4659,24 @@ impl HlsSegmentCache {
         // fresh; this is the signal once the segment outlives it, which is the
         // case that matters when a cached file turns out to be bad days later.
         let device = timing.as_ref().map(|t| t.device.to_string());
+        // What the segment was supposed to contain against what it did, and
+        // whether it is refused for caching, decided BEFORE anything is
+        // published (T119/B1539): a segment renamed into the keyed path and
+        // removed again afterwards is, in between, readable by a fast-path
+        // reader that does not join this encode, and would be served as a
+        // retained Real segment. A refused one never reaches the keyed path.
+        let frame_deficit = match (expected_frames, produced_frames) {
+            // Only meaningful when this segment actually encodes video.
+            (Some(want), Some(got)) if opts.video.is_some() => Some(want as i64 - got as i64),
+            _ => None,
+        };
+        let frame_result = frame_deficit.map(|d| FrameResult::classify(d, opts.window.is_final()));
+        // Bounded to ONE refusal per segment identity (see below), so the
+        // `refused_once` insert happens here, once, for a warning-worthy result.
+        let disposition = frame_result
+            .filter(|r| r.warrants_warning())
+            .map(|r| short_disposition(r, self.refused_once.insert(key, ()).is_some()));
+        let short_refused = matches!(disposition, Some(ShortDisposition::ReEncode));
         // Raised BEFORE the record and the rename, not after: a flag set
         // afterwards leaves the window it exists to close. Setting it early can
         // only cost a cancellation that was about to become unsafe anyway — the
@@ -4681,61 +4699,68 @@ impl HlsSegmentCache {
         // over bytes still there would describe the wrong ones. The retirement
         // that precedes an encode can fail to remove a file; then the bytes are
         // served uncached and the old file and its record are left as they are.
-        // A directory is left to the rename to refuse (and count) below.
-        let occupied = tokio::fs::symlink_metadata(&path)
-            .await
-            .is_ok_and(|m| !m.is_dir());
-        let record = if occupied {
-            None
+        let cached = if short_refused {
+            // Never published: no record, no rename, no LRU entry. The bytes
+            // are served to the requesters as `Transient`.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            false
         } else {
-            Some(
-                write_provenance(
-                    &path,
-                    SegmentProvenance {
-                        device: device.as_deref(),
-                        generation: generation(),
-                        transcode_ms: transcode_ms as u64,
-                        encode_ms: timing.as_ref().map(|t| t.encode_ms),
-                        queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
-                        produced_frames,
-                        expected_frames,
-                        filler: is_filler,
-                    },
+            // A directory is left to the rename to refuse (and count) below.
+            let occupied = tokio::fs::symlink_metadata(&path)
+                .await
+                .is_ok_and(|m| !m.is_dir());
+            let record = if occupied {
+                None
+            } else {
+                Some(
+                    write_provenance(
+                        &path,
+                        SegmentProvenance {
+                            device: device.as_deref(),
+                            generation: generation(),
+                            transcode_ms: transcode_ms as u64,
+                            encode_ms: timing.as_ref().map(|t| t.encode_ms),
+                            queue_wait_ms: timing.as_ref().map(|t| t.queue_wait_ms),
+                            produced_frames,
+                            expected_frames,
+                            filler: is_filler,
+                        },
+                    )
+                    .await,
                 )
-                .await,
-            )
-        };
-        let cached = match record {
-            None => {
-                tracing::warn!(
-                    media.id = media_id,
-                    seg = seg_index,
-                    kind = kind.label(),
-                    path = %path.display(),
-                    "keyed path is still occupied after retirement; serving the segment without caching it (B1539)"
-                );
-                metrics::counter!("pharos_segment_publish_occupied_total").increment(1);
-                let _ = tokio::fs::remove_file(&tmp).await;
-                false
-            }
-            Some(Ok(())) => {
-                tokio::fs::rename(&tmp, &path)
-                    .await
-                    .map_err(|e| counted("publish_rename", e.into()))?;
-                true
-            }
-            Some(Err(e)) => {
-                tracing::warn!(
-                    media.id = media_id,
-                    seg = seg_index,
-                    error = %e,
-                    kind = kind.label(),
-                    "could not record segment provenance; serving the segment without caching it (B1539)"
-                );
-                metrics::counter!("pharos_segment_provenance_write_failed_total").increment(1);
-                let _ = tokio::fs::remove_file(&tmp).await;
-                let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
-                false
+            };
+            match record {
+                None => {
+                    tracing::warn!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        kind = kind.label(),
+                        path = %path.display(),
+                        "keyed path is still occupied after retirement; serving the segment without caching it (B1539)"
+                    );
+                    metrics::counter!("pharos_segment_publish_occupied_total").increment(1);
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    false
+                }
+                Some(Ok(())) => {
+                    tokio::fs::rename(&tmp, &path)
+                        .await
+                        .map_err(|e| counted("publish_rename", e.into()))?;
+                    true
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        media.id = media_id,
+                        seg = seg_index,
+                        error = %e,
+                        kind = kind.label(),
+                        "could not record segment provenance; serving the segment without caching it (B1539)"
+                    );
+                    metrics::counter!("pharos_segment_provenance_write_failed_total").increment(1);
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
+                    false
+                }
             }
         };
         if cached {
@@ -4835,14 +4860,8 @@ impl HlsSegmentCache {
         // its duration — at 6 s that is 600 ms, ~14 frames, a plainly visible
         // stutter that reads as a healthy segment. These fields make the
         // difference queryable instead of invisible.
-        // Whether these bytes are still what the keyed path holds; the short
-        // refusal below can take them out again.
-        let mut retained = cached;
-        let frame_deficit = match (expected_frames, produced_frames) {
-            // Only meaningful when this segment actually encodes video.
-            (Some(want), Some(got)) if opts.video.is_some() => Some(want as i64 - got as i64),
-            _ => None,
-        };
+        // Whether these bytes are what the keyed path holds.
+        let retained = cached;
         tracing::info!(
             media.id = media_id,
             seg = seg_index,
@@ -4873,8 +4892,7 @@ impl HlsSegmentCache {
         // Counted (bounded label: whether the source rate was known at all) and
         // warned, because a fault that only shows as a missing field on an INFO
         // line is a fault nobody queries for.
-        if let Some(deficit) = frame_deficit {
-            let result = FrameResult::classify(deficit, opts.window.is_final());
+        if let (Some(deficit), Some(result)) = (frame_deficit, frame_result) {
             metrics::counter!(
                 "pharos_segment_frames_total",
                 "result" => result.label(),
@@ -4907,20 +4925,8 @@ impl HlsSegmentCache {
                 // trades a visible hitch for unbounded load on the disk that
                 // T117 says is already the constraint. The second production
                 // is accepted and said so, loudly.
-                let already_refused = self.refused_once.insert(key, ()).is_some();
-                if matches!(
-                    short_disposition(result, already_refused),
-                    ShortDisposition::ReEncode
-                ) {
-                    // Segment first, record after, and only if the segment is gone.
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(()) => retained = false,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => retained = false,
-                        Err(_) => {}
-                    }
-                    if !retained {
-                        let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
-                    }
+                // (Decided above, before publishing: `short_refused`.)
+                if short_refused {
                     metrics::counter!(
                         "pharos_segment_frames_refused_total",
                         "disposition" => "reencode",
@@ -10662,6 +10668,116 @@ mod tests {
         assert!(
             rt.block_on(cache.state.lock()).entries.is_empty(),
             "no LRU entry for a file that does not exist"
+        );
+    }
+
+    /// Serve segment 7/0 once through a scheduler whose segment is short of the
+    /// frames its window implies (150 of ~180). Returns the kind it was served
+    /// as, whether the keyed path / its record exist afterwards, the LRU size, and
+    /// the `(refused, provenance_write_failed)` counters.
+    fn serve_one_short_segment(
+        block_sidecar: bool,
+    ) -> (SegmentKind, bool, bool, usize, (u64, u64)) {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let cache = cache.with_scheduler(writes_each_segment(std::time::Duration::ZERO));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            window: pharos_core::SegmentWindow::for_segment(
+                0,
+                pharos_core::FrameRate::from_mille(30_000),
+                Some(600.0),
+            ),
+            ..slow_opts()
+        };
+        let source = Path::new("/no/source");
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::for_read(source, None));
+        let path = cache.segment_path_keyed(key);
+        if block_sidecar {
+            // A record written for this segment would fail and be counted.
+            std::fs::create_dir_all(provenance_sidecar_path(&path)).unwrap();
+        }
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let kind = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                cache
+                    .segment_bytes_keyed_served(
+                        7,
+                        0,
+                        None,
+                        None,
+                        source,
+                        None,
+                        &opts,
+                        JobClass::Interactive,
+                        StreamKey::NONE,
+                        PlayheadSeed::Observes,
+                    )
+                    .await
+                    .expect("a refused short segment is still served")
+                    .2
+            })
+        });
+        let snap = snapshotter.snapshot().into_vec();
+        let count = |name: &str, label: Option<&str>| -> u64 {
+            snap.iter()
+                .filter(|(k, ..)| {
+                    k.key().name() == name
+                        && label.is_none_or(|l| k.key().labels().any(|x| x.value() == l))
+                })
+                .map(|(.., v)| match v {
+                    DebugValue::Counter(n) => *n,
+                    _ => 0,
+                })
+                .sum()
+        };
+        let lru = rt.block_on(cache.state.lock()).entries.len();
+        (
+            kind,
+            path.exists(),
+            !block_sidecar && provenance_sidecar_path(&path).exists(),
+            lru,
+            (
+                count("pharos_segment_frames_refused_total", Some("reencode")),
+                count("pharos_segment_provenance_write_failed_total", None),
+            ),
+        )
+    }
+
+    /// B1539/T119 — a short segment that is refused for caching is never
+    /// renamed into the keyed path: no file, no record, no LRU entry, served as
+    /// `Transient`. (Published and removed again, a fast-path reader could have
+    /// served it in between as a retained Real segment.)
+    #[test]
+    fn a_refused_short_segment_never_appears_at_the_keyed_path() {
+        let (kind, file, record, lru, (refused, _)) = serve_one_short_segment(false);
+        assert_eq!(refused, 1, "precondition: the segment was refused");
+        assert_eq!(kind, SegmentKind::Transient);
+        assert!(!file && !record, "nothing at the keyed path");
+        assert_eq!(lru, 0);
+    }
+
+    /// The same segment must be refused BEFORE its record is written: with the
+    /// record's path blocked, a record write attempt is counted as a failure.
+    ///
+    /// Disarm evidence: with the refusal decided after the sidecar write and
+    /// rename (the old order) the write is attempted and counted, so this goes
+    /// RED.
+    #[test]
+    fn a_refused_short_segment_is_decided_before_its_record_is_written() {
+        let (kind, _, _, _, (refused, write_failed)) = serve_one_short_segment(true);
+        assert_eq!(refused, 1);
+        assert_eq!(kind, SegmentKind::Transient);
+        assert_eq!(
+            write_failed, 0,
+            "no record was attempted for a refused segment"
         );
     }
 
