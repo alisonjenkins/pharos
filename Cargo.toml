@@ -62,7 +62,7 @@ actix-ws = "0.4"
 anyhow = "1"
 argon2 = "0.6"
 capnp = "0.27"
-capnp-rpc = "0.27"
+capnp-rpc = "0.28"
 capnpc = "0.27"
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
