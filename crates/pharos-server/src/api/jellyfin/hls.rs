@@ -1735,6 +1735,60 @@ fn share_of(item_path: &std::path::Path) -> Option<&'static crate::media_share::
         .then(crate::media_share::MediaShare::global)
 }
 
+/// At most this many up-front source stats run at once; a share that stops
+/// answering after the last check strands each one on a blocked thread.
+const ABSENT_STATS_MAX: usize = 4;
+
+/// Up-front source stats running now, stuck ones included.
+static ABSENT_STATS_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether `stat` says `path` is not there, deciding within `timeout` on a
+/// thread of its own, at most [`ABSENT_STATS_MAX`] at once. A stat that is
+/// slow, refused a thread, or fails is not "missing": the request then goes
+/// on as it would have without the check.
+async fn source_missing_within(
+    path: &std::path::Path,
+    timeout: std::time::Duration,
+    in_flight: &'static std::sync::atomic::AtomicUsize,
+    stat: impl FnOnce(&std::path::Path) -> std::io::Result<bool> + Send + 'static,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if in_flight.fetch_add(1, Ordering::AcqRel) >= ABSENT_STATS_MAX {
+        in_flight.fetch_sub(1, Ordering::AcqRel);
+        tracing::warn!("hls: too many source checks stuck on an absent share; skipping this one");
+        return false;
+    }
+    let owned = path.to_owned();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("absent-share-stat".to_owned())
+        .spawn(move || {
+            let result = stat(&owned);
+            in_flight.fetch_sub(1, Ordering::AcqRel);
+            drop(tx.send(result));
+        });
+    if let Err(e) = spawned {
+        in_flight.fetch_sub(1, Ordering::AcqRel);
+        tracing::warn!(error = %e, "hls: could not start a source check on an absent share");
+        return false;
+    }
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(exists))) => !exists,
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "hls: could not tell whether the source exists on an absent share");
+            false
+        }
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                "hls: a source check on an absent share did not return in time"
+            );
+            false
+        }
+    }
+}
+
 /// The 503 for a local source that is not there while the share is absent
 /// (V1538), or `None` when the share is present, the source is URL-backed,
 /// or the file exists. Stats the file only while the share is absent.
@@ -1745,13 +1799,19 @@ async fn refuse_missing_on_absent_share(
     if !share.is_some_and(crate::media_share::MediaShare::is_absent) {
         return None;
     }
-    match tokio::fs::try_exists(path).await {
-        Ok(false) => {}
-        Ok(true) => return None,
-        Err(e) => {
-            tracing::warn!(error = %e, "hls: could not tell whether the source exists on an absent share");
-            return None;
-        }
+    let missing = source_missing_within(
+        path,
+        crate::media_share::ROOT_TIMEOUT,
+        &ABSENT_STATS_IN_FLIGHT,
+        |p| match std::fs::metadata(p) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        },
+    )
+    .await;
+    if !missing {
+        return None;
     }
     tracing::warn!(
         reason = "missing",
@@ -5757,6 +5817,83 @@ mod tests {
         assert!(refuse_missing_on_absent_share(Some(share), &gone)
             .await
             .is_none());
+    }
+
+    /// B1538: the up-front check never blocks a request past its timeout on
+    /// a share that stopped answering, and stuck checks are capped: past the
+    /// cap a check is skipped, not queued. Either way it is not "missing".
+    #[actix_web::test]
+    async fn a_stalled_source_check_gives_up_in_time_and_is_capped() {
+        static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Arc::new(std::sync::Mutex::new(wait));
+        let stalled = || {
+            let wait = std::sync::Arc::clone(&wait);
+            move |_: &std::path::Path| {
+                wait.lock().unwrap().recv().ok();
+                Ok(false)
+            }
+        };
+        let path = std::path::Path::new("/m/gone.mkv");
+        let started = std::time::Instant::now();
+        assert!(
+            !source_missing_within(
+                path,
+                std::time::Duration::from_millis(20),
+                &IN_FLIGHT,
+                stalled()
+            )
+            .await,
+            "a stalled stat is not missing"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        for _ in 1..ABSENT_STATS_MAX {
+            assert!(
+                !source_missing_within(
+                    path,
+                    std::time::Duration::from_millis(5),
+                    &IN_FLIGHT,
+                    stalled()
+                )
+                .await
+            );
+        }
+        assert_eq!(
+            IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire),
+            ABSENT_STATS_MAX
+        );
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&ran);
+        assert!(
+            !source_missing_within(
+                path,
+                std::time::Duration::from_secs(5),
+                &IN_FLIGHT,
+                move |_| {
+                    seen.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(false)
+                }
+            )
+            .await,
+            "past the cap the check is skipped"
+        );
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::Acquire),
+            "and never runs"
+        );
+        for _ in 0..ABSENT_STATS_MAX {
+            release.send(()).unwrap();
+        }
+        while IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            source_missing_within(path, std::time::Duration::from_secs(5), &IN_FLIGHT, |_| Ok(
+                false
+            ))
+            .await,
+            "a stat that answers in time decides"
+        );
     }
 
     /// B1532: an audio session whose source would not open answers as a
