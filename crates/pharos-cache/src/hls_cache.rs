@@ -930,6 +930,16 @@ fn record_cache_hit(
     );
 }
 
+/// Remove the record this publication wrote at the keyed path. True when it
+/// is gone (removed or never there), so a retired pair may be restored without
+/// ever meeting a replacement record.
+async fn remove_own_record(path: &Path) -> bool {
+    match tokio::fs::remove_file(provenance_sidecar_path(path)).await {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Where a committed segment's provenance record lives.
 ///
 /// Distinct from [`pharos_transcode::progress_sidecar_path`], which belongs to
@@ -3556,10 +3566,19 @@ impl HlsSegmentCache {
         self.take_out_of_service_locked(key, path, read).await
     }
 
-    /// Put a filler that this publication retired back at `path`, segment first
-    /// and then its record, because the publication failed and left the keyed
-    /// path empty. Called under the publish lock. A failure to restore is
-    /// logged and counted: the filler is then only in the quarantine ring.
+    /// Put a filler that this publication retired back at `path`, record
+    /// first and then its segment, because the publication failed and left the
+    /// keyed path empty. Called under the publish lock, after the caller has
+    /// removed its own new record from the keyed path.
+    ///
+    /// Order argument: a reader treats the segment as the thing that exists and
+    /// reads its record to classify it. Restoring the record first means no
+    /// instant has the old filler bytes at the path beside any record other
+    /// than the filler's own; a record with no segment is a miss. If the
+    /// record cannot be restored the segment is left in quarantine (counted
+    /// and logged), because bytes without their record fail closed anyway but
+    /// must never meet a different record. A failure to restore is logged and
+    /// counted: the filler is then only in the quarantine ring.
     async fn restore_retired_filler(&self, key: SegmentIdentity, path: &Path) {
         let name = path
             .file_name()
@@ -3569,15 +3588,28 @@ impl HlsSegmentCache {
             .root
             .join(QUARANTINE_DIR)
             .join(format!("{}-{name}", key.media_id));
-        let restored = match tokio::fs::rename(&held, path).await {
-            Ok(()) => {
-                tokio::fs::rename(
-                    provenance_sidecar_path(&held),
-                    provenance_sidecar_path(path),
-                )
-                .await
+        let record_back = tokio::fs::rename(
+            provenance_sidecar_path(&held),
+            provenance_sidecar_path(path),
+        )
+        .await;
+        let restored = match record_back {
+            // No record was kept for the filler: the segment alone fails
+            // closed as unconfirmed, so it may still be put back.
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            kept => {
+                let record_present = kept.is_ok();
+                match tokio::fs::rename(&held, path).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        if record_present {
+                            // Do not leave a record without its bytes.
+                            let _ = tokio::fs::remove_file(provenance_sidecar_path(path)).await;
+                        }
+                        Err(e)
+                    }
+                }
             }
-            Err(e) => Err(e),
         };
         if let Err(e) = restored {
             metrics::counter!("pharos_segment_filler_restore_failed_total").increment(1);
@@ -5154,8 +5186,8 @@ impl HlsSegmentCache {
                         // arrived: remove it with the staged file, under the
                         // lock, before reporting the failure (B1539).
                         let _ = tokio::fs::remove_file(&tmp).await;
-                        let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
-                        if retired_to_quarantine {
+                        let own_record_gone = remove_own_record(&path).await;
+                        if retired_to_quarantine && own_record_gone {
                             self.restore_retired_filler(key, &path).await;
                         }
                         return Err(counted("publish_rename", e.into()));
@@ -5172,8 +5204,8 @@ impl HlsSegmentCache {
                     );
                     metrics::counter!("pharos_segment_provenance_write_failed_total").increment(1);
                     let _ = tokio::fs::remove_file(&tmp).await;
-                    let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
-                    if retired_to_quarantine {
+                    let own_record_gone = remove_own_record(&path).await;
+                    if retired_to_quarantine && own_record_gone {
                         self.restore_retired_filler(key, &path).await;
                     }
                     false
@@ -11834,6 +11866,38 @@ mod tests {
             let (_, served, _) = ask_filler_variant(&cache, &source, &opts).await;
             assert_eq!(served, SegmentServed::Miss);
         });
+    }
+
+    /// B1539 — a retired filler is restored record first. When the record
+    /// cannot be put back the segment stays in quarantine: the old bytes never
+    /// sit at the keyed path beside a record that is not their own.
+    ///
+    /// Disarm evidence: with the segment restored first, the bytes land at the
+    /// keyed path although their record did not, so this goes RED.
+    #[tokio::test]
+    async fn a_retired_filler_is_restored_record_first() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(9, 0, None, None, &opts, SourceGen::LOCAL);
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let held = cache
+            .root
+            .join(QUARANTINE_DIR)
+            .join(format!("{}-{name}", key.media_id));
+        std::fs::create_dir_all(held.parent().unwrap()).unwrap();
+        std::fs::write(&held, b"old filler").unwrap();
+        std::fs::write(provenance_sidecar_path(&held), b"{}").unwrap();
+        // A directory where the record belongs makes its restore fail.
+        std::fs::create_dir_all(provenance_sidecar_path(&path)).unwrap();
+        cache.restore_retired_filler(key, &path).await;
+        assert!(
+            !path.exists(),
+            "bytes restored beside a record that is not theirs"
+        );
+        assert!(held.exists(), "the filler left the quarantine ring");
     }
 
     /// B1539 — an LRU entry recorded without a known mtime is never treated as
