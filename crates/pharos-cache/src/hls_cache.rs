@@ -2385,6 +2385,10 @@ pub struct HlsSegmentCache {
     /// cache volume in a rolling update would otherwise both start at 0 and
     /// write the same temp file for the same key.
     next_registration: Arc<std::sync::atomic::AtomicU64>,
+    /// B1539 — this instance's own directory for in-progress encodes, claimed
+    /// atomically at construction so no other process sharing the cache root
+    /// has it. See [`segment_tmp_path`].
+    staging: Arc<PathBuf>,
 }
 
 /// B1539 — the first registration id of a cache instance: random high 32 bits,
@@ -2673,54 +2677,52 @@ async fn await_last_requester_gone(
 /// unreferenced, never renamed, never served — which is the trade this makes on
 /// purpose: a leaked temp file is recoverable and a corrupt cached segment
 /// served with a 200 is not.
-/// B1539 — candidate temp names for one registration: the plain
-/// [`segment_tmp_path`] first (what cancellation cleanup removes), then
-/// suffixed ones for the rare case another cache instance already holds it.
-fn segment_tmp_candidate(path: &Path, registration: u64, attempt: u32) -> PathBuf {
-    if attempt == 0 {
-        segment_tmp_path(path, registration)
-    } else {
-        path.with_extension(format!("{registration}.{attempt}.ts.tmp"))
-    }
+///
+/// B1539 — the file lives in this cache instance's own staging directory
+/// (see [`claim_staging_dir`]), never beside the keyed path. Registration ids
+/// are unique only within a process; the staging directory is unique across
+/// every process sharing the cache root, so a name in it — and the progress and
+/// partial sidecars derived from it, and any later rename between them — can
+/// never be another pod's file. Cleanup rebuilds the same name from the same
+/// `(staging, path, id)` and so only ever touches this instance's files.
+fn segment_tmp_path(staging: &Path, path: &Path, registration: u64) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    staging.join(format!("{name}.{registration}.ts.tmp"))
 }
 
-/// How many names [`reserve_segment_tmp`] tries before giving up.
-const TMP_RESERVE_ATTEMPTS: u32 = 16;
+/// Parent of every instance's staging directory, under the cache root.
+/// Dot-prefixed so eviction and the janitor skip it.
+const STAGING_DIR: &str = ".staging";
 
-/// B1539 — create this encode's temp file with `create_new` (O_EXCL) so no
-/// other process sharing the cache root can be writing the same file. A name
-/// that already exists belongs to someone else (ids are unique in-process), so
-/// the next candidate is tried. The progress and partial sidecars derive from
-/// the reserved name, so they are exclusive too.
-async fn reserve_segment_tmp(path: &Path, registration: u64) -> std::io::Result<PathBuf> {
-    for attempt in 0..TMP_RESERVE_ATTEMPTS {
-        let candidate = segment_tmp_candidate(path, registration, attempt);
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-            .await
-        {
-            Ok(_) => return Ok(candidate),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                metrics::counter!("pharos_segment_tmp_collision_total").increment(1);
-                tracing::warn!(
-                    path = %candidate.display(),
-                    attempt,
-                    "hls segment temp name already taken by another writer; trying the next (B1539)"
-                );
+/// B1539 — create a staging directory no other process sharing `root` has:
+/// `create_dir` is atomic and fails on an existing name, so a name that is
+/// taken (another pod drew the same nonce) is simply skipped. Falls back to an
+/// unclaimed path when the volume is unwritable; encodes there then fail and
+/// are counted like any other unwritable cache.
+fn claim_staging_dir(root: &Path) -> PathBuf {
+    let parent = root.join(STAGING_DIR);
+    let _ = std::fs::create_dir_all(&parent);
+    let mut last = parent.join("unclaimed");
+    for _ in 0..16 {
+        let dir = parent.join(format!(
+            "{:016x}-{}",
+            first_registration_id(),
+            std::process::id()
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return dir,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                tracing::warn!(dir = %dir.display(), error = %e, "could not create the HLS staging directory");
+                return dir;
             }
-            Err(e) => return Err(e),
         }
+        last = dir;
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!("no free temp name after {TMP_RESERVE_ATTEMPTS} attempts"),
-    ))
-}
-
-fn segment_tmp_path(path: &Path, registration: u64) -> PathBuf {
-    path.with_extension(format!("{registration}.ts.tmp"))
+    last
 }
 
 /// Drops the in-flight registration however the driver ends.
@@ -3065,6 +3067,7 @@ impl HlsSegmentCache {
         Self::reclaim_stale_generations(&base, generation, GENERATION_RECLAIM_GRACE);
         let root = Self::generation_root(&base, generation);
         let _ = std::fs::create_dir_all(&root);
+        let staging = claim_staging_dir(&root);
         tracing::info!(
             base = %base.display(),
             generation,
@@ -3082,6 +3085,7 @@ impl HlsSegmentCache {
             source_end: Arc::new(std::sync::OnceLock::new()),
             refused_once: Arc::new(DashMap::new()),
             next_registration: Arc::new(std::sync::atomic::AtomicU64::new(first_registration_id())),
+            staging: Arc::new(staging),
         }
     }
 
@@ -4214,7 +4218,7 @@ impl HlsSegmentCache {
                         // describes can leave an orphan writing to it, and
                         // unlinking a file a worker still holds open costs
                         // nothing and reclaims its space when that worker exits.
-                        let orphan = segment_tmp_path(&driver.segment_path_keyed(key), id);
+                        let orphan = segment_tmp_path(&driver.staging, &driver.segment_path_keyed(key), id);
                         let _ = tokio::fs::remove_file(progress_sidecar_path(&orphan)).await;
                         let _ = tokio::fs::remove_file(&orphan).await;
                         tracing::debug!(
@@ -4345,14 +4349,13 @@ impl HlsSegmentCache {
                 .await
                 .map_err(|e| counted("create_dir", e.into()))?;
         }
-        // B1539 — reserve the temp path exclusively before any encode writes
-        // it. Registration ids are unique only within this process; another
-        // pod sharing the cache volume may hold the same name. `create_new`
-        // (O_EXCL) makes the reservation atomic across processes, and on a
-        // collision the next candidate name is tried.
-        let tmp = reserve_segment_tmp(&path, registration_id)
+        // B1539 — the temp file lives in this instance's own staging
+        // directory, so no other pod sharing the cache volume can write it;
+        // re-created here in case a sweep removed it while idle.
+        tokio::fs::create_dir_all(self.staging.as_path())
             .await
-            .map_err(|e| counted("reserve_tmp", e.into()))?;
+            .map_err(|e| counted("create_staging", e.into()))?;
+        let tmp = segment_tmp_path(&self.staging, &path, registration_id);
         // Time the transcode: a segment covers SEGMENT_SECONDS of playback, so
         // if this exceeds that wall-clock the encoder is below realtime and the
         // client will stall. Logged per miss so Loki/Tempo show exactly which
@@ -8156,6 +8159,34 @@ mod tests {
         }
     }
 
+    /// B1539 — two cache instances on one root (two pods sharing the cache
+    /// volume in a rolling update) each own a staging directory the other
+    /// cannot have, so even the SAME registration id for the SAME key names
+    /// different temp, progress and partial files — and a file the other
+    /// instance is writing is never touched by this one's cleanup.
+    #[test]
+    fn two_cache_instances_never_share_a_temp_file_even_with_the_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = HlsSegmentCache::new(dir.path(), 1 << 20);
+        let b = HlsSegmentCache::new(dir.path(), 1 << 20);
+        assert_ne!(
+            a.staging, b.staging,
+            "two instances claimed one staging dir"
+        );
+        assert!(a.staging.is_dir() && b.staging.is_dir());
+        // A forced collision: same keyed path, same id, in both instances.
+        let path = dir.path().join("61/9.ts");
+        let ta = segment_tmp_path(&a.staging, &path, 7);
+        let tb = segment_tmp_path(&b.staging, &path, 7);
+        assert_ne!(ta, tb);
+        assert_ne!(progress_sidecar_path(&ta), progress_sidecar_path(&tb));
+        assert_ne!(partial_segment_path(&ta), partial_segment_path(&tb));
+        // A further claim on the same root gets its own directory too.
+        let taken = claim_staging_dir(&a.root);
+        assert_ne!(taken, *a.staging);
+        assert_ne!(taken, *b.staging);
+    }
+
     /// The belt on the abandonment seam: two drivers for one key must not share
     /// a temp file, nor the `-progress` sidecar derived from it.
     ///
@@ -8168,36 +8199,12 @@ mod tests {
     /// wrong reader: a corrupt segment, renamed into the cache and served with a
     /// 200 for as long as it stays there. Distinct names make that interleaving
     /// harmless rather than rare.
-    /// B1539 — a temp name another writer (another pod on the same cache
-    /// volume) already holds is never reused: the reservation is O_EXCL, so a
-    /// forced collision on the same registration id gets a different file.
-    #[tokio::test]
-    async fn a_temp_name_held_by_another_writer_is_never_reused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("9.ts");
-        // The other pod's in-progress encode, same id.
-        let theirs = segment_tmp_path(&path, 7);
-        std::fs::write(&theirs, b"their half-written bytes").unwrap();
-        let ours = reserve_segment_tmp(&path, 7).await.unwrap();
-        assert_ne!(ours, theirs, "reserved the other writer's temp file");
-        assert_ne!(progress_sidecar_path(&ours), progress_sidecar_path(&theirs));
-        assert_ne!(partial_segment_path(&ours), partial_segment_path(&theirs));
-        assert_eq!(
-            std::fs::read(&theirs).unwrap(),
-            b"their half-written bytes",
-            "the other writer's file was touched"
-        );
-        // A second concurrent reservation of the same id gets yet another name.
-        let again = reserve_segment_tmp(&path, 7).await.unwrap();
-        assert_ne!(again, ours);
-        assert_ne!(again, theirs);
-    }
-
     #[test]
     fn two_registrations_for_one_key_never_write_the_same_file() {
         let path = Path::new("/cache/61/9.ts");
-        let first = segment_tmp_path(path, 7);
-        let second = segment_tmp_path(path, 8);
+        let staging = Path::new("/cache/.staging/a");
+        let first = segment_tmp_path(staging, path, 7);
+        let second = segment_tmp_path(staging, path, 8);
         assert_ne!(
             first, second,
             "an abandoned driver's worker and its successor would write the same \
@@ -11094,7 +11101,8 @@ mod tests {
             })
         };
         // The encode finishes into its tmp file, then waits at the lock.
-        let dir_of = path.parent().unwrap().to_path_buf();
+        // B1539 — temp files live in the instance's staging directory.
+        let dir_of = cache.staging.as_ref().clone();
         let tmp_seen = || {
             std::fs::read_dir(&dir_of).is_ok_and(|d| {
                 d.flatten()
