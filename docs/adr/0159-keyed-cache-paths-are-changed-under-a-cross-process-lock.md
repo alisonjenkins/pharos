@@ -39,6 +39,7 @@ We will change keyed cache paths only while holding an advisory
 - The cache volume needs a filesystem with working `flock`. Local disks and the current PVC have it; some network filesystems do not.
 - Unrelated segments that share a stripe can wait briefly on each other.
 - `pharos-cache` gains a direct `libc` dependency. It was already in the workspace.
+- During the first rollout to the locked build, an old pod still renames without the lock. That is a known mixed-version exception; B1539 records it and the admin purge repairs any pair it leaves.
 - The lock is not reentrant, so code must never take it while holding it.
 
 ## Alternatives considered
