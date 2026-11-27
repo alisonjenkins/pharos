@@ -5102,6 +5102,11 @@ impl HlsSegmentCache {
             // section across processes (B1539): a pod sharing this volume
             // could otherwise interleave its own record write or rename.
             // A directory is left to the rename to refuse (and count) below.
+            // The cap sweep may have pruned the media dir while the temp sat in
+            // staging; re-create it under the lock, just before publishing.
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
             let is_occupied = || async {
                 tokio::fs::symlink_metadata(&path)
                     .await
