@@ -11314,7 +11314,7 @@ mod tests {
             snap.iter()
                 .filter(|(k, ..)| {
                     k.key().name() == name
-                        && label.is_none_or(|l| k.key().labels().any(|x| x.value() == l))
+                        && label.map_or(true, |l| k.key().labels().any(|x| x.value() == l))
                 })
                 .map(|(.., v)| match v {
                     DebugValue::Counter(n) => *n,
