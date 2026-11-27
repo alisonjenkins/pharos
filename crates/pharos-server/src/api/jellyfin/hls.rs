@@ -1722,10 +1722,41 @@ fn real_segment_etag(key_etag: &str) -> String {
     }
 }
 
-/// Whether an `If-None-Match` names the Real-form ETag of this segment key.
+/// The opaque tags (quotes included, any `W/` prefix dropped) of an
+/// `If-None-Match` entity-tag list, split only on commas OUTSIDE quoted tags
+/// (RFC 9110 §8.8.3). Parsing stops at the first malformed element. `*` is not
+/// a tag and yields none.
+fn opaque_tags(list: &str) -> Vec<&str> {
+    let mut tags = Vec::new();
+    let mut rest = list.trim_start();
+    while !rest.is_empty() {
+        let tag_start = rest.strip_prefix("W/").unwrap_or(rest);
+        let Some(inner) = tag_start.strip_prefix('"') else {
+            break;
+        };
+        let Some(end) = inner.find('"') else {
+            break;
+        };
+        tags.push(&tag_start[..end + 2]);
+        rest = tag_start[end + 2..].trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next.trim_start(),
+            None => break,
+        }
+    }
+    tags
+}
+
+/// Whether an `If-None-Match` names the Real-form ETag of this segment key,
+/// by weak comparison (RFC 9110 §8.8.3.2: opaque tags compared, `W/` ignored).
+///
+/// `*` is deliberately NOT a match here. It means "any current representation",
+/// and this runs before the cache is read, so a current Real representation
+/// cannot be confirmed; answering 200 is always safe.
 fn if_none_match_is_real(inm: &str, key_etag: &str) -> bool {
     let real = real_segment_etag(key_etag);
-    inm.split(',').any(|t| t.trim() == real)
+    let real = real.strip_prefix("W/").unwrap_or(&real);
+    opaque_tags(inm).contains(&real)
 }
 
 /// The 200 answer for a cached segment. Only a `Real` segment, retained at its
@@ -5689,6 +5720,19 @@ mod tests {
         assert_eq!(real, "W/\"seg-0123456789abcdef-real\"");
         assert!(if_none_match_is_real(&real, key));
         assert!(if_none_match_is_real(&format!("\"x\", {real}"), key));
+        // Weak comparison: the strong form of the same opaque tag matches.
+        assert!(if_none_match_is_real("\"seg-0123456789abcdef-real\"", key));
+        // A comma inside a quoted tag does not split it, so it cannot make a
+        // different tag look like ours.
+        assert!(!if_none_match_is_real(
+            "\"a, \\\"seg-0123456789abcdef-real\\\"\"",
+            key
+        ));
+        assert!(if_none_match_is_real(
+            "W/\"a,b\" , W/\"seg-0123456789abcdef-real\"",
+            key
+        ));
+        assert!(!if_none_match_is_real("seg-0123456789abcdef-real", key));
         assert!(
             !if_none_match_is_real(key, key),
             "the old-form ETag must not be answered 304"
