@@ -143,6 +143,10 @@ struct EntryMeta {
     /// The file's mtime when it was recorded, so an eviction can tell the file
     /// it chose from one a peer has since published at the same path (B1539).
     mtime: Option<SystemTime>,
+    /// Identity of this RECORD: the access counter when `record` made it, never
+    /// changed by a touch. An eviction forgets or debits an entry only if it is
+    /// still the record the eviction selected (B1539).
+    recorded: u64,
 }
 
 /// Compound cache key. Audio + subtitle default to a 0 / off sentinel so
@@ -6940,6 +6944,7 @@ impl HlsSegmentCache {
                 bytes,
                 last_used: counter,
                 mtime,
+                recorded: counter,
             },
         ) {
             state.total_bytes = state.total_bytes.saturating_sub(old.bytes);
@@ -6963,6 +6968,7 @@ impl HlsSegmentCache {
                             bytes: m.bytes,
                             last_used: m.last_used,
                             mtime: m.mtime,
+                            recorded: m.recorded,
                         },
                     )
                 })
@@ -6992,8 +6998,10 @@ impl HlsSegmentCache {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
                 Err(_) => false,
                 Ok(m) => {
+                    // Fail closed: an unknown recorded or current mtime is never
+                    // a match.
                     let same = m.len() == victim.bytes
-                        && victim.mtime.is_none_or(|t| m.modified().ok() == Some(t));
+                        && victim.mtime.is_some_and(|t| m.modified().ok() == Some(t));
                     if !same {
                         // Not the recorded file: leave it, and stop billing
                         // for bytes that are no longer these.
@@ -7031,7 +7039,7 @@ impl HlsSegmentCache {
                 if state
                     .entries
                     .get(&key)
-                    .is_some_and(|m| m.bytes == victim.bytes)
+                    .is_some_and(|m| m.recorded == victim.recorded)
                 {
                     state.entries.remove(&key);
                     state.total_bytes = state.total_bytes.saturating_sub(victim.bytes);
@@ -11709,6 +11717,62 @@ mod tests {
             0,
             "no temp file"
         );
+    }
+
+    /// B1539 — an LRU entry recorded without a known mtime is never treated as
+    /// matching the file now at the path.
+    ///
+    /// Disarm evidence: with an unknown mtime counted as a match the file is
+    /// evicted, so this goes RED.
+    #[tokio::test]
+    async fn lru_eviction_never_matches_an_unknown_mtime() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache_capped(&dir, std::time::Duration::ZERO, 100);
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::LOCAL);
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Recorded while no file existed: mtime unknown.
+        cache.record(key, 400).await;
+        std::fs::write(&path, vec![b'x'; 400]).unwrap();
+        cache.maybe_evict().await;
+        assert!(path.exists(), "a file of unknown identity was evicted");
+    }
+
+    /// B1539 — the accounting is fenced by record identity: an entry that was
+    /// re-recorded after the eviction selected it (same length, newer file) is
+    /// neither dropped nor debited.
+    ///
+    /// Disarm evidence: fencing by length alone drops the new record, so this
+    /// goes RED.
+    #[tokio::test]
+    async fn lru_eviction_does_not_forget_a_re_recorded_entry() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache_capped(&dir, std::time::Duration::ZERO, 100);
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::LOCAL);
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![b'x'; 400]).unwrap();
+        backdate(&path, 3600);
+        cache.record(key, 400).await;
+
+        // Another process holds the lock, so the eviction waits after it has
+        // selected its victim.
+        let held = hold_publish_lock_elsewhere(&cache, &path);
+        let sweep = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.maybe_evict().await })
+        };
+        tokio::task::yield_now().await;
+        // A new segment of the same length is published and recorded.
+        std::fs::write(&path, vec![b'y'; 400]).unwrap();
+        cache.record(key, 400).await;
+        drop(held);
+        sweep.await.unwrap();
+        assert!(path.exists());
+        assert_eq!(cache.entry_count().await, 1, "the new record was forgotten");
+        assert_eq!(cache.total_bytes().await, 400);
     }
 
     /// B1539 — a purge that cannot move a segment leaves its record where it is.
