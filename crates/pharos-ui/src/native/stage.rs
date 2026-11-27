@@ -14,7 +14,7 @@ use super::platform;
 use super::playback::{position_at, MediaState};
 use super::queue::{QueueAction, QueueCtx};
 use super::route::Route;
-use super::views::Nav;
+use super::views::{Nav, MAIN_ID};
 use super::watch_view::Control;
 
 /// The stage element, for its size while dragging.
@@ -905,6 +905,14 @@ pub fn IdleQueueBar() -> Element {
         ));
         if let Some(id) = play {
             start(id);
+        } else if queue.peek().upcoming().is_empty() {
+            // The bar goes with the last song, and the focus with it: it
+            // moves to the page rather than falling to the body (B1540).
+            platform::info(&idle_queue_line("emptied", 0));
+            spawn(async move {
+                platform::sleep_ms(0).await;
+                platform::focus_first_in(MAIN_ID);
+            });
         }
     });
     let mut toggle = move || {
