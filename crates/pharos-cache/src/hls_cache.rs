@@ -1138,6 +1138,61 @@ fn cached_age_secs(meta: &std::fs::Metadata) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// B1539/V1540 — how long a cached synthesized filler is trusted before the
+/// next read tries the source again.
+///
+/// A filler is the right answer for a window the source genuinely cannot
+/// yield, but the same bytes are produced when the source was only
+/// TRANSIENTLY unreadable (a storage outage mid-ladder). Cached forever, that
+/// outage became a permanent black window for one variant. Past this age a hit
+/// on a filler is taken out of service and re-encoded; a fresh filler gets a
+/// new mtime, so a window that really is damaged costs at most one re-encode
+/// per variant per this interval. Younger fillers are still served from cache,
+/// which is what stops a burst of client retries becoming an encode storm.
+const FILLER_RETRY_AFTER_SECS: u64 = 600;
+
+/// What the provenance sidecar of a cached segment says about a filler.
+struct FillerProvenance {
+    /// Epoch seconds the record was written; the age fallback when the
+    /// segment's own mtime is unavailable.
+    written_unix: Option<u64>,
+}
+
+/// `Some` when the segment's provenance sidecar says its bytes are a
+/// synthesized filler. Best-effort and cheap (one small read): a missing or
+/// unparsable sidecar is "not a filler", the same as a segment written before
+/// the record existed.
+async fn filler_provenance(segment: &Path) -> Option<FillerProvenance> {
+    let text = tokio::fs::read(provenance_sidecar_path(segment))
+        .await
+        .ok()?;
+    let doc: serde_json::Value = serde_json::from_slice(&text).ok()?;
+    if doc.get("filler").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(FillerProvenance {
+        written_unix: doc.get("written_unix").and_then(serde_json::Value::as_u64),
+    })
+}
+
+/// Age of a cached filler: the segment's mtime, else the sidecar's write time.
+/// `None` when neither is known, which [`filler_is_stale`] treats as young.
+fn filler_age_secs(meta: &std::fs::Metadata, prov: &FillerProvenance) -> Option<u64> {
+    cached_age_secs(meta).or_else(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        prov.written_unix.map(|w| now.saturating_sub(w))
+    })
+}
+
+/// Whether a filler of this age should be retried from source. An unknown age
+/// is not stale: without an age there is no bound on re-encodes per interval.
+fn filler_is_stale(age_secs: Option<u64>) -> bool {
+    age_secs.is_some_and(|a| a >= FILLER_RETRY_AFTER_SECS)
+}
+
 /// What ffmpeg reported it actually produced, read from the `-progress`
 /// sidecar next to `out` — which is removed on the way out, success or not.
 /// `(frames, out_time_seconds)`.
@@ -2200,7 +2255,17 @@ pub struct HlsSegmentCache {
 /// NOT a `String`: collapsing the error would lose the VARIANT, and
 /// `SchedulerBusy` — deliberate load-shedding — would come back to callers as a
 /// generic transcode failure. See [`shared_copy`].
-type SharedSegment = Result<Arc<Vec<u8>>, Arc<HlsCacheError>>;
+type SharedSegment = Result<Arc<ProducedSegment>, Arc<HlsCacheError>>;
+
+/// The bytes one encode published, and whether they are a synthesized filler
+/// rather than a real transcode (B228). Carried alongside the bytes so every
+/// requester that shared the encode learns it without re-reading the sidecar,
+/// which the short-segment path may already have removed.
+#[derive(Debug)]
+struct ProducedSegment {
+    bytes: Vec<u8>,
+    filler: bool,
+}
 
 /// How one wait on the shared registry ended.
 ///
@@ -3066,6 +3131,55 @@ impl HlsSegmentCache {
         defect: SegmentDefect,
     ) {
         record_segment_defect(defect, DefectStage::Cached);
+        let Some(kept) = self.take_out_of_service(key, path, read).await else {
+            return;
+        };
+        tracing::warn!(
+            media.id = key.media_id,
+            seg = key.seg_index,
+            reason = defect.label(),
+            bytes = read.len(),
+            kept,
+            path = %path.display(),
+            "cached segment is defective; taken out of service and re-encoding (B890)"
+        );
+    }
+
+    /// B1539/V1540 — take a cached filler older than
+    /// [`FILLER_RETRY_AFTER_SECS`] out of service so the read re-encodes it from
+    /// the source. Never fails the request, like the defect path.
+    async fn retire_stale_filler(
+        &self,
+        key: SegmentIdentity,
+        path: &Path,
+        read: &std::fs::Metadata,
+        age_secs: u64,
+    ) {
+        let Some(kept) = self.take_out_of_service(key, path, read).await else {
+            return;
+        };
+        metrics::counter!("pharos_segment_filler_retry_total").increment(1);
+        tracing::info!(
+            media.id = key.media_id,
+            seg = key.seg_index,
+            age_secs,
+            reason = "stale_filler",
+            bytes = read.len(),
+            kept,
+            "cached filler segment is older than the retry interval; taken out of service and re-encoding from source (B1539)"
+        );
+    }
+
+    /// Move a cached segment (and its provenance sidecar) into the quarantine
+    /// ring, or delete it, and drop its LRU entry. `None` when the file is no
+    /// longer the one `read` describes, in which case nothing is touched;
+    /// otherwise whether the bytes were kept for inspection.
+    async fn take_out_of_service(
+        &self,
+        key: SegmentIdentity,
+        path: &Path,
+        read: &std::fs::Metadata,
+    ) -> Option<bool> {
         // A concurrent request may already have quarantined these bytes and
         // published a fresh encode at the same path; that file is not ours to
         // move. Same length and mtime is the file this request read.
@@ -3073,9 +3187,8 @@ impl HlsSegmentCache {
             now.len() == read.len() && now.modified().ok() == read.modified().ok()
         });
         if !unchanged {
-            return;
+            return None;
         }
-        let bytes = read.len();
         let pen = self.root.join(QUARANTINE_DIR);
         let name = path
             .file_name()
@@ -3110,15 +3223,7 @@ impl HlsSegmentCache {
                 state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
             }
         }
-        tracing::warn!(
-            media.id = key.media_id,
-            seg = key.seg_index,
-            reason = defect.label(),
-            bytes,
-            kept,
-            path = %path.display(),
-            "cached segment is defective; taken out of service and re-encoding (B890)"
-        );
+        Some(kept)
     }
 
     /// Delete every cached audio encode of this item: its Opus rendition
@@ -3343,12 +3448,18 @@ impl HlsSegmentCache {
             seeds_playhead,
         )
         .await
-        .map(|(bytes, _)| bytes)
+        .map(|(bytes, _, _)| bytes)
     }
 
     /// [`Self::segment_bytes_keyed`] that also says how the segment was
     /// satisfied, so an HTTP handler can label its latency hit / coalesced /
     /// miss without re-deriving it from the cache's logs.
+    ///
+    /// The third element is `true` when the bytes are a synthesized filler
+    /// (B228) — freshly produced or a hit on a young cached one. The handler
+    /// must not serve those `immutable` (B1539/V1540): a filler older than
+    /// [`FILLER_RETRY_AFTER_SECS`] is re-encoded from the source on the next
+    /// read, and a client that kept the bytes for a year would never see it.
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(
         name = "segment_cache",
@@ -3367,7 +3478,7 @@ impl HlsSegmentCache {
         class: JobClass,
         stream: StreamKey,
         seeds_playhead: PlayheadSeed,
-    ) -> Result<(Vec<u8>, SegmentServed), HlsCacheError> {
+    ) -> Result<(Vec<u8>, SegmentServed, bool), HlsCacheError> {
         let hint = JobHint {
             stream,
             segment: Some(seg_index),
@@ -3401,19 +3512,32 @@ impl HlsSegmentCache {
                             .await;
                     }
                     None => {
-                        self.touch(key).await;
-                        record_cache_hit(
-                            media_id,
-                            seg_index,
-                            b.len(),
-                            opts,
-                            class,
-                            CacheHitPath::Fast,
-                            hit_started.elapsed().as_millis() as u64,
-                            cached_age_secs(&meta),
-                        );
-                        self.note_client_playhead(class, stream, seg_index);
-                        return Ok((b, SegmentServed::Hit));
+                        // B1539/V1540 — a filler is only trusted for
+                        // `FILLER_RETRY_AFTER_SECS`; an older one is taken out
+                        // of service and the read falls through to a fresh
+                        // encode of the source.
+                        let filler = filler_provenance(&path).await;
+                        let stale_age = filler
+                            .as_ref()
+                            .and_then(|p| filler_age_secs(&meta, p))
+                            .filter(|age| filler_is_stale(Some(*age)));
+                        if let Some(age) = stale_age {
+                            self.retire_stale_filler(key, &path, &meta, age).await;
+                        } else {
+                            self.touch(key).await;
+                            record_cache_hit(
+                                media_id,
+                                seg_index,
+                                b.len(),
+                                opts,
+                                class,
+                                CacheHitPath::Fast,
+                                hit_started.elapsed().as_millis() as u64,
+                                cached_age_secs(&meta),
+                            );
+                            self.note_client_playhead(class, stream, seg_index);
+                            return Ok((b, SegmentServed::Hit, filler.is_some()));
+                        }
                     }
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
@@ -3499,8 +3623,8 @@ impl HlsSegmentCache {
             }
         };
 
-        let bytes = match outcome {
-            Ok(b) => b,
+        let produced = match outcome {
+            Ok(p) => p,
             Err(e) => {
                 // Symmetry: the success half of this path records a hit per
                 // waiter, so the failure half records one per waiter too — but
@@ -3526,7 +3650,7 @@ impl HlsSegmentCache {
             record_cache_hit(
                 media_id,
                 seg_index,
-                bytes.len(),
+                produced.bytes.len(),
                 opts,
                 class,
                 CacheHitPath::Coalesced,
@@ -3547,7 +3671,7 @@ impl HlsSegmentCache {
         } else {
             SegmentServed::Coalesced
         };
-        Ok((bytes.as_ref().clone(), served))
+        Ok((produced.bytes.clone(), served, produced.filler))
     }
 
     /// Tell the scheduler where this viewer has reached, for a segment the
@@ -3850,7 +3974,7 @@ impl HlsSegmentCache {
         // `segment_tmp_path`. Two drivers for one key can only overlap at the
         // abandonment seam, and they must not share a file when they do.
         registration_id: u64,
-    ) -> Result<Vec<u8>, HlsCacheError> {
+    ) -> Result<ProducedSegment, HlsCacheError> {
         let path = self.segment_path_keyed(key);
         // V128: every exit from this function has to land in exactly one arm of
         // `pharos_segment_produced_total`, or the arms do not partition
@@ -4582,7 +4706,10 @@ impl HlsSegmentCache {
         }
         self.record(key, bytes.len() as u64).await;
         self.maybe_evict().await;
-        Ok(bytes)
+        Ok(ProducedSegment {
+            bytes,
+            filler: is_filler,
+        })
     }
 
     #[cfg(test)]
@@ -9669,7 +9796,7 @@ mod tests {
                 PlayheadSeed::Observes,
             )
             .await
-            .map(|(_, served)| served)
+            .map(|(_, served, _)| served)
         };
 
         let driver = tokio::spawn(ask(cache.clone(), opts.clone()));
@@ -9690,6 +9817,196 @@ mod tests {
             SegmentServed::Hit,
             "the request that found the file"
         );
+    }
+
+    /// Ask for segment 0 of media 42 through the filler-producing scheduler
+    /// and return `(bytes, served, filler)`.
+    async fn ask_filler_variant(
+        cache: &HlsSegmentCache,
+        source: &Path,
+        opts: &SegmentOpts,
+    ) -> (Vec<u8>, SegmentServed, bool) {
+        cache
+            .segment_bytes_keyed_served(
+                42,
+                0,
+                None,
+                None,
+                source,
+                None,
+                opts,
+                JobClass::Interactive,
+                StreamKey::NONE,
+                PlayheadSeed::Observes,
+            )
+            .await
+            .expect("a damaged window is served as a filler")
+    }
+
+    /// Backdate a cached segment's mtime, as if it had been written `secs` ago.
+    fn backdate(path: &Path, secs: u64) {
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    fn counter_value(snapshotter: &metrics_util::debugging::Snapshotter, name: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .map(|(.., v)| match v {
+                DebugValue::Counter(n) => n,
+                other => panic!("not a counter: {other:?}"),
+            })
+            .sum()
+    }
+
+    /// B1539/V1540 — a filler older than `FILLER_RETRY_AFTER_SECS` is taken out
+    /// of service on the next read and encoded again from the source; the
+    /// caller is told when what it got is a filler; a filler younger than that
+    /// is served from cache with no encode.
+    ///
+    /// Disarm evidence: with the `stale_age` branch in the fast hit path
+    /// forced to `None`, the stale read below is a `Hit` that runs no real
+    /// attempts and the retry counter stays 0, so this goes RED.
+    #[test]
+    fn a_stale_cached_filler_is_re_encoded_and_a_young_one_is_served() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let cache = cache.with_scheduler(always_short_until_filler(false, real_attempts.clone()));
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            ..slow_opts()
+        };
+        let key =
+            SegmentIdentity::new(42, 0, None, None, &opts, SourceGen::for_read(&source, None));
+        let path = cache.segment_path_keyed(key);
+        let attempts = || real_attempts.load(std::sync::atomic::Ordering::SeqCst);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (_, served, filler) = ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!(served, SegmentServed::Miss);
+                assert!(filler, "a freshly produced filler is flagged to the caller");
+                assert_eq!(attempts(), 2, "precondition: the ladder ran once");
+
+                // Young: served from cache, still flagged, no encode.
+                let (_, served, filler) = ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!(served, SegmentServed::Hit);
+                assert!(filler, "a filler hit is flagged to the caller");
+                assert_eq!(attempts(), 2, "a young filler must not be re-encoded");
+                assert!(cache.quarantined().is_empty());
+
+                // Stale: taken out of service, encoded again, kept for inspection.
+                backdate(&path, FILLER_RETRY_AFTER_SECS + 60);
+                let (_, served, filler) = ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!(
+                    served,
+                    SegmentServed::Miss,
+                    "the stale filler must not be a hit"
+                );
+                assert!(filler, "this source still yields a filler");
+                assert_eq!(
+                    attempts(),
+                    4,
+                    "the stale filler must be re-encoded from source"
+                );
+                let kept = cache
+                    .quarantined()
+                    .into_iter()
+                    .filter(|(name, ..)| !name.ends_with(PROVENANCE_SUFFIX))
+                    .count();
+                assert_eq!(kept, 1, "{:?}", cache.quarantined());
+
+                // The replacement is young again: bounded to one retry per interval.
+                let (_, served, _) = ask_filler_variant(&cache, &source, &opts).await;
+                assert_eq!(served, SegmentServed::Hit);
+                assert_eq!(attempts(), 4);
+            });
+        });
+        assert_eq!(
+            counter_value(&snapshotter, "pharos_segment_filler_retry_total"),
+            1
+        );
+    }
+
+    /// B1539/V1540 — age alone never retires a real segment: only a filler is
+    /// retried.
+    #[tokio::test]
+    async fn an_old_non_filler_segment_is_still_served_from_cache() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let sched = writes_each_segment(std::time::Duration::ZERO);
+        let cache = cache.with_scheduler(sched);
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let ask = || async {
+            cache
+                .segment_bytes_keyed_served(
+                    7,
+                    0,
+                    None,
+                    None,
+                    source,
+                    None,
+                    &opts,
+                    JobClass::Interactive,
+                    StreamKey::NONE,
+                    PlayheadSeed::Observes,
+                )
+                .await
+                .expect("segment")
+        };
+        let (_, served, filler) = ask().await;
+        assert_eq!(served, SegmentServed::Miss);
+        assert!(!filler);
+        let key = SegmentIdentity::new(7, 0, None, None, &opts, SourceGen::for_read(source, None));
+        backdate(
+            &cache.segment_path_keyed(key),
+            FILLER_RETRY_AFTER_SECS * 100,
+        );
+
+        let (_, served, filler) = ask().await;
+        assert_eq!(served, SegmentServed::Hit);
+        assert!(!filler, "a real segment is never flagged as a filler");
+        assert!(cache.quarantined().is_empty());
+    }
+
+    /// B1539/V1540 — the sidecar read is best-effort: a missing or unparsable
+    /// record, or one that says `filler: false`, is "not a filler".
+    #[tokio::test]
+    async fn the_filler_provenance_read_is_best_effort() {
+        let dir = TempDir::new().unwrap();
+        let seg = dir.path().join("seg.m4s");
+        let side = provenance_sidecar_path(&seg);
+        assert!(filler_provenance(&seg).await.is_none(), "missing sidecar");
+        std::fs::write(&side, "{not json").unwrap();
+        assert!(
+            filler_provenance(&seg).await.is_none(),
+            "unparsable sidecar"
+        );
+        std::fs::write(&side, r#"{"filler":false,"written_unix":1}"#).unwrap();
+        assert!(filler_provenance(&seg).await.is_none(), "filler false");
+        std::fs::write(&side, r#"{"filler":true,"written_unix":1}"#).unwrap();
+        let p = filler_provenance(&seg).await.expect("filler true");
+        assert_eq!(p.written_unix, Some(1));
+        assert!(filler_is_stale(Some(FILLER_RETRY_AFTER_SECS)));
+        assert!(!filler_is_stale(Some(FILLER_RETRY_AFTER_SECS - 1)));
+        assert!(!filler_is_stale(None), "an unknown age is not stale");
     }
 
     #[::core::prelude::v1::test]
